@@ -4,6 +4,9 @@ Rust rewrite of LemonGraph (NSA): a log-based transactional graph DB (nodes/edge
 backed by a single LMDB file, with historical views by log position, a query language (LGQL),
 and a REST service. Goals: faster, fix upstream bugs, keep the core model.
 
+## Spec
+- `docs/spec.md` (local only, not committed yet) is the architecture spec and source of truth. Update it in the same change when a design decision changes.
+
 ## Upstream reference
 - Run `./scripts/fetch-reference.sh` to get the pinned upstream source at `reference/lemongraph/`.
 - It is gitignored and **read-only** — never edit it, never copy it into tracked files wholesale.
