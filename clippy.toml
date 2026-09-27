@@ -1,0 +1,16 @@
+# New codebase: let clippy suggest breaking changes to public APIs.
+avoid-breaking-exported-api = false
+# Doc lints (missing_errors_doc, missing_panics_doc, ...) apply to private items too.
+check-private-items = true
+
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-dbg-in-tests = true
+allow-print-in-tests = true
+
+disallowed-methods = [
+  { path = "std::thread::sleep", reason = "sleep-based sync is a bug; use a proper primitive" },
+  { path = "std::process::exit", reason = "skips destructors; return from main instead" },
+]

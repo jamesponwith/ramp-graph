@@ -1,0 +1,10 @@
+[build]
+# Shared compile cache across worktrees/branches/clean builds. `cargo install sccache` or `just setup`.
+rustc-wrapper = "sccache"
+
+[alias]
+lint = "clippy --workspace --all-targets --locked -- -D warnings"
+t = "nextest run --workspace"
+
+[env]
+RUST_BACKTRACE = "1"
