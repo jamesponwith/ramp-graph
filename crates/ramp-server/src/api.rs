@@ -3,11 +3,11 @@
 //! `/exec`, `/view` and `/static` are gone. Everything here is synchronous; `main` runs
 //! it on a blocking thread because LMDB transactions belong to the thread that opened them.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use axum::body::{Body, Bytes};
-use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::Response;
+use axum::body::Bytes;
+use axum::http::{HeaderMap, StatusCode};
 use ramp_graph::lgql::{ParseError, Pattern};
 use ramp_graph::value::{self, Value};
 use ramp_graph::{Direction, Entry, Graph, GraphError, LogId, Record, Txn};
@@ -18,6 +18,25 @@ use crate::store::{Creds, Open, Status, Store, allowed, is_uuid, remove_lmdb};
 
 /// Kv domain behind `/kv/<uuid>`.
 const RESTOBJS: &[u8] = b"lg.restobjs";
+
+/// Bodies up to this size are buffered and sent with `Content-Length`; errors before it
+/// still get a proper status. Larger ones stream (as upstream's `-b` buffer did).
+const BUFFER: usize = 1 << 20;
+/// Chunk size once streaming.
+const CHUNK: usize = 64 << 10;
+
+/// A response head: status and headers.
+pub(crate) type Head = (StatusCode, Vec<(&'static str, String)>);
+
+/// Where a response goes: `start` once, then body chunks.
+pub(crate) trait Wire {
+    fn start(&mut self, status: StatusCode, headers: Vec<(&'static str, String)>);
+    /// Returns `false` once the client has gone away.
+    fn write(&mut self, chunk: Vec<u8>) -> bool;
+    /// Abandons a response whose headers were already sent (the connection is cut, so
+    /// the client cannot mistake a truncated body for a complete one).
+    fn fail(&mut self);
+}
 
 /// A request with its body already read.
 #[derive(Debug)]
@@ -70,13 +89,14 @@ impl ApiError {
         }
     }
 
-    fn response(&self) -> Response {
+    fn send(&self, wire: &mut dyn Wire) {
         let body = json!({"code": self.status.as_u16(), "reason": self.status.canonical_reason(), "message": self.msg});
-        let mut headers = Vec::new();
+        let mut headers = vec![("Content-Type", "application/json".to_owned())];
         if let Some(a) = self.allow {
             headers.push(("Allow", a.to_owned()));
         }
-        respond(self.status, "application/json", &headers, json_line(&body))
+        wire.start(self.status, headers);
+        wire.write(json_line(&body));
     }
 }
 
@@ -114,11 +134,9 @@ struct Reply {
 enum Out {
     Empty,
     One(Value),
-    /// JSON array, or concatenated msgpack values.
-    Stream(Vec<Value>),
-    /// JSON regardless of `Accept` (upstream has no msgpack form for dumps).
-    Json(Value),
     Raw(Vec<u8>, &'static str),
+    /// Already written to the wire by a [`Streamer`].
+    Sent,
 }
 
 impl Reply {
@@ -136,36 +154,111 @@ impl Reply {
     }
 }
 
-fn respond(status: StatusCode, ctype: &str, headers: &[(&str, String)], body: Vec<u8>) -> Response {
-    let mut b = Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, ctype);
-    for (k, v) in headers {
-        b = b.header(*k, v);
-    }
-    b.body(Body::from(body)).unwrap_or_else(|_| {
-        let mut r = Response::new(Body::empty());
-        *r.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-        r
-    })
-}
-
 fn json_line(v: &Value) -> Vec<u8> {
     let mut out = serde_json::to_vec(v).unwrap_or_default();
     out.push(b'\n');
     out
 }
 
-/// Handles one request.
-pub(crate) fn handle(store: &Store, req: &Req) -> Response {
+/// Handles one request, writing the response to `wire`.
+pub(crate) fn handle(store: &Store, req: &Req, wire: &mut dyn Wire) {
     let ctx = Ctx {
         store,
         req,
         params: parse_query(&req.query),
+        wire: RefCell::new(wire),
+        started: Cell::new(false),
+        extra: RefCell::default(),
     };
     match ctx.route() {
         Ok(reply) => ctx.render(reply),
-        Err(e) => e.response(),
+        Err(_) if ctx.started.get() => ctx.wire.borrow_mut().fail(),
+        Err(e) => e.send(*ctx.wire.borrow_mut()),
+    }
+}
+
+/// Writes a body incrementally: buffered up to [`BUFFER`], then streamed in [`CHUNK`]s.
+struct Streamer<'c, 'r> {
+    ctx: &'c Ctx<'r>,
+    /// Status and headers, until they are sent.
+    pending: Option<(StatusCode, Vec<(&'static str, String)>)>,
+    ctype: &'static str,
+    buf: Vec<u8>,
+    msgpack: bool,
+    items: usize,
+}
+
+impl Streamer<'_, '_> {
+    /// # Errors
+    /// The client went away.
+    fn raw(&mut self, bytes: &[u8]) -> Res<()> {
+        self.buf.extend_from_slice(bytes);
+        if self.buf.len()
+            >= if self.pending.is_some() {
+                BUFFER
+            } else {
+                CHUNK
+            }
+        {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// # Errors
+    /// The client went away.
+    fn flush(&mut self) -> Res<()> {
+        let mut wire = self.ctx.wire.borrow_mut();
+        if let Some((status, mut headers)) = self.pending.take() {
+            headers.push(("Content-Type", self.ctype.to_owned()));
+            wire.start(status, headers);
+            self.ctx.started.set(true);
+        }
+        if wire.write(std::mem::take(&mut self.buf)) {
+            Ok(())
+        } else {
+            Err(ApiError::new(499, "client went away"))
+        }
+    }
+
+    /// One element of a JSON array, or one concatenated msgpack value.
+    ///
+    /// # Errors
+    /// The client went away.
+    fn item(&mut self, v: &Value) -> Res<()> {
+        if self.msgpack {
+            return self.raw(&value::encode(v)?);
+        }
+        self.raw(if self.items == 0 { b"[" } else { b"," })?;
+        self.items += 1;
+        self.raw(&serde_json::to_vec(v).unwrap_or_default())
+    }
+
+    /// Closes an item stream.
+    ///
+    /// # Errors
+    /// The client went away.
+    fn end_items(mut self) -> Res<Reply> {
+        if !self.msgpack {
+            self.raw(if self.items == 0 { b"[]\n" } else { b"]\n" })?;
+        }
+        self.finish()
+    }
+
+    /// Sends what is left. A body that never outgrew the buffer goes out as a plain reply.
+    ///
+    /// # Errors
+    /// The client went away.
+    fn finish(mut self) -> Res<Reply> {
+        if let Some((status, headers)) = self.pending.take() {
+            return Ok(Reply {
+                status: status.as_u16(),
+                headers,
+                body: Out::Raw(std::mem::take(&mut self.buf), self.ctype),
+            });
+        }
+        self.flush()?;
+        Ok(Reply::new(Out::Sent))
     }
 }
 
@@ -210,9 +303,14 @@ struct Ctx<'r> {
     store: &'r Store,
     req: &'r Req,
     params: Vec<(String, String)>,
+    wire: RefCell<&'r mut dyn Wire>,
+    /// Headers have gone out; errors can no longer change the status.
+    started: Cell<bool>,
+    /// Headers every response from here on carries (`X-lg-maxID` from `read`).
+    extra: RefCell<Vec<(&'static str, String)>>,
 }
 
-impl Ctx<'_> {
+impl<'r> Ctx<'r> {
     fn param(&self, name: &str) -> Option<&str> {
         self.params
             .iter()
@@ -309,34 +407,60 @@ impl Ctx<'_> {
         }
     }
 
-    fn render(&self, r: Reply) -> Response {
+    fn render(&self, r: Reply) {
         let mp = self.msgpack();
         let (ctype, body) = match r.body {
+            Out::Sent => return,
             Out::Empty => ("application/json", Vec::new()),
             Out::Raw(b, ctype) => (ctype, b),
             Out::One(v) if mp => (
                 "application/x-msgpack",
                 value::encode(&v).unwrap_or_default(),
             ),
-            Out::Json(v) | Out::One(v) => ("application/json", json_line(&v)),
-            Out::Stream(vs) if mp => (
-                "application/x-msgpack",
-                vs.iter()
-                    .flat_map(|v| value::encode(v).unwrap_or_default())
-                    .collect(),
-            ),
-            Out::Stream(vs) => ("application/json", json_line(&Value::Array(vs))),
+            Out::One(v) => ("application/json", json_line(&v)),
         };
         let status = if body.is_empty() && r.status == 200 && self.req.method != "HEAD" {
             204
         } else {
             r.status
         };
-        respond(
+        let mut headers = self.extra.take();
+        headers.extend(r.headers);
+        headers.push(("Content-Type", ctype.to_owned()));
+        if status != 204 {
+            // RFC 9110: a 204 carries no Content-Length.
+            headers.push(("Content-Length", body.len().to_string()));
+        }
+        let mut wire = self.wire.borrow_mut();
+        wire.start(
             StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+            headers,
+        );
+        wire.write(body);
+    }
+
+    /// A streaming body for a 200 response.
+    fn streamer(&self, ctype: &'static str, msgpack: bool) -> Streamer<'_, 'r> {
+        Streamer {
+            ctx: self,
+            pending: Some((StatusCode::OK, self.extra.take())),
             ctype,
-            &r.headers,
-            body,
+            buf: Vec::new(),
+            msgpack,
+            items: 0,
+        }
+    }
+
+    /// Items as a JSON array, or concatenated msgpack values if accepted.
+    fn items(&self) -> Streamer<'_, 'r> {
+        let mp = self.msgpack();
+        self.streamer(
+            if mp {
+                "application/x-msgpack"
+            } else {
+                "application/json"
+            },
+            mp,
         )
     }
 
@@ -386,11 +510,11 @@ impl Ctx<'_> {
             }
             (["graph", u, "status"], _) if is_uuid(u) => Err(ApiError::not_allowed("GET, HEAD")),
             (["graph", u, "seeds"], "GET") if is_uuid(u) => self.read(u, |t, _| {
-                let seeds = t
-                    .kv_iter(SEEDS, b"")?
-                    .map(|kv| Ok(value::decode(kv?.1)?))
-                    .collect::<Res<_>>()?;
-                Ok(Reply::new(Out::Stream(seeds)))
+                let mut out = self.items();
+                for kv in t.kv_iter(SEEDS, b"")? {
+                    out.item(&value::decode(kv?.1)?)?;
+                }
+                out.end_items()
             }),
             (["graph", u, kind @ ("node" | "edge"), n], _) if is_uuid(u) => {
                 self.object(u, kind, n, m)
@@ -487,7 +611,10 @@ impl Ctx<'_> {
         let g = self.open(uuid)?;
         let t = g.read()?;
         let max = t.next_id()?.saturating_sub(1);
-        Ok(f(&t, &g)?.header("X-lg-maxID", max))
+        self.extra
+            .borrow_mut()
+            .push(("X-lg-maxID", max.to_string()));
+        f(&t, &g)
     }
 
     /// Runs `f` in a write txn, then the adapters; commits, re-indexes, adds `X-lg-updates`/`X-lg-maxID`.
@@ -561,34 +688,29 @@ impl Ctx<'_> {
             }
         }
         let (uniq, patterns) = self.queries()?;
+        let mut out = self.items();
         if patterns.is_empty() {
-            return Ok(Reply::new(Out::Stream(
-                graphs.into_iter().map(|(_, info)| info).collect(),
-            )));
+            for (_, info) in &graphs {
+                out.item(info)?;
+            }
+            return out.end_items();
         }
-        let mut rows = vec![uniq];
+        out.item(&uniq)?;
         for (uuid, _) in graphs {
             let Ok(g) = self.store.graph(&uuid, Open::Existing) else {
                 continue;
             };
             let t = g.read()?;
-            let mut found = Vec::new();
-            t.query(&patterns, None, |qi, chain| {
-                found.push((qi, chain));
-                true
-            })?;
-            for (qi, chain) in found {
-                rows.push(json!([
-                    uuid,
-                    qi,
-                    chain
-                        .iter()
-                        .map(|e| as_dict(&t, e, None))
-                        .collect::<Res<Vec<_>>>()?
-                ]));
-            }
+            stream_chains(
+                &t,
+                &patterns,
+                &mut out,
+                0,
+                |qi, chain| Ok(json!([uuid, qi, chain])),
+                |sink| t.query(&patterns, None, |qi, c| sink(qi, None, c)),
+            )?;
         }
-        Ok(Reply::new(Out::Stream(rows)))
+        out.end_items()
     }
 
     /// Sorted unique `q` parameters, and their compiled patterns in that order.
@@ -696,40 +818,52 @@ impl Ctx<'_> {
         }
         self.read(uuid, |t, g| {
             if patterns.is_empty() {
-                let nodes = t.nodes(None, view)?.collect::<Result<Vec<_>, _>>()?;
-                let edges = t.edges(None, view)?.collect::<Result<Vec<_>, _>>()?;
-                return Ok(Reply::new(Out::Json(dump(
-                    t, g, uuid, view, &nodes, &edges,
-                )?)));
-            }
-            let mut found = Vec::new();
-            let mut sink = |qi, at, chain| {
-                found.push((qi, at, chain));
-                limit == 0 || found.len() < limit
-            };
-            match start {
-                Some(start) if !crawl => {
-                    t.mquery(&patterns, start, stop, |qi, x, c| sink(qi, Some(x + 1), c))?;
-                }
-                _ => t.query(&patterns, view, |qi, c| sink(qi, view, c))?,
+                let nodes = t.nodes(None, view)?;
+                let edges = t.edges(None, view)?;
+                return dump(
+                    t,
+                    g,
+                    uuid,
+                    view,
+                    nodes,
+                    edges,
+                    self.streamer("application/json", false),
+                );
             }
             if crawl {
-                let (nodes, edges) = spider(t, found.into_iter().map(|(_, _, c)| c), view)?;
-                return Ok(Reply::new(Out::Json(dump(
-                    t, g, uuid, view, &nodes, &edges,
-                )?)));
+                let mut found = Vec::new();
+                t.query(&patterns, view, |_, c| {
+                    found.push(c);
+                    limit == 0 || found.len() < limit
+                })?;
+                let (nodes, edges) = spider(t, found.into_iter(), view)?;
+                let out = self.streamer("application/json", false);
+                return dump(
+                    t,
+                    g,
+                    uuid,
+                    view,
+                    nodes.into_iter().map(Ok),
+                    edges.into_iter().map(Ok),
+                    out,
+                );
             }
-            let mut rows = vec![uniq];
-            for (qi, at, chain) in found {
-                rows.push(json!([
-                    qi,
-                    chain
-                        .iter()
-                        .map(|e| as_dict(t, e, at))
-                        .collect::<Res<Vec<_>>>()?
-                ]));
-            }
-            Ok(Reply::new(Out::Stream(rows)))
+            let mut out = self.items();
+            out.item(&uniq)?;
+            stream_chains(
+                t,
+                &patterns,
+                &mut out,
+                limit,
+                |qi, chain| Ok(json!([qi, chain])),
+                |sink| match start {
+                    Some(start) => {
+                        t.mquery(&patterns, start, stop, |qi, x, c| sink(qi, Some(x + 1), c))
+                    }
+                    None => t.query(&patterns, view, |qi, c| sink(qi, view, c)),
+                },
+            )?;
+            out.end_items()
         })
     }
 
@@ -807,21 +941,28 @@ impl Ctx<'_> {
         }
         .filter(|&v| v > 1);
         self.read(uuid, |t, _| {
+            let mut out = self.streamer("application/json", false);
             let mut index = HashMap::new();
-            let mut nodes = Vec::new();
+            out.raw(b"{\"nodes\":[")?;
             for n in t.nodes(None, view)? {
                 let n = n?;
-                index.insert(n.id, nodes.len());
-                nodes.push(json!({"data": as_dict(t, &n, view)?}));
+                out.raw(if index.is_empty() { b"" } else { b"," })?;
+                index.insert(n.id, index.len());
+                out.raw(&json_bytes(&json!({"data": as_dict(t, &n, view)?})))?;
             }
-            let mut edges = Vec::new();
+            out.raw(b"],\"edges\":[")?;
+            let mut first = true;
             for e in t.edges(None, view)? {
                 let e = e?;
                 if let Record::Edge { src, tgt, .. } = e.record {
-                    edges.push(json!({"data": as_dict(t, &e, view)?, "source": index.get(&src), "target": index.get(&tgt)}));
+                    out.raw(if first { b"" } else { b"," })?;
+                    first = false;
+                    let d = json!({"data": as_dict(t, &e, view)?, "source": index.get(&src), "target": index.get(&tgt)});
+                    out.raw(&json_bytes(&d))?;
                 }
             }
-            Ok(Reply::new(Out::Json(json!({"nodes": nodes, "edges": edges}))))
+            out.raw(b"]}\n")?;
+            out.finish()
         })
     }
 
@@ -913,7 +1054,7 @@ fn clear_kv(t: &mut Txn<'_>) -> Res<()> {
     Ok(())
 }
 
-/// Upstream's full-graph JSON dump.
+/// Upstream's full-graph JSON dump, streamed node by node.
 ///
 /// # Errors
 /// The HTTP error to send instead.
@@ -922,19 +1063,69 @@ fn dump(
     g: &Graph,
     uuid: &str,
     view: Option<LogId>,
-    nodes: &[Entry],
-    edges: &[Entry],
-) -> Res<Value> {
-    Ok(json!({
+    nodes: impl Iterator<Item = Result<Entry, GraphError>>,
+    edges: impl Iterator<Item = Result<Entry, GraphError>>,
+    mut out: Streamer<'_, '_>,
+) -> Res<Reply> {
+    let head = json!({
         "graph": uuid,
         "id": uuid,
         "maxID": t.next_id()?.saturating_sub(1),
         "size": g.size()?,
         "created": created(uuid),
         "meta": props_dict(t, 0, view)?,
-        "nodes": nodes.iter().map(|n| as_dict(t, n, view)).collect::<Res<Vec<_>>>()?,
-        "edges": edges.iter().map(|e| format_edge(t, e, view)).collect::<Res<Vec<_>>>()?,
-    }))
+    });
+    // `{...head` without its closing brace, then the arrays.
+    let head = json_bytes(&head);
+    out.raw(head.get(..head.len().saturating_sub(1)).unwrap_or_default())?;
+    out.raw(b",\"nodes\":[")?;
+    for (i, n) in nodes.enumerate() {
+        out.raw(if i == 0 { b"" } else { b"," })?;
+        out.raw(&json_bytes(&as_dict(t, &n?, view)?))?;
+    }
+    out.raw(b"],\"edges\":[")?;
+    for (i, e) in edges.enumerate() {
+        out.raw(if i == 0 { b"" } else { b"," })?;
+        out.raw(&json_bytes(&format_edge(t, &e?, view)?))?;
+    }
+    out.raw(b"]}\n")?;
+    out.finish()
+}
+
+/// Runs a query via `run`, writing `row(pattern index, chain dicts)` per match, at most
+/// `limit` (0 = all).
+///
+/// # Errors
+/// The HTTP error to send instead.
+fn stream_chains(
+    t: &Txn<'_>,
+    patterns: &[Pattern],
+    out: &mut Streamer<'_, '_>,
+    limit: usize,
+    row: impl Fn(usize, Vec<Value>) -> Res<Value>,
+    run: impl FnOnce(&mut dyn FnMut(usize, Option<LogId>, Vec<Entry>) -> bool) -> Result<(), GraphError>,
+) -> Res<()> {
+    debug_assert!(!patterns.is_empty(), "callers handle the no-query case");
+    let (mut n, mut failed) = (0, None);
+    run(&mut |qi, at, chain| {
+        let written = chain
+            .iter()
+            .map(|e| as_dict(t, e, at))
+            .collect::<Res<Vec<_>>>()
+            .and_then(|c| row(qi, c))
+            .and_then(|r| out.item(&r));
+        if let Err(e) = written {
+            failed = Some(e);
+            return false;
+        }
+        n += 1;
+        limit == 0 || n < limit
+    })?;
+    failed.map_or(Ok(()), Err)
+}
+
+fn json_bytes(v: &Value) -> Vec<u8> {
+    serde_json::to_vec(v).unwrap_or_default()
 }
 
 /// Everything connected to the query results: nodes, then edges, each once.

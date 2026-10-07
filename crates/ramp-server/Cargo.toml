@@ -13,6 +13,7 @@ axum.workspace = true
 ramp-graph.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

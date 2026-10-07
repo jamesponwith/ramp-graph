@@ -1,6 +1,6 @@
 //! Endpoint tests: requests go straight to `handle`, no sockets.
 
-use axum::http::HeaderValue;
+use axum::http::{HeaderValue, header};
 use serde_json::json;
 
 use super::*;
@@ -22,13 +22,48 @@ fn server() -> T {
     T { _dir: dir, store }
 }
 
-fn body_bytes(res: Response) -> Vec<u8> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    rt.block_on(axum::body::to_bytes(res.into_body(), usize::MAX))
-        .unwrap()
-        .to_vec()
+/// Records a response. `stop_after` simulates a client that disconnects.
+#[derive(Default)]
+struct Buf {
+    status: u16,
+    headers: HeaderMap,
+    chunks: Vec<Vec<u8>>,
+    failed: bool,
+    stop_after: Option<usize>,
+}
+
+impl Wire for Buf {
+    fn start(&mut self, status: StatusCode, headers: Vec<(&'static str, String)>) {
+        assert_eq!(self.status, 0, "started twice");
+        self.status = status.as_u16();
+        for (k, v) in headers {
+            self.headers.append(
+                axum::http::HeaderName::try_from(k).unwrap(),
+                HeaderValue::from_str(&v).unwrap(),
+            );
+        }
+    }
+
+    fn write(&mut self, chunk: Vec<u8>) -> bool {
+        self.chunks.push(chunk);
+        self.stop_after.is_none_or(|n| self.chunks.len() < n)
+    }
+
+    fn fail(&mut self) {
+        self.failed = true;
+    }
+}
+
+impl Buf {
+    fn body(&self) -> Vec<u8> {
+        self.chunks.concat()
+    }
+}
+
+fn run(store: &Store, req: &Req) -> Buf {
+    let mut buf = Buf::default();
+    handle(store, req, &mut buf);
+    buf
 }
 
 impl T {
@@ -56,10 +91,9 @@ impl T {
             headers: h,
             body,
         };
-        let res = handle(&self.store, &req);
-        let status = res.status().as_u16();
-        let headers = res.headers().clone();
-        let bytes = body_bytes(res);
+        let res = run(&self.store, &req);
+        let (status, bytes) = (res.status, res.body());
+        let headers = res.headers;
         let body = if bytes.is_empty() {
             Value::Null
         } else if headers
@@ -164,6 +198,10 @@ fn depth_and_cost() {
         ]]}),
     );
     assert_eq!(r.status, 204);
+    assert!(
+        !r.headers.contains_key("content-length"),
+        "204 has no length"
+    );
     assert!(
         r.headers["X-lg-updates"]
             .to_str()
@@ -438,17 +476,18 @@ fn upload_roundtrip() {
         header::ACCEPT,
         HeaderValue::from_static("application/octet-stream"),
     );
-    let snap = body_bytes(handle(
+    let snap = run(
         &s.store,
         &req("GET", format!("/graph/{u}"), accept, Vec::new()),
-    ));
+    )
+    .body();
     let target = "0b9e2f7c-5a1d-11ef-8d3e-0242ac120003";
     let put = |body: Vec<u8>| {
-        handle(
+        run(
             &s.store,
             &req("PUT", format!("/graph/{target}"), HeaderMap::new(), body),
         )
-        .status()
+        .status
     };
     assert_eq!(put(b"garbage".to_vec()), 409);
     assert_eq!(put(snap.clone()), 204);
@@ -481,6 +520,68 @@ fn reopen_reindexes() {
         s.get(&format!("/graph/{u}/status")).body["meta"]["name"],
         "kept"
     );
+}
+
+#[test]
+fn large_responses_stream() {
+    let s = server();
+    let nodes: Vec<Value> = (0..20_000)
+        .map(|i| json!({"type": "t", "value": i.to_string(), "pad": "x".repeat(64)}))
+        .collect();
+    let u = s.create(json!({"nodes": nodes}));
+    let req = Req {
+        method: "GET".to_owned(),
+        path: format!("/graph/{u}"),
+        query: String::new(),
+        headers: HeaderMap::new(),
+        body: Bytes::new(),
+    };
+    let res = run(&s.store, &req);
+    assert_eq!(res.status, 200);
+    assert!(
+        res.chunks.len() > 2,
+        "streamed in chunks: {}",
+        res.chunks.len()
+    );
+    assert!(
+        res.headers.get("content-length").is_none(),
+        "length unknown when streaming"
+    );
+    assert!(res.headers.contains_key("x-lg-maxid"));
+    let dump: Value = serde_json::from_slice(&res.body()).unwrap();
+    assert_eq!(dump["nodes"].as_array().unwrap().len(), 20_000);
+
+    let q = Req {
+        query: "q=n()".to_owned(),
+        ..req
+    };
+    let rows = run(&s.store, &q);
+    let rows: Value = serde_json::from_slice(&rows.body()).unwrap();
+    assert_eq!(
+        rows.as_array().unwrap().len(),
+        20_001,
+        "header row + every chain"
+    );
+
+    // A client that goes away mid-stream stops the handler and cuts the connection.
+    let mut gone = Buf {
+        stop_after: Some(2),
+        ..Buf::default()
+    };
+    handle(&s.store, &q, &mut gone);
+    assert_eq!(gone.chunks.len(), 2);
+    assert!(gone.failed);
+
+    // Small responses still carry a length.
+    let small = run(
+        &s.store,
+        &Req {
+            query: "q=n(value='7')".to_owned(),
+            ..q
+        },
+    );
+    assert_eq!(small.chunks.len(), 1);
+    assert!(small.headers.contains_key("content-length"));
 }
 
 #[test]
