@@ -1,4 +1,4 @@
-//! `ramp-server [-i ip] [-p port] [dir]`: serves the graphs in `dir` (default `graphs`)
+//! `ramp-server [-i ip] [-p port] [-n max_open] [dir]`: serves the graphs in `dir` (default `graphs`)
 //! over upstream `LemonGraph`'s REST API.
 
 mod api;
@@ -24,11 +24,13 @@ const MAX_BODY: usize = 1 << 30;
 /// Time allowed to receive a request body.
 const BODY_TIMEOUT: Duration = Duration::from_secs(60);
 
-const USAGE: &str = "usage: ramp-server [-i ip] [-p port] [dir]";
+const USAGE: &str = "usage: ramp-server [-i ip] [-p port] [-n max_open] [dir]";
 
 #[expect(clippy::print_stderr, reason = "CLI diagnostics")]
 fn main() -> ExitCode {
     let (mut ip, mut port, mut dir) = ("127.0.0.1".to_owned(), 8000_u16, "graphs".to_owned());
+    // Idle graphs kept open; each holds three file descriptors: the data file twice, plus its lock file.
+    let mut max_open = 256_usize;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let ok = match a.as_str() {
@@ -37,6 +39,12 @@ fn main() -> ExitCode {
                 .next()
                 .and_then(|v| v.parse().ok())
                 .map(|v| port = v)
+                .is_some(),
+            "-n" => args
+                .next()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| n > 0)
+                .map(|v| max_open = v)
                 .is_some(),
             "-h" | "--help" => false,
             _ if !a.starts_with('-') => {
@@ -50,7 +58,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    let store = match Store::open(&dir) {
+    let store = match Store::open(&dir, max_open) {
         Ok(s) => Arc::new(s),
         Err(e) => {
             eprintln!("cannot open {dir}: {e:?}");
