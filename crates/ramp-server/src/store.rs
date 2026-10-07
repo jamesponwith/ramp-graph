@@ -34,10 +34,46 @@ pub(crate) enum Open {
 pub(crate) struct Store {
     dir: PathBuf,
     // LMDB forbids opening one file twice in a process: every open goes through this map.
-    // ponytail: every graph stays open; add an LRU if fd limits bite.
-    open: Mutex<HashMap<String, Arc<Graph>>>,
+    open: Mutex<Handles>,
     // ponytail: rebuilt by opening every graph at startup; persist it if startup gets slow.
     index: RwLock<BTreeMap<String, Status>>,
+}
+
+/// Open graphs, closed least-recently-used first once there are more than `max`.
+#[derive(Debug)]
+struct Handles {
+    graphs: HashMap<String, (Arc<Graph>, u64)>,
+    tick: u64,
+    max: usize,
+}
+
+impl Handles {
+    fn get(&mut self, uuid: &str) -> Option<Arc<Graph>> {
+        self.tick += 1;
+        let (g, used) = self.graphs.get_mut(uuid)?;
+        *used = self.tick;
+        Some(Arc::clone(g))
+    }
+
+    fn insert(&mut self, uuid: &str, g: &Arc<Graph>) {
+        self.tick += 1;
+        self.graphs
+            .insert(uuid.to_owned(), (Arc::clone(g), self.tick));
+        // Only close graphs no request holds: reopening one that is still open elsewhere
+        // in the process is refused by LMDB. When all are busy, go over `max` for now.
+        // ponytail: O(open graphs) scan per eviction; a linked LRU if `max` gets large.
+        while self.graphs.len() > self.max {
+            let idle = self
+                .graphs
+                .iter()
+                .filter(|(_, (g, _))| Arc::strong_count(g) == 1)
+                .min_by_key(|(_, (_, used))| *used);
+            let Some(lru) = idle.map(|(u, _)| u.clone()) else {
+                break;
+            };
+            self.graphs.remove(&lru);
+        }
+    }
 }
 
 fn poisoned<T>(_: PoisonError<T>) -> ApiError {
@@ -58,12 +94,17 @@ impl Store {
     ///
     /// # Errors
     /// The HTTP error to send instead.
-    pub(crate) fn open(dir: impl Into<PathBuf>) -> Result<Self, ApiError> {
+    /// At most `max_open` graphs stay open while idle (each holds three file descriptors: the data file twice, plus its lock file).
+    pub(crate) fn open(dir: impl Into<PathBuf>, max_open: usize) -> Result<Self, ApiError> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).map_err(ApiError::io)?;
         let store = Self {
             dir,
-            open: Mutex::default(),
+            open: Mutex::new(Handles {
+                graphs: HashMap::new(),
+                tick: 0,
+                max: max_open,
+            }),
             index: RwLock::default(),
         };
         let names: Vec<String> = std::fs::read_dir(&store.dir)
@@ -96,7 +137,7 @@ impl Store {
     /// The HTTP error to send instead.
     pub(crate) fn graph(&self, uuid: &str, how: Open) -> Result<Arc<Graph>, ApiError> {
         let mut open = self.open.lock().map_err(poisoned)?;
-        let exists = open.contains_key(uuid) || self.path(uuid).exists();
+        let exists = open.graphs.contains_key(uuid) || self.path(uuid).exists();
         match (how, exists) {
             (Open::Existing, false) => return Err(ApiError::new(404, format!("no graph {uuid}"))),
             (Open::New, true) => {
@@ -105,10 +146,10 @@ impl Store {
             (Open::Existing, true) | (Open::New, false) => {}
         }
         if let Some(g) = open.get(uuid) {
-            return Ok(Arc::clone(g));
+            return Ok(g);
         }
         let g = Arc::new(Graph::open(self.path(uuid))?);
-        open.insert(uuid.to_owned(), Arc::clone(&g));
+        open.insert(uuid, &g);
         drop(open);
         Ok(g)
     }
@@ -159,7 +200,7 @@ impl Store {
     /// The HTTP error to send instead.
     pub(crate) fn delete(&self, uuid: &str) -> Result<(), ApiError> {
         let mut open = self.open.lock().map_err(poisoned)?;
-        open.remove(uuid);
+        open.graphs.remove(uuid);
         self.index.write().map_err(poisoned)?.remove(uuid);
         let removed = remove_lmdb(&self.path(uuid));
         drop(open); // held so a concurrent create cannot race the unlink
@@ -174,7 +215,7 @@ impl Store {
         {
             let open = self.open.lock().map_err(poisoned)?;
             let target = self.path(uuid);
-            if open.contains_key(uuid) || target.exists() {
+            if open.graphs.contains_key(uuid) || target.exists() {
                 return Err(ApiError::new(409, format!("graph {uuid} already exists")));
             }
             // A lock file belongs to one data file: never carry it across a rename.
@@ -279,6 +320,52 @@ mod tests {
         assert!(!allowed(&locked, &creds(Some("amy"), &["write"])));
         assert!(allowed(&locked, &creds(Some("bob"), &["write"])));
         assert!(!allowed(&locked, &creds(Some("eve"), &[])));
+    }
+
+    #[test]
+    fn idle_graphs_close_lru_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), 2).unwrap();
+        let uuids = [
+            "0b9e2f7c-5a1d-11ef-8d3e-0242ac120001",
+            "0b9e2f7c-5a1d-11ef-8d3e-0242ac120002",
+            "0b9e2f7c-5a1d-11ef-8d3e-0242ac120003",
+        ];
+        let open = || {
+            let mut v: Vec<String> = store.open.lock().unwrap().graphs.keys().cloned().collect();
+            v.sort();
+            v
+        };
+        for u in &uuids {
+            let g = store.graph(u, Open::New).unwrap();
+            let mut t = g.write().unwrap();
+            t.node(b"t", u.as_bytes()).unwrap();
+            t.commit().unwrap();
+        }
+        assert_eq!(open(), [uuids[1], uuids[2]], "first one closed");
+
+        // A graph a request still holds is never closed, even if least recently used.
+        let held = store.graph(uuids[1], Open::Existing).unwrap();
+        store.graph(uuids[2], Open::Existing).unwrap();
+        let zero = store.graph(uuids[0], Open::Existing).unwrap();
+        assert_eq!(open(), [uuids[0], uuids[1]]);
+        let more = store.graph(uuids[2], Open::Existing).unwrap();
+        assert_eq!(
+            open().len(),
+            3,
+            "everything busy: over the cap rather than double-open"
+        );
+        drop((held, zero, more));
+
+        // Reopened graphs still have their data.
+        let g = store.graph(uuids[0], Open::Existing).unwrap();
+        assert!(
+            g.read()
+                .unwrap()
+                .node_lookup(b"t", uuids[0].as_bytes(), None)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
