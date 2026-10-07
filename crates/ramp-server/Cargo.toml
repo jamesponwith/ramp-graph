@@ -1,6 +1,6 @@
 [package]
-name = "ramp-graph"
-description = "Log-structured transactional graph database"
+name = "ramp-server"
+description = "REST service for ramp-graph collections"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,19 +9,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-heed.workspace = true
-regex.workspace = true
+axum.workspace = true
+ramp-graph.workspace = true
 rmp-serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
-proptest.workspace = true
 tempfile.workspace = true
 
 [lints]
 workspace = true
-
-[[bench]]
-name = "insert"
-harness = false
