@@ -10,9 +10,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::store::Store;
 
@@ -101,9 +104,57 @@ async fn serve(State(store): State<Arc<Store>>, req: Request) -> Response {
         headers: parts.headers,
         body,
     };
-    tokio::task::spawn_blocking(move || api::handle(&store, &req))
-        .await
-        .unwrap_or_else(|_| {
-            (StatusCode::INTERNAL_SERVER_ERROR, "handler panicked\n").into_response()
-        })
+    let (head_tx, head_rx) = oneshot::channel();
+    let (body_tx, body_rx) = mpsc::channel(4);
+    let task = tokio::task::spawn_blocking(move || {
+        api::handle(
+            &store,
+            &req,
+            &mut Channel {
+                head: Some(head_tx),
+                body: body_tx,
+            },
+        );
+    });
+    let Ok((status, headers)) = head_rx.await else {
+        // The handler panicked before responding.
+        drop(task.await);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "handler panicked\n").into_response();
+    };
+    let mut res = Response::new(Body::from_stream(ReceiverStream::new(body_rx)));
+    *res.status_mut() = status;
+    for (k, v) in headers {
+        if let (Ok(k), Ok(v)) = (HeaderName::try_from(k), HeaderValue::try_from(v)) {
+            res.headers_mut().append(k, v);
+        }
+    }
+    res
+}
+
+/// Carries a response from the blocking handler to the async side: the head through a
+/// oneshot, body chunks through a small bounded channel, so a slow client stalls the
+/// handler instead of growing memory.
+struct Channel {
+    head: Option<oneshot::Sender<api::Head>>,
+    body: mpsc::Sender<Result<Bytes, std::io::Error>>,
+}
+
+impl api::Wire for Channel {
+    fn start(&mut self, status: StatusCode, headers: Vec<(&'static str, String)>) {
+        if let Some(head) = self.head.take() {
+            // If the connection is gone, the following writes report it.
+            head.send((status, headers)).unwrap_or_default();
+        }
+    }
+
+    fn write(&mut self, chunk: Vec<u8>) -> bool {
+        self.body.blocking_send(Ok(Bytes::from(chunk))).is_ok()
+    }
+
+    fn fail(&mut self) {
+        // An error item makes hyper abort the connection mid-body.
+        self.body
+            .blocking_send(Err(std::io::Error::other("response aborted")))
+            .unwrap_or_default();
+    }
 }
