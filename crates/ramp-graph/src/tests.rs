@@ -522,6 +522,42 @@ fn query_values_and_types() {
 }
 
 #[test]
+fn query_list_valued_natives() {
+    let (_d, g) = graph();
+    let mut t = g.write().unwrap();
+    let [bar, baz, gaz] = load(&mut t);
+    t.edge(baz, baz, b"loop", b"").unwrap();
+    t.edge(gaz, baz, b"back", b"").unwrap();
+    assert_eq!(
+        q(&t, "n(neighbor_count=2)", None),
+        ["foo:baz"],
+        "loop excluded, gaz counted once"
+    );
+    assert_eq!(
+        q(&t, "n(neighbor_types.goo=1, neighbor_types.foo=1)", None),
+        ["foo:baz"]
+    );
+    assert_eq!(
+        q(&t, &format!("n(neighborIDs={bar})"), None),
+        Vec::<String>::new(),
+        "a list never equals a scalar"
+    );
+    assert_eq!(q(&t, "n(edges:array, inboundIDs:array)", None).len(), 3);
+    assert_eq!(q(&t, "n(outbound_count=0)", None), Vec::<String>::new());
+    let ids = |key: &str, n: LogId| {
+        let e = t.entry(n).unwrap().unwrap();
+        t.resolve(&e, &[key.to_owned()], None).unwrap().unwrap()
+    };
+    assert_eq!(ids("neighbors", baz), json!([bar, gaz]));
+    assert_eq!(ids("inboundIDs", gaz).as_array().unwrap().len(), 1);
+    assert_eq!(
+        ids("edgeIDs", baz).as_array().unwrap().len(),
+        4,
+        "e1, e2, loop once, back"
+    );
+}
+
+#[test]
 fn query_uniqueness_and_history() {
     let (_d, g) = graph();
     let mut t = g.write().unwrap();

@@ -3,7 +3,11 @@
 //! A filter key resolves to a native field first, then to a property (msgpack value,
 //! see [`crate::value`]), then walks nested object keys. Native fields:
 //! - both: `ID`, `type`, `value`, `typeID`, `valueID`
-//! - nodes: `edge_count`, `inbound_count`, `outbound_count`
+//! - nodes: `edge_count`, `inbound_count`, `outbound_count`, `neighbor_count`;
+//!   ID lists `edges`/`edgeIDs`, `inbound`/`inboundIDs`, `outbound`/`outboundIDs`,
+//!   `neighbors`/`neighborIDs` (upstream yields objects for the former, which LGQL can
+//!   only test for existence; IDs keep that and make `:array`/list tests useful);
+//!   `neighbor_types` (`{type: count}`)
 //! - edges: `srcID`, `tgtID`, `src`, `tgt` (the latter two continue into the node: `src.type`)
 //!
 //! A key that does not resolve fails every test, including the negated ones.
@@ -318,7 +322,12 @@ impl Txn<'_> {
     ///
     /// # Errors
     /// Fails on storage errors.
-    fn resolve(&self, e: &Entry, path: &[String], view: Option<LogId>) -> Result<Option<Value>> {
+    pub(crate) fn resolve(
+        &self,
+        e: &Entry,
+        path: &[String],
+        view: Option<LogId>,
+    ) -> Result<Option<Value>> {
         let Some((k0, rest)) = path.split_first() else {
             return Ok(None);
         };
@@ -327,11 +336,23 @@ impl Txn<'_> {
                 String::from_utf8_lossy(self.string(id)?).into_owned(),
             ))
         };
-        let degree = |dir| -> Result<Value> {
-            let edges = self
-                .node_edges(e.id, dir, None, view)?
-                .try_fold(0_u64, |n, e| e.map(|_| n + 1))?;
-            Ok(Value::from(edges))
+        let edges =
+            |dir| -> Result<Vec<Entry>> { self.node_edges(e.id, dir, None, view)?.collect() };
+        let degree = |dir| -> Result<Value> { Ok(Value::from(edges(dir)?.len())) };
+        let ids = |dir| -> Result<Value> { Ok(edges(dir)?.iter().map(|e| e.id).collect()) };
+        // Distinct nodes at the other end of this node's edges (self-loops excluded).
+        let neighbors = || -> Result<Vec<LogId>> {
+            let mut out: Vec<LogId> = edges(Direction::Both)?
+                .iter()
+                .filter_map(|x| match x.record {
+                    Record::Edge { src, tgt, .. } => Some(if src == e.id { tgt } else { src }),
+                    Record::Node { .. } | Record::Prop { .. } | Record::Deletion { .. } => None,
+                })
+                .filter(|&n| n != e.id)
+                .collect();
+            out.sort_unstable();
+            out.dedup();
+            Ok(out)
         };
         let native = match (e.record, k0.as_str()) {
             (_, "ID") => Some(Value::from(e.id)),
@@ -344,6 +365,29 @@ impl Txn<'_> {
             (Record::Node { .. }, "edge_count") => Some(degree(Direction::Both)?),
             (Record::Node { .. }, "inbound_count") => Some(degree(Direction::In)?),
             (Record::Node { .. }, "outbound_count") => Some(degree(Direction::Out)?),
+            (Record::Node { .. }, "edges" | "edgeIDs") => Some(ids(Direction::Both)?),
+            (Record::Node { .. }, "inbound" | "inboundIDs") => Some(ids(Direction::In)?),
+            (Record::Node { .. }, "outbound" | "outboundIDs") => Some(ids(Direction::Out)?),
+            (Record::Node { .. }, "neighbors" | "neighborIDs") => {
+                Some(neighbors()?.into_iter().collect())
+            }
+            (Record::Node { .. }, "neighbor_count") => Some(Value::from(neighbors()?.len())),
+            (Record::Node { .. }, "neighbor_types") => {
+                let mut types = serde_json::Map::new();
+                for n in neighbors()? {
+                    if let Some(Entry {
+                        record: Record::Node { ty, .. },
+                        ..
+                    }) = self.entry(n)?
+                    {
+                        let count = types
+                            .entry(s(ty)?.as_str().unwrap_or_default().to_owned())
+                            .or_insert(Value::from(0));
+                        *count = Value::from(count.as_u64().unwrap_or(0) + 1);
+                    }
+                }
+                Some(Value::Object(types))
+            }
             (Record::Edge { src, .. }, "srcID") => Some(Value::from(src)),
             (Record::Edge { tgt, .. }, "tgtID") => Some(Value::from(tgt)),
             (Record::Edge { src: end, .. }, "src") | (Record::Edge { tgt: end, .. }, "tgt") => {
