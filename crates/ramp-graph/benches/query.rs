@@ -102,6 +102,8 @@ fn main() -> Result<()> {
     timed("n(type=\"node1\")-n()-n()", || {
         run(&t, &["n(type=\"node1\")-n()-n()".to_owned()])
     })?;
+    let pushdown = "n(type=\"node1\")-e(type=\"edge2\")-n()".to_owned();
+    timed(&pushdown.clone(), || run(&t, &[pushdown]))?;
     timed("counts at mid", || {
         t.counts(Some(n / 2)).map(|(nodes, _)| nodes)
     })?;
