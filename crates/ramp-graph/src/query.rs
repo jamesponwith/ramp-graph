@@ -258,7 +258,13 @@ impl Txn<'_> {
             *chain.get(from).ok_or_else(bad)?,
         );
         let dir = if pos > from { prev.fwd } else { prev.bwd };
-        for cand in self.neighbors(&cur, dir, view)? {
+        // An edge slot with `type=` walks only those types' edges (via the [node, type] index).
+        let types = (slot.kind == Kind::Edge)
+            .then(|| slot.eq_set("type"))
+            .flatten();
+        let types: Option<Vec<&str>> =
+            types.map(|ts| ts.into_iter().filter_map(Value::as_str).collect());
+        for cand in self.neighbors(&cur, dir, types.as_deref(), view)? {
             if slot.uniq && seen.contains(&cand.id) || !self.matches(&cand, slot, view)? {
                 continue;
             }
@@ -281,10 +287,25 @@ impl Txn<'_> {
     ///
     /// # Errors
     /// Fails on storage errors.
-    fn neighbors(&self, e: &Entry, dir: Direction, view: Option<LogId>) -> Result<Vec<Entry>> {
-        match e.record {
-            Record::Node { .. } => self.node_edges(e.id, dir, None, view)?.collect(),
-            Record::Edge { src, tgt, .. } => {
+    fn neighbors(
+        &self,
+        e: &Entry,
+        dir: Direction,
+        types: Option<&[&str]>,
+        view: Option<LogId>,
+    ) -> Result<Vec<Entry>> {
+        match (e.record, types) {
+            (Record::Node { .. }, None) => self.node_edges(e.id, dir, None, view)?.collect(),
+            (Record::Node { .. }, Some(types)) => {
+                let mut out = Vec::new();
+                for t in types {
+                    for edge in self.node_edges(e.id, dir, Some(t.as_bytes()), view)? {
+                        out.push(edge?);
+                    }
+                }
+                Ok(out)
+            }
+            (Record::Edge { src, tgt, .. }, _) => {
                 let ids = match dir {
                     Direction::In => vec![src],
                     Direction::Out => vec![tgt],
@@ -295,7 +316,7 @@ impl Txn<'_> {
                     .map(|id| self.entry(id)?.ok_or(GraphError::NotFound(id, "node")))
                     .collect()
             }
-            Record::Prop { .. } | Record::Deletion { .. } => Ok(Vec::new()),
+            (Record::Prop { .. } | Record::Deletion { .. }, _) => Ok(Vec::new()),
         }
     }
 

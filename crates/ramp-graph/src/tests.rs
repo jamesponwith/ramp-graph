@@ -522,6 +522,35 @@ fn query_values_and_types() {
 }
 
 #[test]
+fn edge_type_pushdown() {
+    let (_d, g) = graph();
+    let mut t = g.write().unwrap();
+    let a = t.node(b"t", b"a").unwrap().id;
+    for (i, ty) in [b"e1", b"e2", b"e3"].iter().enumerate() {
+        let b = t.node(b"t", format!("b{i}").as_bytes()).unwrap().id;
+        t.edge(a, b, *ty, b"").unwrap();
+        t.edge(b, a, *ty, b"back").unwrap();
+    }
+    assert_eq!(
+        q(&t, "n(value='a')->e(type=['e1','e3'])->n()", None),
+        ["t:a [e1:] t:b0", "t:a [e3:] t:b2"]
+    );
+    assert_eq!(
+        q(&t, "n(value='a')<-e(type='e2')-n()", None),
+        ["t:a [e2:back] t:b1"]
+    );
+    assert_eq!(q(&t, "n(value='a')-e(type='e2')-n()", None).len(), 2);
+    assert_eq!(
+        q(&t, "n(value='a')-e(type=1)-n()", None),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        q(&t, "n(value='a')-e(type='nope')-n()", None),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
 fn query_list_valued_natives() {
     let (_d, g) = graph();
     let mut t = g.write().unwrap();
