@@ -13,12 +13,12 @@
 //! A key that does not resolve fails every test, including the negated ones.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Number, Value};
 
 use crate::lgql::{Cmp, Kind, Pattern, Slot, Test};
-use crate::{Direction, Entry, GraphError, LogId, Record, Result, Txn, value};
+use crate::{Direction, Entry, GraphError, LogId, Record, Result, StrId, Txn, value, varint};
 
 const fn kind(e: &Entry) -> Option<Kind> {
     match e.record {
@@ -26,6 +26,38 @@ const fn kind(e: &Entry) -> Option<Kind> {
         Record::Edge { .. } => Some(Kind::Edge),
         Record::Prop { .. } | Record::Deletion { .. } => None,
     }
+}
+
+/// String IDs of every key-path segment in a query's filters, looked up once per call
+/// instead of once per object tested (strings cannot change while a query runs).
+#[derive(Debug, Default)]
+pub(crate) struct Keys(HashMap<String, Option<StrId>>);
+
+impl Keys {
+    /// # Errors
+    /// Fails on storage errors.
+    fn new(t: &Txn<'_>, patterns: &[Pattern]) -> Result<Self> {
+        let mut keys = HashMap::new();
+        for seg in patterns
+            .iter()
+            .flat_map(|p| &p.slots)
+            .flat_map(|s| &s.filters)
+            .flat_map(|f| &f.path)
+        {
+            if !keys.contains_key(seg) {
+                keys.insert(seg.clone(), t.string_id(seg.as_bytes())?);
+            }
+        }
+        Ok(Self(keys))
+    }
+}
+
+/// What stays fixed while one chain is expanded.
+#[derive(Debug, Clone, Copy)]
+struct Walk<'w> {
+    p: &'w Pattern,
+    view: Option<LogId>,
+    keys: &'w Keys,
 }
 
 type Seeds<'s> = Box<dyn Iterator<Item = Result<Entry>> + 's>;
@@ -43,14 +75,15 @@ impl Txn<'_> {
         mut sink: impl FnMut(usize, Vec<Entry>) -> bool,
     ) -> Result<()> {
         let view = self.view(before)?;
+        let keys = Keys::new(self, patterns)?;
         for (pi, p) in patterns.iter().enumerate() {
             let Some(slot) = p.slots.get(p.seed) else {
                 continue;
             };
             for seed in self.seeds(slot, view)? {
                 let seed = seed?;
-                if self.matches(&seed, slot, view)?
-                    && !self.expand(p, p.seed, seed, view, &mut |c| sink(pi, c))?
+                if self.matches(&seed, slot, view, &keys)?
+                    && !self.expand(p, p.seed, seed, view, &keys, &mut |c| sink(pi, c))?
                 {
                     return Ok(());
                 }
@@ -74,6 +107,7 @@ impl Txn<'_> {
         mut sink: impl FnMut(usize, LogId, Vec<Entry>) -> bool,
     ) -> Result<()> {
         let next = self.next_id()?;
+        let keys = Keys::new(self, patterns)?;
         let end = stop.map_or(next, |s| s.saturating_add(1).min(next));
         // Edge slots testing `src.*`/`tgt.*` change when an endpoint's property does.
         let via_ends = patterns.iter().flat_map(|p| &p.slots).any(|s| {
@@ -134,12 +168,12 @@ impl Txn<'_> {
                 let existed = id < x && obj.live_at(before);
                 for (pi, p) in patterns.iter().enumerate() {
                     for (si, slot) in p.slots.iter().enumerate() {
-                        if !self.matches(&obj, slot, after)?
-                            || existed && self.matches(&obj, slot, before)?
+                        if !self.matches(&obj, slot, after, &keys)?
+                            || existed && self.matches(&obj, slot, before, &keys)?
                         {
                             continue;
                         }
-                        self.expand(p, si, obj, after, &mut |c| {
+                        self.expand(p, si, obj, after, &keys, &mut |c| {
                             if emitted.insert((pi, c.iter().map(|e| e.id).collect::<Vec<_>>()))
                                 && !sink(pi, x, c)
                             {
@@ -214,6 +248,7 @@ impl Txn<'_> {
         s: usize,
         seed: Entry,
         view: Option<LogId>,
+        keys: &Keys,
         sink: &mut dyn FnMut(Vec<Entry>) -> bool,
     ) -> Result<bool> {
         let n = p.slots.len();
@@ -227,20 +262,21 @@ impl Txn<'_> {
         if p.slots.get(s).is_some_and(|x| x.uniq) {
             used.push(seed.id);
         }
-        self.step(p, &order, &mut chain, &mut used, view, sink)
+        let walk = Walk { p, view, keys };
+        self.step(&walk, &order, &mut chain, &mut used, sink)
     }
 
     /// # Errors
     /// Fails on storage errors.
     fn step(
         &self,
-        p: &Pattern,
+        w: &Walk<'_>,
         order: &[(usize, usize)],
         chain: &mut [Entry],
         seen: &mut Vec<LogId>,
-        view: Option<LogId>,
         sink: &mut dyn FnMut(Vec<Entry>) -> bool,
     ) -> Result<bool> {
+        let Walk { p, view, keys } = *w;
         let Some((&(pos, from), rest)) = order.split_first() else {
             let kept = p
                 .slots
@@ -265,14 +301,14 @@ impl Txn<'_> {
         let types: Option<Vec<&str>> =
             types.map(|ts| ts.into_iter().filter_map(Value::as_str).collect());
         for cand in self.neighbors(&cur, dir, types.as_deref(), view)? {
-            if slot.uniq && seen.contains(&cand.id) || !self.matches(&cand, slot, view)? {
+            if slot.uniq && seen.contains(&cand.id) || !self.matches(&cand, slot, view, keys)? {
                 continue;
             }
             *chain.get_mut(pos).ok_or_else(bad)? = cand;
             if slot.uniq {
                 seen.push(cand.id);
             }
-            let go = self.step(p, rest, chain, seen, view, sink)?;
+            let go = self.step(w, rest, chain, seen, sink)?;
             if slot.uniq {
                 seen.pop();
             }
@@ -320,17 +356,42 @@ impl Txn<'_> {
         }
     }
 
+    /// Decoded value of property `key` on `parent`; undecodable (non-msgpack) values resolve to nothing.
+    ///
+    /// # Errors
+    /// Fails on storage errors.
+    fn prop_value(
+        &self,
+        parent: LogId,
+        key: &str,
+        view: Option<LogId>,
+        keys: &Keys,
+    ) -> Result<Option<Value>> {
+        let id = match keys.0.get(key) {
+            Some(&id) => id,
+            None => self.string_id(key.as_bytes())?,
+        };
+        let Some(id) = id else { return Ok(None) };
+        match self.lookup(self.g.t.prop_idx, &varint::pack(&[parent, id]), view)? {
+            Some(Entry {
+                record: Record::Prop { val, .. },
+                ..
+            }) => Ok(value::decode(self.string(val)?).ok()),
+            _ => Ok(None),
+        }
+    }
+
     /// Whether `e` satisfies every filter of `slot` in `view`.
     ///
     /// # Errors
     /// Fails on storage errors.
-    fn matches(&self, e: &Entry, slot: &Slot, view: Option<LogId>) -> Result<bool> {
+    fn matches(&self, e: &Entry, slot: &Slot, view: Option<LogId>, keys: &Keys) -> Result<bool> {
         if kind(e) != Some(slot.kind) {
             return Ok(false);
         }
         for f in &slot.filters {
             if !self
-                .resolve(e, &f.path, view)?
+                .resolve(e, &f.path, view, keys)?
                 .is_some_and(|v| holds(&f.test, &v))
             {
                 return Ok(false);
@@ -348,6 +409,7 @@ impl Txn<'_> {
         e: &Entry,
         path: &[String],
         view: Option<LogId>,
+        keys: &Keys,
     ) -> Result<Option<Value>> {
         let Some((k0, rest)) = path.split_first() else {
             return Ok(None);
@@ -418,20 +480,13 @@ impl Txn<'_> {
                 let Some(node) = self.entry(end)? else {
                     return Ok(None);
                 };
-                return self.resolve(&node, rest, view);
+                return self.resolve(&node, rest, view, keys);
             }
             _ => None,
         };
         let base = match native {
             Some(v) => Some(v),
-            None => match self.prop(e.id, k0.as_bytes(), view)? {
-                // Undecodable values (not msgpack) resolve to nothing.
-                Some(Entry {
-                    record: Record::Prop { val, .. },
-                    ..
-                }) => value::decode(self.string(val)?).ok(),
-                _ => None,
-            },
+            None => self.prop_value(e.id, k0, view, keys)?,
         };
         Ok(base.and_then(|b| {
             rest.iter().try_fold(b, |v, k| match v {

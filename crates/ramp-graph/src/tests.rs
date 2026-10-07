@@ -575,7 +575,9 @@ fn query_list_valued_natives() {
     assert_eq!(q(&t, "n(outbound_count=0)", None), Vec::<String>::new());
     let ids = |key: &str, n: LogId| {
         let e = t.entry(n).unwrap().unwrap();
-        t.resolve(&e, &[key.to_owned()], None).unwrap().unwrap()
+        t.resolve(&e, &[key.to_owned()], None, &query::Keys::default())
+            .unwrap()
+            .unwrap()
     };
     assert_eq!(ids("neighbors", baz), json!([bar, gaz]));
     assert_eq!(ids("inboundIDs", gaz).as_array().unwrap().len(), 1);
