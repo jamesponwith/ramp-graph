@@ -226,7 +226,7 @@ fn empty_strings_are_id_zero() {
 fn kv() {
     let (_d, g) = graph();
     let mut t = g.write().unwrap();
-    for (i, k) in ["fo", "fon", "foo", "foobar", "foobaz", "fom"]
+    for (i, k) in ["f", "fa", "foo", "foobar", "foobaz", "fz"]
         .iter()
         .enumerate()
     {
@@ -240,9 +240,9 @@ fn kv() {
         .map(|kv| kv.unwrap().0)
         .collect();
     assert_eq!(keys, [&b"foo"[..], b"foobar", b"foobaz"]);
-    assert_eq!(t.kv_get(b"foo", b"fon").unwrap(), Some(&b"1"[..]));
-    assert!(t.kv_del(b"foo", b"fon").unwrap());
-    assert!(!t.kv_del(b"foo", b"fon").unwrap());
+    assert_eq!(t.kv_get(b"foo", b"fa").unwrap(), Some(&b"1"[..]));
+    assert!(t.kv_del(b"foo", b"fa").unwrap());
+    assert!(!t.kv_del(b"foo", b"fa").unwrap());
     assert_eq!(t.kv_iter(b"missing", b"").unwrap().count(), 0);
 }
 
