@@ -29,8 +29,9 @@ const USAGE: &str = "usage: ramp-server [-i ip] [-p port] [-n max_open] [dir]";
 #[expect(clippy::print_stderr, reason = "CLI diagnostics")]
 fn main() -> ExitCode {
     let (mut ip, mut port, mut dir) = ("127.0.0.1".to_owned(), 8000_u16, "graphs".to_owned());
-    // Idle graphs kept open; each holds three file descriptors: the data file twice, plus its lock file.
-    let mut max_open = 256_usize;
+    // Idle graphs kept open. Each costs 3 file descriptors and ~2 MiB of RAM (LMDB
+    // preallocates its write-txn dirty list per environment).
+    let mut max_open = 64_usize;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let ok = match a.as_str() {

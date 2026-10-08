@@ -29,6 +29,7 @@ mod varint;
 
 use std::ops::Bound;
 use std::path::Path;
+use std::sync::{Condvar, Mutex};
 
 use heed::types::Bytes;
 use heed::{CompactionOption, Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn, WithTls};
@@ -226,9 +227,18 @@ struct Tables {
     kv: Table,
 }
 
-/// 1 TiB of address space. LMDB only maps it; the file grows as data is written.
-// ponytail: fixed map size, add resize-on-MDB_MAP_FULL if a single graph ever nears 1 TiB.
-const MAP_SIZE: usize = 1 << 40;
+/// Address space mapped past the end of the file. The map grows before a write txn that
+/// would have less, so one write txn can add at most this much data (as upstream).
+const PAD: usize = if cfg!(test) { 1 << 20 } else { 1 << 30 };
+
+/// Map size for a file of `len` bytes: whole pads, at least one pad past the end.
+fn map_size(len: u64) -> usize {
+    usize::try_from(len)
+        .unwrap_or(usize::MAX)
+        .div_ceil(PAD)
+        .saturating_add(1)
+        .saturating_mul(PAD)
+}
 
 /// A graph stored in one LMDB file (plus a `-lock` file beside it).
 ///
@@ -238,7 +248,35 @@ const MAP_SIZE: usize = 1 << 40;
 pub struct Graph {
     env: Env,
     t: Tables,
+    /// Txns active in this process, which LMDB requires to be zero to resize the map.
+    txns: Mutex<Active>,
+    idle: Condvar,
 }
+
+/// See [`Graph::txns`] (upstream `db_t.txns` in `lib/db.c`).
+#[derive(Debug, Default)]
+struct Active {
+    count: usize,
+    /// A resize is waiting: new txns hold off so it cannot starve.
+    resizing: bool,
+}
+
+/// Counts one active txn; dropping it (after the LMDB txn has ended) uncounts it.
+#[derive(Debug)]
+struct Ticket<'a>(&'a Graph);
+
+impl Drop for Ticket<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut a) = self.0.txns.lock() {
+            a.count = a.count.saturating_sub(1);
+            if a.count == 0 {
+                self.0.idle.notify_all();
+            }
+        }
+    }
+}
+
+const POISONED: GraphError = GraphError::Corrupt("txn counter poisoned");
 
 impl Graph {
     /// Opens the graph at `path`, creating it if missing.
@@ -246,8 +284,9 @@ impl Graph {
     /// # Errors
     /// Fails if the file cannot be opened or is not an LMDB file.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let len = std::fs::metadata(path.as_ref()).map_or(0, |m| m.len());
         let mut opts = EnvOpenOptions::new();
-        opts.map_size(MAP_SIZE).max_dbs(10);
+        opts.map_size(map_size(len)).max_dbs(10);
         // SAFETY: NO_SUB_DIR only selects the single-file layout.
         unsafe { opts.flags(EnvFlags::NO_SUB_DIR) };
         // SAFETY: the file is only modified through LMDB, whose lock file arbitrates between
@@ -268,7 +307,62 @@ impl Graph {
             kv: table("kv")?,
         };
         w.commit()?;
-        Ok(Self { env, t })
+        Ok(Self {
+            env,
+            t,
+            txns: Mutex::default(),
+            idle: Condvar::new(),
+        })
+    }
+
+    /// Registers a txn about to start, waiting out any resize.
+    ///
+    /// # Errors
+    /// Fails if a thread panicked while holding the counter.
+    fn ticket(&self) -> Result<Ticket<'_>> {
+        let mut a = self.txns.lock().map_err(|_| POISONED)?;
+        while a.resizing {
+            a = self.idle.wait(a).map_err(|_| POISONED)?;
+        }
+        a.count += 1;
+        drop(a);
+        Ok(Ticket(self))
+    }
+
+    /// Grows the map if less than [`PAD`] is left past the end of the file.
+    ///
+    /// # Errors
+    /// Fails if the file cannot be stat'ed or the map cannot grow.
+    fn reserve(&self) -> Result<()> {
+        // `Some(new size)` when less than a pad is free past the end of the file.
+        let short = |g: &Self| -> Result<Option<usize>> {
+            let len = g.size()?;
+            let end = usize::try_from(len)
+                .unwrap_or(usize::MAX)
+                .saturating_add(PAD);
+            Ok((g.env.info().map_size < end).then(|| map_size(len)))
+        };
+        if short(self)?.is_none() {
+            return Ok(());
+        }
+        let mut a = self.txns.lock().map_err(|_| POISONED)?;
+        while a.resizing {
+            a = self.idle.wait(a).map_err(|_| POISONED)?; // another thread is on it
+        }
+        a.resizing = true;
+        while a.count > 0 {
+            a = self.idle.wait(a).map_err(|_| POISONED)?;
+        }
+        let grown = short(self).and_then(|want| match want {
+            // SAFETY: `count` is zero and `resizing` keeps new txns from starting, and every
+            // txn holds a `Ticket` for its whole life: no txn of this env is active in the process.
+            Some(want) => unsafe { self.env.resize(want) }.map_err(GraphError::from),
+            None => Ok(()),
+        });
+        a.resizing = false;
+        self.idle.notify_all();
+        drop(a);
+        grown
     }
 
     /// Starts a read transaction: a consistent snapshot that never blocks writers.
@@ -276,24 +370,31 @@ impl Graph {
     /// # Errors
     /// Fails if LMDB is out of reader slots.
     pub fn read(&self) -> Result<Txn<'_>> {
+        let ticket = self.ticket()?;
         Ok(Txn {
             g: self,
             inner: Inner::Ro(self.env.read_txn()?),
             state: State::default(),
             parent: None,
+            _ticket: Some(ticket),
         })
     }
 
-    /// Starts a write transaction. Blocks while another write transaction is open.
+    /// Starts a write transaction. Blocks while another write transaction is open, and,
+    /// when the map must grow first, until this process has no other txn on the graph
+    /// (so do not call it while this thread holds one).
     ///
     /// # Errors
-    /// Fails if LMDB cannot start the transaction.
+    /// Fails if LMDB cannot start the transaction or grow the map.
     pub fn write(&self) -> Result<Txn<'_>> {
+        self.reserve()?;
+        let ticket = self.ticket()?;
         let mut txn = Txn {
             g: self,
             inner: Inner::Rw(self.env.write_txn()?),
             state: State::default(),
             parent: None,
+            _ticket: Some(ticket),
         };
         txn.state.begin = txn.next_id()?;
         txn.state.next_log = txn.state.begin;
@@ -321,7 +422,9 @@ impl Graph {
     /// # Errors
     /// Fails if `path` exists or cannot be written.
     pub fn snapshot(&self, path: impl AsRef<Path>) -> Result<()> {
+        let ticket = self.ticket()?; // the copy runs its own read txn
         self.env.copy_to_path(path, CompactionOption::Enabled)?;
+        drop(ticket);
         Ok(())
     }
 }
@@ -352,6 +455,9 @@ pub struct Txn<'a> {
     inner: Inner<'a>,
     state: State,
     parent: Option<&'a mut State>,
+    /// Held until the LMDB txn has ended (fields drop in order); nested txns ride on
+    /// their parent's.
+    _ticket: Option<Ticket<'a>>,
 }
 
 impl std::fmt::Debug for Txn<'_> {
@@ -1177,6 +1283,7 @@ impl<'a> Txn<'a> {
             inner: Inner::Rw(g.env.nested_write_txn(parent)?),
             state: self.state,
             parent: Some(&mut self.state),
+            _ticket: None,
         })
     }
 
@@ -1211,12 +1318,14 @@ impl<'a> Txn<'a> {
             inner,
             state,
             parent,
+            _ticket: ticket,
             ..
         } = self;
         match inner {
             Inner::Ro(t) => t.commit()?,
             Inner::Rw(t) => t.commit()?,
         }
+        drop(ticket);
         if let Some(p) = parent {
             *p = state;
         }
