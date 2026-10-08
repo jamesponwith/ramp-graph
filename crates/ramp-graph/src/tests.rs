@@ -305,6 +305,75 @@ fn reset() {
 }
 
 #[test]
+fn map_grows_past_the_initial_size() {
+    // Tests use a 1 MiB pad: ~6 MiB over many txns forces several resizes.
+    let (_d, g) = graph();
+    let initial = g.env.info().map_size;
+    let blob = vec![b'x'; 64 << 10];
+    let mut ids = Vec::new();
+    for i in 0..96_u32 {
+        let mut t = g.write().unwrap();
+        let n = t.node(b"t", &i.to_be_bytes()).unwrap().id;
+        t.set(n, b"blob", &[blob.as_slice(), &i.to_be_bytes()].concat())
+            .unwrap();
+        t.commit().unwrap();
+        ids.push(n);
+    }
+    assert!(g.env.info().map_size > initial, "map grew");
+    assert!(
+        g.size().unwrap() > u64::try_from(4 * PAD).unwrap(),
+        "file outgrew several pads"
+    );
+    let r = g.read().unwrap();
+    assert_eq!(r.counts(None).unwrap().0, 96);
+    assert!(r.prop(ids[95], b"blob", None).unwrap().is_some());
+}
+
+#[test]
+fn growth_waits_for_readers_on_other_threads() {
+    let (_d, g) = graph();
+    let blob = vec![b'y'; 256 << 10];
+    std::thread::scope(|s| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let g = &g;
+        let reader = s.spawn(move || {
+            let r = g.read().unwrap();
+            tx.send(()).unwrap();
+            std::thread::park_timeout(std::time::Duration::from_millis(200));
+            r.counts(None).unwrap()
+        });
+        rx.recv().unwrap();
+        // Enough data to need growth while the reader holds its txn: the writer must wait.
+        for i in 0..12_u8 {
+            let mut t = g.write().unwrap();
+            let n = t.node(b"w", &[i]).unwrap().id;
+            t.set(n, b"blob", &[blob.as_slice(), &[i]].concat())
+                .unwrap();
+            t.commit().unwrap();
+        }
+        assert_eq!(reader.join().unwrap(), (0, 0), "reader kept its snapshot");
+    });
+    assert_eq!(g.read().unwrap().counts(None).unwrap().0, 12);
+}
+
+#[test]
+fn one_txn_larger_than_the_pad_fails_cleanly() {
+    let (_d, g) = graph();
+    let mut t = g.write().unwrap();
+    let n = t.node(b"t", b"big").unwrap().id;
+    let blob = vec![b'z'; 3 * PAD];
+    assert!(
+        matches!(t.set(n, b"blob", &blob), Err(GraphError::Lmdb(_))),
+        "map full"
+    );
+    drop(t);
+    let mut t = g.write().unwrap();
+    t.node(b"t", b"after").unwrap();
+    t.commit().unwrap();
+    assert_eq!(g.read().unwrap().counts(None).unwrap().0, 1);
+}
+
+#[test]
 fn snapshot_and_reopen() {
     let (d, g) = graph();
     let mut t = g.write().unwrap();

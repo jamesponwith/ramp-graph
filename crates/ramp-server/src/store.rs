@@ -94,7 +94,8 @@ impl Store {
     ///
     /// # Errors
     /// The HTTP error to send instead.
-    /// At most `max_open` graphs stay open while idle (each holds three file descriptors: the data file twice, plus its lock file).
+    /// At most `max_open` graphs stay open while idle (each holds three file descriptors
+    /// and ~2 MiB of RAM).
     pub(crate) fn open(dir: impl Into<PathBuf>, max_open: usize) -> Result<Self, ApiError> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).map_err(ApiError::io)?;
