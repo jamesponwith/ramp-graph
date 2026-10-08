@@ -5,7 +5,7 @@ backed by a single LMDB file, with historical views by log position, a query lan
 and a REST service. Goals: faster, fix upstream bugs, keep the core model.
 
 ## Spec
-- `docs/spec.md` (local only, not committed yet) is the architecture spec and source of truth. Update it in the same change when a design decision changes.
+- `docs/spec.md` is the architecture spec and source of truth. Update it in the same change when a design decision changes.
 
 ## Upstream reference
 - Run `./scripts/fetch-reference.sh` to get the pinned upstream source at `reference/lemongraph/`.
