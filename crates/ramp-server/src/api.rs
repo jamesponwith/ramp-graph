@@ -10,10 +10,10 @@ use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
 use ramp_graph::lgql::{ParseError, Pattern};
 use ramp_graph::value::{self, Value};
-use ramp_graph::{Direction, Entry, Graph, GraphError, LogId, Record, Txn};
+use ramp_graph::{Direction, Entry, Graph, GraphError, LogId, Projection, Record, Txn};
 use serde_json::{Map, json};
 
-use crate::input::{self, Input, SEEDS, as_dict, format_edge, props_dict, run_adapters};
+use crate::input::{self, Input, Render, SEEDS, as_dict, format_edge, props_dict, run_adapters};
 use crate::store::{Creds, Open, Status, Store, allowed, is_uuid, remove_lmdb};
 
 /// Kv domain behind `/kv/<uuid>`.
@@ -232,6 +232,17 @@ impl Streamer<'_, '_> {
         self.raw(if self.items == 0 { b"[" } else { b"," })?;
         self.items += 1;
         self.raw(&serde_json::to_vec(v).unwrap_or_default())
+    }
+
+    /// One JSON array element written straight into the buffer by `f`.
+    ///
+    /// # Errors
+    /// Whatever `f` fails with, or the client went away.
+    fn raw_item(&mut self, f: impl FnOnce(&mut Vec<u8>) -> Res<()>) -> Res<()> {
+        self.buf.push(if self.items == 0 { b'[' } else { b',' });
+        self.items += 1;
+        f(&mut self.buf)?;
+        self.raw(b"")
     }
 
     /// Closes an item stream.
@@ -703,10 +714,11 @@ impl<'r> Ctx<'r> {
             let t = g.read()?;
             stream_chains(
                 &t,
+                None,
                 &patterns,
                 &mut out,
                 0,
-                |qi, chain| Ok(json!([uuid, qi, chain])),
+                &[Value::from(uuid.as_str())],
                 |sink| t.query(&patterns, None, |qi, c| sink(qi, None, c)),
             )?;
         }
@@ -850,12 +862,19 @@ impl<'r> Ctx<'r> {
             }
             let mut out = self.items();
             out.item(&uniq)?;
+            // A scan on the current view gets a projection, built now if a commit
+            // dropped the cached one; point lookups never pay for it.
+            // ponytail: rebuilt in full after any commit; incremental when write-heavy graphs need it
+            let proj = (start.is_none() && view.is_none() && patterns.iter().any(Pattern::scans))
+                .then(|| t.projection())
+                .transpose()?;
             stream_chains(
                 t,
+                proj.as_deref(),
                 &patterns,
                 &mut out,
                 limit,
-                |qi, chain| Ok(json!([qi, chain])),
+                &[],
                 |sink| match start {
                     Some(start) => {
                         t.mquery(&patterns, start, stop, |qi, x, c| sink(qi, Some(x + 1), c))
@@ -1099,21 +1118,48 @@ fn dump(
 /// The HTTP error to send instead.
 fn stream_chains(
     t: &Txn<'_>,
+    proj: Option<&Projection>,
     patterns: &[Pattern],
     out: &mut Streamer<'_, '_>,
     limit: usize,
-    row: impl Fn(usize, Vec<Value>) -> Res<Value>,
+    prefix: &[Value],
     run: impl FnOnce(&mut dyn FnMut(usize, Option<LogId>, &[Entry]) -> bool) -> Result<(), GraphError>,
 ) -> Res<()> {
     debug_assert!(!patterns.is_empty(), "callers handle the no-query case");
     let (mut n, mut failed) = (0, None);
+    let mut render = Render::new(t, proj);
     run(&mut |qi, at, chain| {
-        let written = chain
-            .iter()
-            .map(|e| as_dict(t, e, at))
-            .collect::<Res<Vec<_>>>()
-            .and_then(|c| row(qi, c))
-            .and_then(|r| out.item(&r));
+        // A row is `[prefix…, qi, [object, …]]`.
+        let written = if out.msgpack {
+            chain
+                .iter()
+                .map(|e| as_dict(t, e, at))
+                .collect::<Res<Vec<_>>>()
+                .and_then(|c| {
+                    let mut row = prefix.to_vec();
+                    row.push(qi.into());
+                    row.push(Value::Array(c));
+                    out.item(&Value::Array(row))
+                })
+        } else {
+            out.raw_item(|buf| {
+                buf.push(b'[');
+                for p in prefix {
+                    buf.extend_from_slice(&json_bytes(p));
+                    buf.push(b',');
+                }
+                buf.extend_from_slice(qi.to_string().as_bytes());
+                buf.extend_from_slice(b",[");
+                for (i, e) in chain.iter().enumerate() {
+                    if i > 0 {
+                        buf.push(b',');
+                    }
+                    render.json(buf, e, at)?;
+                }
+                buf.extend_from_slice(b"]]");
+                Ok(())
+            })
+        };
         if let Err(e) = written {
             failed = Some(e);
             return false;

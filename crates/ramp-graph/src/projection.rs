@@ -56,6 +56,8 @@ pub struct Projection {
     by_kv: Vec<(StrId, StrId, LogId)>,
     /// Live properties as `(parent, key, value)`, sorted; one per `(parent, key)`.
     by_pk: Vec<(LogId, StrId, StrId)>,
+    /// Per row, where its properties start in `by_pk` (one past the end at `rows.len()`).
+    prop_off: Vec<u32>,
 }
 
 /// # Errors
@@ -250,6 +252,18 @@ impl Projection {
         by_kv.sort_unstable();
         let mut by_pk = props;
         by_pk.sort_unstable();
+        // Rows and `by_pk` are both in log-ID order; properties of non-rows (a property
+        // of a property) sit between and are skipped past.
+        let mut prop_off = Vec::with_capacity(rows.len() + 1);
+        let mut at = 0_usize;
+        for e in &rows {
+            at += by_pk
+                .get(at..)
+                .unwrap_or_default()
+                .partition_point(|&(p, _, _)| p < e.id);
+            prop_off.push(row(at)?);
+        }
+        prop_off.push(row(by_pk.len())?);
         Ok(Self {
             end,
             slot,
@@ -264,6 +278,7 @@ impl Projection {
             ends,
             by_kv,
             by_pk,
+            prop_off,
         })
     }
 
@@ -408,6 +423,32 @@ impl Projection {
             .map(|&(_, _, v)| v)
     }
 
+    /// Live properties of `parent` as `(parent, key, value)`, in key-ID order (the order
+    /// [`Txn::props`] yields them).
+    #[must_use]
+    pub fn props_of(&self, parent: LogId) -> &[(LogId, StrId, StrId)] {
+        let Some(r) = self.row_of(parent) else {
+            // Not a node or edge (a property's properties): search.
+            let lo = self.by_pk.partition_point(|&(p, _, _)| p < parent);
+            let hi = lo
+                + self
+                    .by_pk
+                    .get(lo..)
+                    .unwrap_or_default()
+                    .partition_point(|&(p, _, _)| p == parent);
+            return self.by_pk.get(lo..hi).unwrap_or_default();
+        };
+        let (Some(&lo), Some(&hi)) = (self.prop_off.get(index(r)), self.prop_off.get(index(r) + 1))
+        else {
+            return &[];
+        };
+        // The span runs to the next row's start, so it may end with properties of
+        // non-rows that sort after this row; this row's own come first.
+        let span = self.by_pk.get(index(lo)..index(hi)).unwrap_or_default();
+        let len = span.partition_point(|&(p, _, _)| p == parent);
+        span.get(..len).unwrap_or_default()
+    }
+
     /// Live properties `key == val` as `(key, val, parent)`, in parent order.
     pub(crate) fn kv_range(&self, key: StrId, val: StrId) -> &[(StrId, StrId, LogId)] {
         let lo = self.by_kv.partition_point(|&(k, v, _)| (k, v) < (key, val));
@@ -432,6 +473,7 @@ impl Projection {
             + self.ends.len() * size_of::<[End; 2]>()
             + self.by_kv.len() * size_of::<(StrId, StrId, LogId)>()
             + self.by_pk.len() * size_of::<(LogId, StrId, StrId)>()
+            + self.prop_off.len() * size_of::<u32>()
     }
 
     /// Chains of `patterns` in this view, as [`Txn::query`] would yield them.
