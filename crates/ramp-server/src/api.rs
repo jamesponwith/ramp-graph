@@ -24,6 +24,8 @@ const RESTOBJS: &[u8] = b"lg.restobjs";
 const BUFFER: usize = 1 << 20;
 /// Chunk size once streaming.
 const CHUNK: usize = 64 << 10;
+/// A graph's projection is rebuilt only when the last build is this many build-times old.
+const PROJECTION_DUTY: u32 = 4;
 
 /// A response head: status and headers.
 pub(crate) type Head = (StatusCode, Vec<(&'static str, String)>);
@@ -863,11 +865,14 @@ impl<'r> Ctx<'r> {
             let mut out = self.items();
             out.item(&uniq)?;
             // A scan on the current view gets a projection, built now if a commit
-            // dropped the cached one; point lookups never pay for it.
-            // ponytail: rebuilt in full after any commit; incremental when write-heavy graphs need it
+            // dropped the cached one, unless this graph is being rebuilt too often:
+            // builds stay under a fifth of its time, and scans in between read LMDB.
+            // Point lookups never pay for it.
+            // ponytail: rebuilt in full when due; incremental maintenance if the LMDB fallback bites
             let proj = (start.is_none() && view.is_none() && patterns.iter().any(Pattern::scans))
-                .then(|| t.projection())
-                .transpose()?;
+                .then(|| t.projection_if_due(PROJECTION_DUTY))
+                .transpose()?
+                .flatten();
             if proj.is_some() {
                 self.store.fit_projections(uuid)?;
             }
