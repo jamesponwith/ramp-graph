@@ -27,7 +27,8 @@ mod query;
 pub mod value;
 mod varint;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::{Condvar, Mutex};
@@ -232,6 +233,29 @@ struct Tables {
 
 /// Entries kept in a write txn's string cache before it is cleared.
 const STR_CACHE: usize = 1 << 12;
+/// Node IDs kept in a write txn's liveness cache before it is cleared.
+const LIVE_CACHE: usize = 1 << 20;
+
+/// Fibonacci hashing for log IDs: one multiply, and sequential IDs spread evenly.
+/// `SipHash` cost more than the log read it replaced on a bulk load.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0 ^ i).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 
 /// Address space mapped past the end of the file. The map grows before a write txn that
 /// would have less, so one write txn can add at most this much data (as upstream).
@@ -383,6 +407,8 @@ impl Graph {
             state: State::default(),
             parent: None,
             strs: HashMap::new(),
+            old_live: HashSet::default(),
+            new_live: Vec::new(),
             _ticket: Some(ticket),
         };
         // The snapshot is fixed, so the end of the log is too: look it up once, not
@@ -406,6 +432,8 @@ impl Graph {
             state: State::default(),
             parent: None,
             strs: HashMap::new(),
+            old_live: HashSet::default(),
+            new_live: Vec::new(),
             _ticket: Some(ticket),
         };
         txn.state.begin = txn.next_id()?;
@@ -469,6 +497,11 @@ pub struct Txn<'a> {
     parent: Option<&'a mut State>,
     /// Strings this write txn has already found in the string table, by bytes.
     strs: HashMap<Vec<u8>, StrId>,
+    /// Nodes this write txn has already seen live; `end` removes what it ends. Nodes
+    /// it created itself (`id >= state.begin`) are bits of `new_live`, the rest are in
+    /// `old_live`. In a read txn `begin` is 0 and only `old_live` is used.
+    old_live: HashSet<LogId, BuildHasherDefault<IdHasher>>,
+    new_live: Vec<u64>,
     /// Held until the LMDB txn has ended (fields drop in order); nested txns ride on
     /// their parent's.
     _ticket: Option<Ticket<'a>>,
@@ -1091,6 +1124,7 @@ impl<'a> Txn<'a> {
             };
             e.next = by;
             t.log.put(self.rw()?, &varint::pack(&[id]), &e.encode())?;
+            self.forget_live(id);
             let key = varint::pack(&[id]);
             let mut children: Vec<LogId> = self
                 .scan(t.prop_idx, key.clone(), None)?
@@ -1113,6 +1147,66 @@ impl<'a> Txn<'a> {
         Ok(())
     }
 
+    /// Bit position of `id` in `new_live`, if it was logged by this txn.
+    fn new_bit(&self, id: LogId) -> Option<(usize, u64)> {
+        let off = id
+            .checked_sub(self.state.begin)
+            .filter(|_| self.state.begin > 0)?;
+        Some((usize::try_from(off / 64).ok()?, 1 << (off % 64)))
+    }
+
+    /// Remembers that `node` is live in this txn (see [`live_node`](Self::live_node)).
+    fn saw_live(&mut self, node: LogId) {
+        if let Some((word, bit)) = self.new_bit(node) {
+            if self.new_live.len() <= word {
+                self.new_live.resize(word + 1, 0);
+            }
+            if let Some(w) = self.new_live.get_mut(word) {
+                *w |= bit;
+            }
+        } else {
+            // ponytail: flat cap, cleared when full; an LRU if a hot set outgrows it
+            if self.old_live.len() >= LIVE_CACHE {
+                self.old_live.clear();
+            }
+            self.old_live.insert(node);
+        }
+    }
+
+    fn forget_live(&mut self, node: LogId) {
+        match self.new_bit(node) {
+            Some((word, bit)) => {
+                if let Some(w) = self.new_live.get_mut(word) {
+                    *w &= !bit;
+                }
+            }
+            None => {
+                self.old_live.remove(&node);
+            }
+        }
+    }
+
+    fn seen_live(&self, node: LogId) -> bool {
+        match self.new_bit(node) {
+            Some((word, bit)) => self.new_live.get(word).is_some_and(|w| w & bit != 0),
+            None => self.old_live.contains(&node),
+        }
+    }
+
+    /// [`live`](Self::live) for a node, through the per-txn cache: an endpoint this txn
+    /// created, found, or already checked costs a bit test or a hash probe instead of
+    /// a log read.
+    ///
+    /// # Errors
+    /// [`GraphError::NotFound`] if `id` is not a live node.
+    fn live_node(&mut self, id: LogId) -> Result<()> {
+        if !self.seen_live(id) {
+            self.live(id, "node")?;
+            self.saw_live(id);
+        }
+        Ok(())
+    }
+
     /// Finds or creates node `(ty, val)`. Works in a read txn if the node exists.
     ///
     /// # Errors
@@ -1122,12 +1216,14 @@ impl<'a> Txn<'a> {
         if let (Some(t), Some(v)) = (t0, v0)
             && let Some(e) = self.lookup(self.g.t.node_idx, &varint::pack(&[t, v]), None)?
         {
+            self.saw_live(e.id);
             return Ok(e);
         }
         let (ty, val) = (self.intern_known(ty, t0)?, self.intern_known(val, v0)?);
         let e = self.append(Record::Node { ty, val }, 0)?;
         self.put_idx(self.g.t.node_idx, &[ty, val, e.id])?;
         self.state.node_delta += 1;
+        self.saw_live(e.id);
         Ok(e)
     }
 
@@ -1137,8 +1233,8 @@ impl<'a> Txn<'a> {
     /// [`GraphError::NotFound`] if `src` or `tgt` is not a live node;
     /// [`GraphError::ReadOnly`] if it would have to be created in a read txn.
     pub fn edge(&mut self, src: LogId, tgt: LogId, ty: &[u8], val: &[u8]) -> Result<Entry> {
-        self.live(src, "node")?;
-        self.live(tgt, "node")?;
+        self.live_node(src)?;
+        self.live_node(tgt)?;
         let (t0, v0) = (self.known(ty)?, self.known(val)?);
         if let (Some(t), Some(v)) = (t0, v0)
             && let Some(e) =
@@ -1307,6 +1403,8 @@ impl<'a> Txn<'a> {
             ..State::default()
         };
         self.strs.clear();
+        self.old_live.clear();
+        self.new_live.clear();
         Ok(())
     }
 
@@ -1320,12 +1418,16 @@ impl<'a> Txn<'a> {
         let Inner::Rw(parent) = &mut self.inner else {
             return Err(GraphError::ReadOnly);
         };
+        self.old_live.clear();
+        self.new_live.clear();
         Ok(Txn {
             g,
             inner: Inner::Rw(g.env.nested_write_txn(parent)?),
             state: self.state,
             parent: Some(&mut self.state),
             strs: HashMap::new(),
+            old_live: HashSet::default(),
+            new_live: Vec::new(),
             _ticket: None,
         })
     }
