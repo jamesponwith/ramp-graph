@@ -251,6 +251,17 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
 
    A count at a mid-txn view replays the log from the last txn boundary, as upstream does. That is slow only for a view inside one huge transaction.
 
+   **REST** (2026-10-08, same machine, `ramp-server` release build, a stdlib Python client over keep-alive connections, so the read numbers are client-bound):
+
+   | load | result |
+   |---|---|
+   | 4 writers, 100-node batches with one property each | 1.5k req/s, 152k nodes/s, p50 2.5 ms |
+   | 1 writer, single-node requests | 5.0k req/s, p50 0.2 ms |
+   | 4 writers, single-node requests | 8.0k req/s, p50 0.5 ms |
+   | 8 readers, point-lookup queries | 6–9k req/s, p50 0.5 ms |
+
+   In-process, one 100-node batch costs ≈440 µs (parse 30, apply 290, adapters 45, commit 17), so a request adds ≈200 µs of transport. Commits are fsynced and that is not the bottleneck on NVMe: upstream's `-s`/`-m` nosync flags stay unported. A REST node costs ~3× a bench node because each request also merges properties (read, merge, encode, set) and runs the adapters.
+
    **Not yet measured:**
-   - REST throughput
-   - a CPU profile of any phase (no `perf` on the bench machine yet); the remaining per-insert suspects are the parent-liveness read in `set` and the small per-op key allocations
+   - a CPU profile of any phase (no `perf` on the bench machine yet); the remaining per-insert suspects are the parent-liveness read in `set`, the double property lookup in `set_merged`, and the small per-op key allocations
+   - REST reads with a client that is not GIL-bound
