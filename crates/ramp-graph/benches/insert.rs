@@ -98,9 +98,16 @@ fn main() -> Result<()> {
         start.elapsed().as_secs_f64()
     );
 
-    // The same edges through `edge_batch`, in one batch and in REST-sized ones.
+    bulk_edges(dir.path(), n, &pairs)
+}
+
+/// The same edges through `edge_batch`, in one batch and in REST-sized ones.
+///
+/// # Errors
+/// Storage errors.
+fn bulk_edges(dir: &std::path::Path, n: u64, pairs: &BTreeSet<(u64, u64)>) -> Result<()> {
     for batch in [n, 10_000] {
-        let g = Graph::open(dir.path().join(format!("bulk{batch}.db")))?;
+        let g = Graph::open(dir.join(format!("bulk{batch}.db")))?;
         let mut t = g.write()?;
         let mut nodes = Vec::new();
         for x in 0..n {
@@ -120,7 +127,7 @@ fn main() -> Result<()> {
         let tys: Vec<String> = (0..5).map(|i| format!("edge{i}")).collect();
         let vals: Vec<String> = (0..n).map(|i| i.to_string()).collect();
         let specs: Vec<EdgeSpec<'_>> = (0_u64..)
-            .zip(&pairs)
+            .zip(pairs)
             .filter_map(|(i, &(x, y))| {
                 Some(EdgeSpec {
                     src: *nodes.get(usize::try_from(x).ok()?)?,
