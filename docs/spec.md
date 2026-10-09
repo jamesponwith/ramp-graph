@@ -220,7 +220,7 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
    |---|---|---|---|
    | 1M nodes | 150k/s | 860k/s | 5.7× |
    | 1M props | 375k/s | 984k/s | 2.6× |
-   | 1M edges | 110k/s | 254k/s | 2.3× |
+   | 1M edges | 110k/s | 343k/s | 3.1× |
    | commit | — | 69ms | |
    | file | 293 MiB | 299 MiB | ≈ |
 
@@ -230,7 +230,8 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
    - Next log/string IDs are cached per write txn, as upstream does (nested txns inherit and fold back the cache). Each string is looked up once per insert.
    - The log, string, and txnlog tables are written with `MDB_APPEND`: their keys are allocated monotonically and the log is only ever rewritten in place. Nodes 584k/s → 652k/s, props 542k/s → 580k/s.
    - A per-txn cache of strings already on disk (`Txn::known`) makes a repeated type, key, or value one hash probe instead of a hash-index scan plus a string fetch. Only hits are cached, so unique values never fill it; a flat cap clears it. Nodes 652k/s → 858k/s, props 580k/s → 980k/s, edges 236k/s → 250k/s.
-   - Edges remain bound by three random-key index inserts per edge and two endpoint liveness reads.
+   - A per-txn liveness cache of node IDs (`Txn::live_node`) spares `edge` its two endpoint log reads when the txn created, found, or already checked the node. This txn's own nodes are a bitset over `begin..`; older ones go in a hash set with a multiplicative hasher and a flat cap. `end` clears what it ends, and a nested txn clears its parent's cache since it may delete. Interleaved A/B against the commit before: edges 243k/s → 340k/s, nodes and props unchanged.
+   - Edges remain bound by the uniqueness lookup and three index inserts per edge.
 
    **Query benchmark** `crates/ramp-graph/benches/query.rs`. 1M nodes with one property each, plus 1M deterministic edges. Upstream ran an identical Python mirror on CPython 3.14, on the same idle machine. Result counts match exactly:
 

@@ -309,6 +309,32 @@ fn reset() {
 }
 
 #[test]
+fn edge_endpoint_liveness_is_rechecked_after_delete() {
+    // Endpoints are cached as live per txn; a delete (direct, cascaded, or in a nested
+    // txn) must drop them from the cache.
+    let (_d, g) = graph();
+    let mut t = g.write().unwrap();
+    let na = t.node(b"t", b"a").unwrap().id;
+    let nb = t.node(b"t", b"b").unwrap().id;
+    let nc = t.node(b"t", b"c").unwrap().id;
+    t.edge(na, nb, b"e", b"").unwrap();
+    t.delete(nb).unwrap();
+    assert!(
+        matches!(t.edge(na, nb, b"e", b"2"), Err(GraphError::NotFound(id, "node")) if id == nb)
+    );
+    let mut n = t.nested().unwrap();
+    n.edge(na, nc, b"e", b"").unwrap();
+    n.delete(nc).unwrap();
+    n.commit().unwrap();
+    assert!(
+        matches!(t.edge(na, nc, b"e", b"2"), Err(GraphError::NotFound(id, "node")) if id == nc)
+    );
+    t.edge(na, na, b"e", b"loop").unwrap();
+    t.commit().unwrap();
+    assert_eq!(g.read().unwrap().counts(None).unwrap(), (1, 1));
+}
+
+#[test]
 fn map_grows_past_the_initial_size() {
     // Tests use a 1 MiB pad: ~6 MiB over many txns forces several resizes.
     let (_d, g) = graph();
