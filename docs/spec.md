@@ -277,7 +277,9 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
 
    Per object the render went from ≈1.8 µs to ≈0.5 µs; what is left is mostly the LMDB read of each object's own value string. The first scan after a commit also pays the projection build (≈0.4 s here).
 
-   In-process, one 100-node batch costs ≈440 µs (parse 30, apply 290, adapters 45, commit 17), so a request adds ≈200 µs of transport. Commits are fsynced and that is not the bottleneck on NVMe: upstream's `-s`/`-m` nosync flags stay unported. A REST node costs ~3× a bench node because each request also merges properties (read, merge, encode, set) and runs the adapters.
+   In-process, one 100-node batch costs ≈440 µs (parse 30, apply 290, adapters 45, commit 17), so a request adds ≈200 µs of transport.
+
+   Edges posted by `src`/`tgt` type and value cost ≈7 µs each in-process (parse 0.7, apply 5.8, adapters 0.6): two endpoint resolutions (an index seek and a log read each) on top of the ≈3 µs engine insert. That is the floor for this wire shape; a client that posts endpoint `ID`s skips the seeks. The adapters no longer re-check the endpoints of a live edge, since a live edge implies live endpoints. Commits are fsynced and that is not the bottleneck on NVMe: upstream's `-s`/`-m` nosync flags stay unported. A REST node costs ~3× a bench node because each request also merges properties (read, merge, encode, set) and runs the adapters.
 
    **Against LadybugDB** (2026-10-08, same laptop, LadybugDB 0.15.3 via `real_ladybug`, the community fork of Kùzu; `scripts/bench-ladybugdb.py` mirrors both benches). It is the nearest embedded peer: single process, one file, Cypher. Its model is schema-first and columnar, ours is schemaless and log-based with history, so the comparison is of workloads, not of a like for like engine.
 

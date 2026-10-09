@@ -1,5 +1,6 @@
 //! Rendering graph objects to JSON, applying client input, and the depth/cost adapters.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -371,6 +372,10 @@ impl Input<'_, '_> {
     }
 
     fn props<'v>(&self, obj: &'v Map<String, Value>, reserved: &[&str]) -> Vec<(&'v str, Value)> {
+        // The common case: nothing but natives, and no seed to add.
+        if !self.seed && obj.keys().all(|k| reserved.contains(&k.as_str())) {
+            return Vec::new();
+        }
         let mut props: Vec<(&str, Value)> = obj
             .iter()
             .filter(|(k, _)| !reserved.contains(&k.as_str()))
@@ -445,24 +450,27 @@ impl Input<'_, '_> {
             let ty = obj.get("type").and_then(scalar).ok_or_else(bad)?;
             let val = obj
                 .get("value")
-                .map_or(Some(String::new()), scalar)
+                .map_or(Some(Cow::Borrowed("")), scalar)
                 .ok_or_else(bad)?;
             self.t
                 .edge(src.id, tgt.id, ty.as_bytes(), val.as_bytes())
                 .map_err(|_| bad())?
         };
         let mut props = self.props(obj, EDGE_RESERVED);
-        let current = self
-            .t
-            .value(entry.id, "cost", None)
-            .ok()
-            .flatten()
-            .and_then(|v| v.as_f64());
-        props.retain(|(k, v)| {
-            *k != "cost"
-                || v.as_f64()
-                    .is_some_and(|c| (0.0..=1.0).contains(&c) && current.is_none_or(|cur| c < cur))
-        });
+        if props.iter().any(|(k, _)| *k == "cost") {
+            let current = self
+                .t
+                .value(entry.id, "cost", None)
+                .ok()
+                .flatten()
+                .and_then(|v| v.as_f64());
+            props.retain(|(k, v)| {
+                *k != "cost"
+                    || v.as_f64().is_some_and(|c| {
+                        (0.0..=1.0).contains(&c) && current.is_none_or(|cur| c < cur)
+                    })
+            });
+        }
         for (k, v) in props {
             set_merged(self.t, entry.id, k, &v)?;
         }
@@ -479,13 +487,13 @@ fn as_array<'v>(v: &'v Value, what: &str) -> Result<&'v [Value], ApiError> {
 }
 
 /// Node/edge type or value as upstream's default serializer stores it.
-fn scalar(v: &Value) -> Option<String> {
+fn scalar(v: &Value) -> Option<Cow<'_, str>> {
     match v {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        Value::Bool(true) => Some("True".to_owned()),
-        Value::Bool(false) => Some("False".to_owned()),
-        Value::Null => Some(String::new()),
+        Value::String(s) => Some(Cow::Borrowed(s)),
+        Value::Number(n) => Some(Cow::Owned(n.to_string())),
+        Value::Bool(true) => Some(Cow::Borrowed("True")),
+        Value::Bool(false) => Some(Cow::Borrowed("False")),
+        Value::Null => Some(Cow::Borrowed("")),
         Value::Array(_) | Value::Object(_) => None,
     }
 }
@@ -525,6 +533,9 @@ pub(crate) fn run_adapters(t: &mut Txn<'_>, start: LogId) -> Result<(), ApiError
         let Some(e) = t.entry(x)? else { break };
         x += 1;
         match e.record {
+            // A live edge has live endpoints (deleting a node ends its edges), so only
+            // an edge ended within this request needs its endpoints checked.
+            Record::Edge { src, tgt, .. } if e.next == 0 => relax_live(t, src, tgt, 1.0)?,
             Record::Edge { src, tgt, .. } => relax(t, src, tgt, 1.0)?,
             Record::Prop { parent, key, val } => {
                 let key = match t.string(key)? {
@@ -561,6 +572,14 @@ fn relax(t: &mut Txn<'_>, src: LogId, tgt: LogId, cost: f64) -> Result<(), ApiEr
     if live(t, src)?.is_none() || live(t, tgt)?.is_none() {
         return Ok(());
     }
+    relax_live(t, src, tgt, cost)
+}
+
+/// [`relax`] for endpoints known to be live.
+///
+/// # Errors
+/// The HTTP error to send instead.
+fn relax_live(t: &mut Txn<'_>, src: LogId, tgt: LogId, cost: f64) -> Result<(), ApiError> {
     let (ds, dt) = (depth(t, src), depth(t, tgt));
     if ds + cost < dt {
         t.set_value(tgt, "depth", &num(ds + cost))?;
