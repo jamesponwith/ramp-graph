@@ -223,8 +223,8 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
 
    | metric | ramp-graph | best other measured here | standing |
    |---|---|---|---|
-   | transactional inserts, 1 thread | 828k nodes/s, 984k props/s, 343k edges/s | upstream LemonGraph 150k / 375k / 110k; LadybugDB bulk `COPY` 737k / 330k edges on 1 thread | ahead |
-   | bulk edges, 1 thread | 520k/s (`edge_batch`) | LadybugDB `COPY` 610k/s on 8 threads | ahead per thread; behind its 8 cores |
+   | transactional inserts, 1 thread | 780k nodes/s, 970k props/s, 400k edges/s | upstream LemonGraph 150k / 375k / 110k; LadybugDB bulk `COPY` 737k / 330k edges on 1 thread | ahead |
+   | bulk edges, 1 thread | 845k/s (`edge_batch`) | LadybugDB `COPY` 330k/s on 1 thread, 610k/s on 8 | ahead, even of its 8 cores |
    | ad-hoc queries, 1 thread (projection) | scans 3 ms, 2-hop 20 ms, 3-node chain 0.27 s | LadybugDB 23 / 33 / 880 ms | ahead on every row |
    | ad-hoc queries, 8 threads | scans 1 ms, 2-hop 5 ms, 3-node chain 47 ms | LadybugDB 6 / 10 / 410 ms | ahead on every row |
    | point lookups, 10k | 48 ms (LMDB), 52 ms (projection) | LadybugDB 79 ms | ahead |
@@ -243,10 +243,10 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
 
    | phase | upstream | ramp-graph | speedup |
    |---|---|---|---|
-   | 1M nodes | 150k/s | 860k/s | 5.7× |
-   | 1M props | 375k/s | 984k/s | 2.6× |
-   | 1M edges | 110k/s | 343k/s | 3.1× |
-   | 1M edges via `edge_batch`, one batch / 10k-edge batches | — | 520k/s / 440k/s | 4.7× / 4.0× |
+   | 1M nodes | 150k/s | 780k/s | 5.2× |
+   | 1M props | 375k/s | 970k/s | 2.6× |
+   | 1M edges | 110k/s | 400k/s | 3.6× |
+   | 1M edges via `edge_batch`, one batch / 10k-edge batches | — | 845k/s / 570k/s | 7.7× / 5.2× |
    | commit | — | 69ms | |
    | file | 293 MiB | 299 MiB | ≈ |
 
@@ -255,9 +255,9 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
    **Write-path optimisations.**
    - Next log/string IDs are cached per write txn, as upstream does (nested txns inherit and fold back the cache). Each string is looked up once per insert.
    - The log, string, and txnlog tables are written with `MDB_APPEND`: their keys are allocated monotonically and the log is only ever rewritten in place. Nodes 584k/s → 652k/s, props 542k/s → 580k/s.
-   - A per-txn cache of strings already on disk (`Txn::known`) makes a repeated type, key, or value one hash probe instead of a hash-index scan plus a string fetch. Only hits are cached, so unique values never fill it; a flat cap clears it. Nodes 652k/s → 858k/s, props 580k/s → 980k/s, edges 236k/s → 250k/s.
+   - A per-txn cache of strings (`Txn::known`, `StrCache`) makes a repeated type, key, or value one hash probe instead of a hash-index scan plus a string fetch. It holds strings found on disk and strings the txn interned itself, so a bulk load's edges find the values its nodes just created. Bytes live in one arena keyed by the FNV hash the string index needs anyway, so caching costs no allocation per string; a colliding hash is simply not cached, and a flat cap of 2²⁰ entries clears it. Nodes 652k/s → 780k/s, props 580k/s → 970k/s, edges 236k/s → 400k/s.
    - A per-txn liveness cache of node IDs (`Txn::live_node`) spares `edge` its two endpoint log reads when the txn created, found, or already checked the node. This txn's own nodes are a bitset over `begin..`; older ones go in a hash set with a multiplicative hasher and a flat cap. `end` clears what it ends, and a nested txn clears its parent's cache since it may delete. Interleaved A/B against the commit before: edges 243k/s → 340k/s, nodes and props unchanged.
-   - `Txn::edge_batch` takes a batch of edge specs, interns and checks liveness first, looks existing edges up in key order, appends all new log records, then fills each of the three index tables in its own key order, so a batch costs sequential B-tree inserts instead of random ones: 520k/s in one batch of a million, 440k/s in batches of 10k. Per-edge calls remain bound by the uniqueness lookup and three random index inserts.
+   - `Txn::edge_batch` takes a batch of edge specs, interns and checks liveness first, looks existing edges up in key order, appends all new log records, then fills each of the three index tables in its own key order, so a batch costs sequential B-tree inserts instead of random ones. When a batch's smallest key sorts after everything already in a table (a bulk load), it skips the existence lookups and writes with `MDB_APPEND`, which also packs pages full: 845k/s in one batch of a million, 570k/s in batches of 10k. Per-edge calls remain bound by the uniqueness lookup and three random index inserts.
 
    **Query benchmark** `crates/ramp-graph/benches/query.rs`. 1M nodes with one property each, plus 1M deterministic edges. Upstream ran an identical Python mirror on CPython 3.14, on the same idle machine. Result counts match exactly:
 
@@ -329,8 +329,8 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
 
    | load, 1M nodes + 1M props + 1M edges | nodes | edges |
    |---|---|---|
-   | ramp-graph, one txn, per-object API, 1 thread | **828k/s** | **343k/s** |
-   | ramp-graph, `edge_batch`, 1 thread | | **520k/s** |
+   | ramp-graph, one txn, per-object API, 1 thread | **780k/s** | **400k/s** |
+   | ramp-graph, `edge_batch`, 1 thread | | **845k/s** |
    | LadybugDB `COPY` from Parquet, 1 thread (bulk; needs a schema and a file) | 737k/s | 330k/s |
    | LadybugDB `COPY`, 8 threads | 1.0M/s | 610k/s |
    | LadybugDB `CREATE`, 10k-row batches, one txn or auto-commit | 33k/s | 2.4k/s at 10k, 850/s at 20k, superlinear |
