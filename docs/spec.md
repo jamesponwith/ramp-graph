@@ -307,8 +307,8 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
    The 2-hop was the last row to fall. A chain materialises its far node; copying each edge's two endpoints into its projection row (`End`) made that read warm, and precomputing the fill order and hop types per pattern, passing fully-kept chains to the sink uncopied, and carrying edge rows through expansion took the executor from ≈250 ns to ≈125 ns per chain.
 
    What remains, in order:
-   1. Keeping the projection warm in the server: build on first query, rebuild incrementally after small commits instead of dropping it.
-   3. A property index on disk, for `n(key=val)` without a projection.
+   1. Incremental maintenance of the projection after a commit, so a graph that is written and scanned constantly does not fall back to LMDB between duty-cycled rebuilds (see REST).
+   2. A property index on disk, for `n(key=val)` without a projection.
 
    **Not yet measured:**
    - a CPU profile of any phase (no `perf` on the bench machine yet); the remaining per-insert suspects are the parent-liveness read in `set`, the double property lookup in `set_merged`, and the small per-op key allocations
