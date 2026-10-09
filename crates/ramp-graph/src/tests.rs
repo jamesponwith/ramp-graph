@@ -295,13 +295,17 @@ fn reset() {
     t.commit().unwrap();
     let mut t = g.write().unwrap();
     assert_eq!(t.next_id().unwrap(), 2);
+    t.node(b"a", b"b").unwrap(); // warms the string cache, which reset must drop
     t.reset().unwrap();
     assert_eq!(t.next_id().unwrap(), 1);
     t.node(b"c", b"d").unwrap();
+    let n = t.node(b"a", b"b").unwrap();
+    assert_eq!(n.id, 2);
     t.commit().unwrap();
     let r = g.read().unwrap();
-    assert_eq!(r.next_id().unwrap(), 2);
-    assert_eq!(r.counts(None).unwrap(), (1, 0));
+    assert_eq!(r.next_id().unwrap(), 3);
+    assert_eq!(r.counts(None).unwrap(), (2, 0));
+    assert_eq!(r.string(r.string_id(b"a").unwrap().unwrap()).unwrap(), b"a");
 }
 
 #[test]
@@ -588,6 +592,41 @@ fn query_values_and_types() {
         "repeated ~ is AND (upstream: cannot match)"
     );
     assert_eq!(q(&t, "n(x=1, x=2)", None), Vec::<String>::new());
+}
+
+#[test]
+fn query_string_equality_by_id() {
+    // `=`/`!=` against string literals compares interned IDs: same answers as resolving.
+    let (_d, g) = graph();
+    let mut t = g.write().unwrap();
+    let a = t.node(b"t", b"a").unwrap().id;
+    let b = t.node(b"t", b"b").unwrap().id;
+    t.set_value(a, "s", &json!("str")).unwrap();
+    t.set_value(b, "s", &json!(7)).unwrap();
+    t.edge(a, b, b"e", b"").unwrap();
+    let none = Vec::<String>::new();
+    assert_eq!(q(&t, "n(s='str')", None), ["t:a"]);
+    assert_eq!(q(&t, "n(s!='str')", None), ["t:b"], "7 is not 'str'");
+    assert_eq!(q(&t, "n(s='7')", None), none, "'7' is not 7");
+    assert_eq!(q(&t, "n(s=['none','str'])", None), ["t:a"]);
+    assert_eq!(q(&t, "n(value='b')", None), ["t:b"]);
+    assert_eq!(q(&t, "n(type!='t')", None), none);
+    assert_eq!(
+        q(&t, "n(type='nope')", None),
+        none,
+        "literal never interned"
+    );
+    assert_eq!(
+        q(&t, "n(nope!='x')", None),
+        none,
+        "unresolved keys fail != too"
+    );
+    assert_eq!(
+        q(&t, "e(src!='1')", None),
+        ["[e:]"],
+        "src is an ID, not a property"
+    );
+    assert_eq!(q(&t, "e(value='')", None), ["[e:]"]);
 }
 
 #[test]

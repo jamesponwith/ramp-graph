@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Number, Value};
 
-use crate::lgql::{Cmp, Kind, Pattern, Slot, Test};
+use crate::lgql::{Cmp, Filter, Kind, Pattern, Slot, Test};
 use crate::{Direction, Entry, GraphError, LogId, Record, Result, StrId, Txn, value, varint};
 
 const fn kind(e: &Entry) -> Option<Kind> {
@@ -28,27 +28,73 @@ const fn kind(e: &Entry) -> Option<Kind> {
     }
 }
 
-/// String IDs of every key-path segment in a query's filters, looked up once per call
-/// instead of once per object tested (strings cannot change while a query runs).
+/// String IDs of every key-path segment and equality literal in a query's filters,
+/// looked up once per call instead of once per object tested (strings cannot change
+/// while a query runs).
 #[derive(Debug, Default)]
-pub(crate) struct Keys(HashMap<String, Option<StrId>>);
+pub(crate) struct Keys {
+    keys: HashMap<String, Option<StrId>>,
+    /// Per key of a single-key `=`/`!=` test, the ID of each string literal: of its
+    /// raw bytes for `type`/`value`, of its msgpack encoding for a property. `None`
+    /// means no object holds that string.
+    literals: HashMap<String, HashMap<String, Option<StrId>>>,
+}
 
 impl Keys {
     /// # Errors
     /// Fails on storage errors.
     fn new(t: &Txn<'_>, patterns: &[Pattern]) -> Result<Self> {
-        let mut keys = HashMap::new();
-        for seg in patterns
+        let mut k = Self::default();
+        for f in patterns
             .iter()
             .flat_map(|p| &p.slots)
             .flat_map(|s| &s.filters)
-            .flat_map(|f| &f.path)
         {
-            if !keys.contains_key(seg) {
-                keys.insert(seg.clone(), t.string_id(seg.as_bytes())?);
+            for seg in &f.path {
+                // `type`/`value` are native on every object a slot can hold.
+                if !k.keys.contains_key(seg) && !NATIVE_STR.contains(&seg.as_str()) {
+                    k.keys.insert(seg.clone(), t.string_id(seg.as_bytes())?);
+                }
+            }
+            let (Some(vals), [key]) = (eq_strings(f), f.path.as_slice()) else {
+                continue;
+            };
+            let packed = !NATIVE_STR.contains(&key.as_str());
+            let literals = k.literals.entry(key.clone()).or_default();
+            for v in vals {
+                if !literals.contains_key(v) {
+                    let id = if packed {
+                        t.string_id(&value::encode(&Value::from(v))?)?
+                    } else {
+                        t.string_id(v.as_bytes())?
+                    };
+                    literals.insert(v.to_owned(), id);
+                }
             }
         }
-        Ok(Self(keys))
+        Ok(k)
+    }
+
+    /// Whether any of `key`'s literals `literals` is interned as `id`.
+    fn any_is(&self, key: &str, literals: &[&str], id: StrId) -> bool {
+        self.literals.get(key).is_some_and(|m| {
+            literals
+                .iter()
+                .any(|l| m.get(*l).copied().flatten() == Some(id))
+        })
+    }
+}
+
+/// Native string fields of nodes and edges, the only objects a slot can hold.
+const NATIVE_STR: [&str; 2] = ["type", "value"];
+
+/// The literals of a single-key `=`/`!=` test, if every one is a string.
+fn eq_strings(f: &Filter) -> Option<Vec<&str>> {
+    match (f.path.as_slice(), &f.test) {
+        ([_], Test::In(vals) | Test::NotIn(vals)) => {
+            vals.iter().map(Value::as_str).collect::<Option<Vec<_>>>()
+        }
+        _ => None,
     }
 }
 
@@ -367,7 +413,7 @@ impl Txn<'_> {
         view: Option<LogId>,
         keys: &Keys,
     ) -> Result<Option<Value>> {
-        let id = match keys.0.get(key) {
+        let id = match keys.keys.get(key) {
             Some(&id) => id,
             None => self.string_id(key.as_bytes())?,
         };
@@ -390,14 +436,61 @@ impl Txn<'_> {
             return Ok(false);
         }
         for f in &slot.filters {
-            if !self
-                .resolve(e, &f.path, view, keys)?
-                .is_some_and(|v| holds(&f.test, &v))
-            {
+            let ok = match self.eq_by_id(e, f, view, keys)? {
+                Some(ok) => ok,
+                None => self
+                    .resolve(e, &f.path, view, keys)?
+                    .is_some_and(|v| holds(&f.test, &v)),
+            };
+            if !ok {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// A single-key `=`/`!=` test against string literals, decided by comparing interned
+    /// IDs instead of materialising the value. `None` when the test is not of that
+    /// shape or the key is a computed native field, which [`resolve`](Self::resolve)
+    /// handles. Same result as the slow path: a key that does not resolve fails both tests.
+    ///
+    /// # Errors
+    /// Fails on storage errors.
+    fn eq_by_id(
+        &self,
+        e: &Entry,
+        f: &Filter,
+        view: Option<LogId>,
+        keys: &Keys,
+    ) -> Result<Option<bool>> {
+        let (Some(literals), [k]) = (eq_strings(f), f.path.as_slice()) else {
+            return Ok(None);
+        };
+        let negated = matches!(f.test, Test::NotIn(_));
+        let id = match (e.record, k.as_str()) {
+            (Record::Node { ty, .. } | Record::Edge { ty, .. }, "type") => ty,
+            (Record::Node { val, .. } | Record::Edge { val, .. }, "value") => val,
+            // `src`/`tgt` are handled before properties in `resolve`.
+            (Record::Edge { .. }, "src" | "tgt") => return Ok(None),
+            _ => {
+                if self.native(e, k, view)?.is_some() {
+                    return Ok(None);
+                }
+                let Some(key) = keys.keys.get(k).copied().flatten() else {
+                    return Ok(Some(false));
+                };
+                return Ok(Some(
+                    match self.lookup(self.g.t.prop_idx, &varint::pack(&[e.id, key]), view)? {
+                        Some(Entry {
+                            record: Record::Prop { val, .. },
+                            ..
+                        }) => keys.any_is(k, &literals, val) != negated,
+                        _ => false,
+                    },
+                ));
+            }
+        };
+        Ok(Some(keys.any_is(k, &literals, id) != negated))
     }
 
     /// The value at `path` on `e` in `view`, if any.
@@ -414,6 +507,38 @@ impl Txn<'_> {
         let Some((k0, rest)) = path.split_first() else {
             return Ok(None);
         };
+        if let (Record::Edge { src: end, .. }, "src") | (Record::Edge { tgt: end, .. }, "tgt") =
+            (e.record, k0.as_str())
+        {
+            if rest.is_empty() {
+                return Ok(Some(Value::from(end)));
+            }
+            let Some(node) = self.entry(end)? else {
+                return Ok(None);
+            };
+            return self.resolve(&node, rest, view, keys);
+        }
+        let base = match self.native(e, k0, view)? {
+            Some(v) => Some(v),
+            None => self.prop_value(e.id, k0, view, keys)?,
+        };
+        Ok(base.and_then(|b| {
+            rest.iter().try_fold(b, |v, k| match v {
+                Value::Object(mut m) => m.remove(k),
+                Value::Null
+                | Value::Bool(_)
+                | Value::Number(_)
+                | Value::String(_)
+                | Value::Array(_) => None,
+            })
+        }))
+    }
+
+    /// A native field of `e` other than `src`/`tgt`, or `None` if `k0` is not one.
+    ///
+    /// # Errors
+    /// Fails on storage errors.
+    fn native(&self, e: &Entry, k0: &str, view: Option<LogId>) -> Result<Option<Value>> {
         let s = |id| -> Result<Value> {
             Ok(Value::String(
                 String::from_utf8_lossy(self.string(id)?).into_owned(),
@@ -437,7 +562,7 @@ impl Txn<'_> {
             out.dedup();
             Ok(out)
         };
-        let native = match (e.record, k0.as_str()) {
+        Ok(match (e.record, k0) {
             (_, "ID") => Some(Value::from(e.id)),
             (Record::Node { ty, .. } | Record::Edge { ty, .. }, "type") => Some(s(ty)?),
             (Record::Node { val, .. } | Record::Edge { val, .. }, "value") => Some(s(val)?),
@@ -473,31 +598,8 @@ impl Txn<'_> {
             }
             (Record::Edge { src, .. }, "srcID") => Some(Value::from(src)),
             (Record::Edge { tgt, .. }, "tgtID") => Some(Value::from(tgt)),
-            (Record::Edge { src: end, .. }, "src") | (Record::Edge { tgt: end, .. }, "tgt") => {
-                if rest.is_empty() {
-                    return Ok(Some(Value::from(end)));
-                }
-                let Some(node) = self.entry(end)? else {
-                    return Ok(None);
-                };
-                return self.resolve(&node, rest, view, keys);
-            }
             _ => None,
-        };
-        let base = match native {
-            Some(v) => Some(v),
-            None => self.prop_value(e.id, k0, view, keys)?,
-        };
-        Ok(base.and_then(|b| {
-            rest.iter().try_fold(b, |v, k| match v {
-                Value::Object(mut m) => m.remove(k),
-                Value::Null
-                | Value::Bool(_)
-                | Value::Number(_)
-                | Value::String(_)
-                | Value::Array(_) => None,
-            })
-        }))
+        })
     }
 }
 

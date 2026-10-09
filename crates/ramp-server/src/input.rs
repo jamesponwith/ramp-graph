@@ -406,7 +406,10 @@ pub(crate) fn run_adapters(t: &mut Txn<'_>, start: LogId) -> Result<(), ApiError
         match e.record {
             Record::Edge { src, tgt, .. } => relax(t, src, tgt, 1.0)?,
             Record::Prop { parent, key, val } => {
-                let key = t.string(key)?.to_vec();
+                let key = match t.string(key)? {
+                    k @ (b"seed" | b"depth" | b"cost") => k.to_vec(),
+                    _ => continue,
+                };
                 let v = value::decode(t.string(val)?).unwrap_or(Value::Null);
                 match (key.as_slice(), live(t, parent)?) {
                     (b"seed", Some(Record::Node { .. })) if truthy(&v) => {
