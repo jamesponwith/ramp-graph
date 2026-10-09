@@ -29,3 +29,7 @@ harness = false
 [[bench]]
 name = "query"
 harness = false
+
+[[bench]]
+name = "stream"
+harness = false

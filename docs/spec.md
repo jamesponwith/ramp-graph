@@ -257,6 +257,19 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
 
    A count at a mid-txn view replays the log from the last txn boundary, as upstream does. That is slow only for a view inside one huge transaction.
 
+   **Streaming, history, deletes** (`crates/ramp-graph/benches/stream.rs`, 2026-10-09, the query-bench graph: a 3M-entry log).
+
+   | operation | result |
+   |---|---|
+   | `mquery n(type="node3")` over the whole log | 0.15s (200k reports) |
+   | `mquery n(prop2="value2")` | 0.57s |
+   | `mquery e(type="edge3")` | 0.16s |
+   | `mquery n(type="node1")->e()->n()` | 2.2s |
+   | `n(type="node3")` at a historical view (LMDB path) | 0.049s (150k) |
+   | delete 200k nodes, cascading ~400k edges and 200k properties | 1.33s (150k nodes/s) |
+
+   `mquery` walks the log with one cursor and skips entries that cannot change a match: a property whose key no filter names, an edge when no slot is an edge and no filter reads a node's edges, and endpoints when no slot is a node. Before those rules a full pass cost 2–4 s whatever the pattern. The 2-hop is inherent: every new edge starts a chain that must be expanded.
+
    **REST** (2026-10-08, same machine, `ramp-server` release build, a stdlib Python client over keep-alive connections, so the read numbers are client-bound):
 
    | load | result |
@@ -265,6 +278,16 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
    | 1 writer, single-node requests | 5.0k req/s, p50 0.2 ms |
    | 4 writers, single-node requests | 8.0k req/s, p50 0.5 ms |
    | 8 readers, point-lookup queries | 6–9k req/s, p50 0.5 ms |
+
+   With a keep-alive client that is not GIL-bound (a 60-line Rust loader, 2026-10-09, 1M-node graph), point-lookup queries `n(type=…, value=…)`:
+
+   | connections | throughput | p50 | p99 |
+   |---|---|---|---|
+   | 1 | 25k req/s | 35 µs | 71 µs |
+   | 8 | 54k req/s | 47 µs | 90 µs |
+   | 32 | 74k req/s | 71 µs | 0.7 ms |
+
+   `/graph/<uuid>/status` from 8 connections: 55k req/s.
 
    Large responses (2026-10-09, `curl` to `/dev/null`, 1M-node graph loaded over REST, best of 3). Before: the LMDB executor and a `Value` tree per object. After: the projection and direct rendering.
 
