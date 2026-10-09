@@ -214,32 +214,38 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
 4. ✅ REST server (`ramp-server`): all upstream endpoints except exec/UI, collection index, permissions, depth/cost adapters.
 5. ✅ Benchmark `crates/ramp-graph/benches/insert.rs` (`just bench`): a port of upstream `bench.py`.
 
-   **Results.** ramp-graph measured 2026-10-08 at `134cb2f` (after the LMDB map-growth change), i5-1135G7 laptop, idle (load avg 0.09). Upstream numbers are from 2026-10-07 on the same machine, built from the pinned rev on CPython 3.14 (no PyPy available). Three interleaved rounds, best of each (spread ≤3%):
+   **Results.** ramp-graph measured 2026-10-08 at `902115a` (map growth, MDB_APPEND, per-txn string cache), i5-1135G7 laptop, idle (load avg 0.09). Upstream numbers are from 2026-10-07 on the same machine, built from the pinned rev on CPython 3.14 (no PyPy available). Three interleaved rounds, best of each (spread ≤3%):
 
    | phase | upstream | ramp-graph | speedup |
    |---|---|---|---|
-   | 1M nodes | 150k/s | 584k/s | 3.9× |
-   | 1M props | 375k/s | 542k/s | 1.4× |
-   | 1M edges | 110k/s | 229k/s | 2.1× |
+   | 1M nodes | 150k/s | 860k/s | 5.7× |
+   | 1M props | 375k/s | 984k/s | 2.6× |
+   | 1M edges | 110k/s | 254k/s | 2.3× |
    | commit | — | 69ms | |
-   | file | 293 MiB | 300 MiB | ≈ |
+   | file | 293 MiB | 299 MiB | ≈ |
 
-   Growing the map before each write txn costs nothing measurable: every phase is within noise of the fixed-1-TiB numbers from 2026-10-07 (573k/s, 536k/s, 220k/s).
+   Growing the map before each write txn costs nothing measurable: at `134cb2f` every phase was within noise of the fixed-1-TiB numbers from 2026-10-07 (573k/s, 536k/s, 220k/s).
 
-   **Write-path optimisations.** Next log/string IDs are cached per write txn, as upstream does (nested txns inherit and fold back the cache). Each string is looked up once per insert.
+   **Write-path optimisations.**
+   - Next log/string IDs are cached per write txn, as upstream does (nested txns inherit and fold back the cache). Each string is looked up once per insert.
+   - The log, string, and txnlog tables are written with `MDB_APPEND`: their keys are allocated monotonically and the log is only ever rewritten in place. Nodes 584k/s → 652k/s, props 542k/s → 580k/s.
+   - A per-txn cache of strings already on disk (`Txn::known`) makes a repeated type, key, or value one hash probe instead of a hash-index scan plus a string fetch. Only hits are cached, so unique values never fill it; a flat cap clears it. Nodes 652k/s → 858k/s, props 580k/s → 980k/s, edges 236k/s → 250k/s.
+   - Edges remain bound by three random-key index inserts per edge and two endpoint liveness reads.
 
    **Query benchmark** `crates/ramp-graph/benches/query.rs`. 1M nodes with one property each, plus 1M deterministic edges. Upstream ran an identical Python mirror on CPython 3.14, on the same idle machine. Result counts match exactly:
 
    | query | upstream | ramp-graph | speedup |
    |---|---|---|---|
-   | 10k point lookups | 0.689s | 0.047s | 15× |
-   | `n(type="node3")` (200k) | 0.787s | 0.089s | 8.8× |
-   | `n(prop2="value2")` (full scan) | 3.957s | 0.671s | 5.9× |
-   | `e(type="edge3")` (200k) | 0.787s | 0.089s | 8.8× |
-   | `n(type="node1")->e()->n()` | 5.479s | 0.344s | 16× |
-   | `n(type="node1")-e(type="edge2")-n()` (200k) | not measured | 0.528s | |
-   | `n(type="node1")-n()-n()` (400k) | 30.0s | 2.07s | 14× |
+   | 10k point lookups | 0.689s | 0.048s | 14× |
+   | `n(type="node3")` (200k) | 0.787s | 0.067s | 12× |
+   | `n(prop2="value2")` (full scan) | 3.957s | 0.654s | 6.1× |
+   | `e(type="edge3")` (200k) | 0.787s | 0.070s | 11× |
+   | `n(type="node1")->e()->n()` | 5.479s | 0.317s | 17× |
+   | `n(type="node1")-e(type="edge2")-n()` (200k) | not measured | 0.482s | |
+   | `n(type="node1")-n()-n()` (400k) | 30.0s | 2.04s | 15× |
    | node count at a mid-txn view | 8ms | 9ms | ≈ |
+
+   **Query optimisations.** A single-key `=`/`!=` test against string literals compares interned IDs (`Keys` resolves the literals once per query, as it does key segments): `type`/`value` tests never touch the string table and property tests stop at the index entry. Type scans 0.089s → 0.067s. The property full scan is bound by the per-node index lookup, not by decoding.
 
    The typed-edge query was added in PR #4 after the upstream mirror was run; its A/B against the untyped expansion is in that PR (0.720s → 0.630s at the time).
 
@@ -247,4 +253,4 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
 
    **Not yet measured:**
    - REST throughput
-   - a profile of the props phase: per-insert parent-liveness check, msgpack round trip
+   - a CPU profile of any phase (no `perf` on the bench machine yet); the remaining per-insert suspects are the parent-liveness read in `set` and the small per-op key allocations
