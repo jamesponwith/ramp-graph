@@ -90,6 +90,71 @@ impl Keys {
 /// Native string fields of nodes and edges, the only objects a slot can hold.
 const NATIVE_STR: [&str; 2] = ["type", "value"];
 
+/// Which log entries can change a match of some pattern, for `mquery`.
+#[derive(Debug, Clone, Copy)]
+struct Relevance<'k> {
+    /// Some edge slot tests `src.*`/`tgt.*`, so a node's property changes its edges' matches.
+    via_ends: bool,
+    /// Whether some slot is a node, and whether some slot is an edge.
+    slots: (bool, bool),
+    /// Some filter reads a node's edges (degree, lists), so an edge changes node matches.
+    edge_natives: bool,
+    /// Property keys some filter names.
+    keyed: &'k HashMap<String, Option<StrId>>,
+}
+
+impl<'k> Relevance<'k> {
+    fn of(patterns: &[Pattern], keys: &'k Keys) -> Self {
+        let slots = || patterns.iter().flat_map(|p| &p.slots);
+        let filters = || slots().flat_map(|s| &s.filters);
+        Self {
+            via_ends: slots().any(|s| {
+                s.kind == Kind::Edge
+                    && s.filters
+                        .iter()
+                        .any(|f| matches!(f.path.first().map(String::as_str), Some("src" | "tgt")))
+            }),
+            slots: (
+                slots().any(|s| s.kind == Kind::Node),
+                slots().any(|s| s.kind == Kind::Edge),
+            ),
+            edge_natives: filters().any(|f| {
+                f.path
+                    .first()
+                    .is_some_and(|k| EDGE_NATIVES.contains(&k.as_str()))
+            }),
+            keyed: &keys.keys,
+        }
+    }
+
+    /// A property matters only if some filter names its key; an edge only if a slot is
+    /// an edge or a filter reads a node's edges.
+    fn may_change(&self, e: &Entry) -> bool {
+        match e.record {
+            Record::Prop { key, .. } => self.keyed.values().any(|&k| k == Some(key)),
+            Record::Edge { .. } => self.slots.1 || self.edge_natives,
+            Record::Node { .. } | Record::Deletion { .. } => true,
+        }
+    }
+}
+
+/// Native node fields that read the node's edges, so a new or deleted edge changes them.
+const EDGE_NATIVES: [&str; 13] = [
+    "edge_count",
+    "inbound_count",
+    "outbound_count",
+    "edges",
+    "edgeIDs",
+    "inbound",
+    "inboundIDs",
+    "outbound",
+    "outboundIDs",
+    "neighbors",
+    "neighborIDs",
+    "neighbor_count",
+    "neighbor_types",
+];
+
 /// The literals of a single-key `=`/`!=` test, if every one is a string.
 fn eq_strings(f: &Filter) -> Option<&[Value]> {
     match (f.path.as_slice(), &f.test) {
@@ -288,42 +353,34 @@ impl Txn<'_> {
         let mut scratch = Scratch::default();
         let end = stop.map_or(next, |s| s.saturating_add(1).min(next));
         // Edge slots testing `src.*`/`tgt.*` change when an endpoint's property does.
-        let via_ends = patterns.iter().flat_map(|p| &p.slots).any(|s| {
-            s.kind == Kind::Edge
-                && s.filters
-                    .iter()
-                    .any(|f| matches!(f.path.first().map(String::as_str), Some("src" | "tgt")))
-        });
-        for x in start.max(1)..end {
-            let Some(entry) = self.entry(x)? else {
+        let rel = Relevance::of(patterns, &keys);
+        let Relevance { via_ends, .. } = rel;
+        // One cursor over the range, not a B-tree seek per entry.
+        for entry in self.log(start.max(1), Some(end))? {
+            let entry = entry?;
+            if !rel.may_change(&entry) {
                 continue;
-            };
+            }
+            let x = entry.id;
             let (before, after) = (Some(x), Some(x + 1));
             let mut cands = Vec::new();
-            let touch = |txn: &Self, parent: LogId, cands: &mut Vec<LogId>| -> Result<()> {
-                cands.push(parent);
-                if via_ends
-                    && matches!(
-                        txn.entry(parent)?,
-                        Some(Entry {
-                            record: Record::Node { .. },
-                            ..
-                        })
-                    )
-                {
-                    for e in txn.node_edges(parent, Direction::Both, None, after)? {
-                        cands.push(e?.id);
-                    }
-                }
-                Ok(())
-            };
             match entry.record {
                 Record::Node { .. } => cands.push(x),
-                Record::Edge { src, tgt, .. } => cands.extend([x, src, tgt]),
-                Record::Prop { parent, .. } => touch(self, parent, &mut cands)?,
+                // The edge can only fill an edge slot; its endpoints only node slots.
+                Record::Edge { src, tgt, .. } => {
+                    if rel.slots.1 {
+                        cands.push(x);
+                    }
+                    if rel.slots.0 {
+                        cands.extend([src, tgt]);
+                    }
+                }
+                Record::Prop { parent, .. } => self.touched(parent, via_ends, after, &mut cands)?,
                 Record::Deletion { target } => match self.entry(target)?.map(|e| e.record) {
                     Some(Record::Edge { src, tgt, .. }) => cands.extend([src, tgt]),
-                    Some(Record::Prop { parent, .. }) => touch(self, parent, &mut cands)?,
+                    Some(Record::Prop { parent, .. }) => {
+                        self.touched(parent, via_ends, after, &mut cands)?;
+                    }
                     Some(Record::Node { .. }) => {
                         for e in self.node_edges(target, Direction::Both, None, before)? {
                             if let Record::Edge { src, tgt, .. } = e?.record {
@@ -340,7 +397,12 @@ impl Txn<'_> {
             let mut emitted = HashSet::new();
             let mut stopped = false;
             for id in cands {
-                let Some(obj) = self.entry(id)?.filter(|o| o.live_at(after)) else {
+                let found = if id == x {
+                    Some(entry)
+                } else {
+                    self.entry(id)?
+                };
+                let Some(obj) = found.filter(|o| o.live_at(after)) else {
                     continue;
                 };
                 let existed = id < x && obj.live_at(before);
@@ -374,6 +436,35 @@ impl Txn<'_> {
                         }
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Candidates a property change on `parent` makes: the parent, and its edges when
+    /// an edge slot reads `src.*`/`tgt.*`.
+    ///
+    /// # Errors
+    /// Fails on storage errors.
+    fn touched(
+        &self,
+        parent: LogId,
+        via_ends: bool,
+        after: Option<LogId>,
+        cands: &mut Vec<LogId>,
+    ) -> Result<()> {
+        cands.push(parent);
+        if via_ends
+            && matches!(
+                self.entry(parent)?,
+                Some(Entry {
+                    record: Record::Node { .. },
+                    ..
+                })
+            )
+        {
+            for e in self.node_edges(parent, Direction::Both, None, after)? {
+                cands.push(e?.id);
             }
         }
         Ok(())
