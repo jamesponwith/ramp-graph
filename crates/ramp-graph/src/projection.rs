@@ -48,14 +48,43 @@ pub struct Projection {
     /// CSR of edges entering each node row, as `out_*`.
     in_off: Vec<u32>,
     in_adj: Vec<Row>,
-    /// Per row, an edge's `(source row, target row)`; `(0, 0)` for nodes. Lets a hop
-    /// from an edge reach its far node without the ID → row lookup.
-    ends: Vec<(Row, Row)>,
+    /// Per row, an edge's index into `ends` (`NO_END` for nodes).
+    end_idx: Vec<u32>,
+    /// Per edge, both endpoints copied in, so a hop from an edge reads nothing cold.
+    ends: Vec<[End; 2]>,
     /// Live properties as `(key, value, parent)`, sorted.
     by_kv: Vec<(StrId, StrId, LogId)>,
     /// Live properties as `(parent, key, value)`, sorted; one per `(parent, key)`.
     by_pk: Vec<(LogId, StrId, StrId)>,
 }
+
+/// # Errors
+/// Fails if the projection would need more rows than [`Row`] can index.
+/// A node as an edge's endpoint: its row and enough to rebuild its [`Entry`].
+#[derive(Debug, Clone, Copy, Default)]
+struct End {
+    row: Row,
+    id: LogId,
+    next: LogId,
+    ty: StrId,
+    val: StrId,
+}
+
+impl End {
+    const fn entry(self) -> Entry {
+        Entry {
+            id: self.id,
+            next: self.next,
+            record: Record::Node {
+                ty: self.ty,
+                val: self.val,
+            },
+        }
+    }
+}
+
+/// `end_idx` of a node row.
+const NO_END: u32 = u32::MAX;
 
 /// # Errors
 /// Fails if the projection would need more rows than [`Row`] can index.
@@ -188,15 +217,33 @@ impl Projection {
         nodes_by_type.sort_unstable();
         edges_by_type.sort_unstable();
         let [out_off, out_adj, in_off, in_adj] = csr(&rows, &edges_by_type, by_row)?;
-        let ends = rows
-            .iter()
-            .map(|e| match e.record {
-                Record::Edge { src, tgt, .. } => {
-                    (by_row(src).unwrap_or(0), by_row(tgt).unwrap_or(0))
-                }
-                Record::Node { .. } | Record::Prop { .. } | Record::Deletion { .. } => (0, 0),
-            })
-            .collect();
+        let end_of = |id: LogId| -> Result<End> {
+            let r = by_row(id).ok_or(GraphError::Corrupt("live edge on a dead node"))?;
+            match rows.get(index(r)) {
+                Some(&Entry {
+                    id,
+                    next,
+                    record: Record::Node { ty, val },
+                }) => Ok(End {
+                    row: r,
+                    id,
+                    next,
+                    ty,
+                    val,
+                }),
+                _ => Err(GraphError::Corrupt("edge endpoint is not a node")),
+            }
+        };
+        let mut end_idx = Vec::with_capacity(rows.len());
+        let mut ends = Vec::new();
+        for e in &rows {
+            if let Record::Edge { src, tgt, .. } = e.record {
+                end_idx.push(row(ends.len())?);
+                ends.push([end_of(src)?, end_of(tgt)?]);
+            } else {
+                end_idx.push(NO_END);
+            }
+        }
 
         let mut by_kv: Vec<(StrId, StrId, LogId)> =
             props.iter().map(|&(p, k, v)| (k, v, p)).collect();
@@ -213,6 +260,7 @@ impl Projection {
             out_adj,
             in_off,
             in_adj,
+            end_idx,
             ends,
             by_kv,
             by_pk,
@@ -284,13 +332,14 @@ impl Projection {
         rows: &mut Vec<Row>,
     ) -> Result<()> {
         let r = row.or_else(|| self.row_of(edge));
-        let (src, tgt) = r
-            .and_then(|r| self.ends.get(index(r)).copied())
+        let [src, tgt] = r
+            .and_then(|r| self.end_idx.get(index(r)).copied())
+            .and_then(|i| self.ends.get(index(i)).copied())
             .ok_or(GraphError::NotFound(edge, "edge"))?;
         for &d in dirs {
             let n = if d == Direction::Out { tgt } else { src };
-            out.push(self.by_row(n)?);
-            rows.push(n);
+            out.push(n.entry());
+            rows.push(n.row);
         }
         Ok(())
     }
@@ -379,7 +428,8 @@ impl Projection {
             + (self.nodes_by_type.len() + self.edges_by_type.len()) * size_of::<(StrId, Row)>()
             + (self.out_off.len() + self.in_off.len()) * size_of::<u32>()
             + (self.out_adj.len() + self.in_adj.len()) * size_of::<Row>()
-            + self.ends.len() * size_of::<(Row, Row)>()
+            + self.end_idx.len() * size_of::<u32>()
+            + self.ends.len() * size_of::<[End; 2]>()
             + self.by_kv.len() * size_of::<(StrId, StrId, LogId)>()
             + self.by_pk.len() * size_of::<(LogId, StrId, StrId)>()
     }

@@ -147,7 +147,7 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
   - Ranges compare number with number or string with string; any other pair is false (upstream crashed).
   - Non-strings fail both `~` and `!~`.
 - Results go to a callback `sink(pattern_idx, chain) -> keep_going`. Results are not buffered, and the callback provides the limit.
-- **Projection (`projection.rs`): a read-optimised copy of one committed view.** Ad-hoc queries on LMDB pay a B-tree seek per candidate: the log read behind every index hit and the index seek behind every hop. `Txn::projection()` builds, from one sequential scan of the log, dense rows of the live nodes and edges, node and edge rows grouped by type, CSR adjacency per node in exactly the order `node_edges` yields, and the live properties sorted by `(key, value)` and by `(parent, key)`. The executor is unchanged; a projection only answers "rows of this type", "edges of this node", "value of this property", and "parents with key = value" (which also seeds a property-equality slot). `Txn::query` uses the graph's cached projection when it projects exactly the txn's view; any commit drops it, since `reset` can reuse log IDs; historical views and `mquery` always read LMDB. `Projection::query_par` deals seeds round-robin to threads, each in its own read txn. Cost: ≈0.35 s and ≈230 MiB per million nodes, edges, and properties, so it is opt-in; the server does not build one yet.
+- **Projection (`projection.rs`): a read-optimised copy of one committed view.** Ad-hoc queries on LMDB pay a B-tree seek per candidate: the log read behind every index hit and the index seek behind every hop. `Txn::projection()` builds, from one sequential scan of the log, dense rows of the live nodes and edges, node and edge rows grouped by type, CSR adjacency per node in exactly the order `node_edges` yields, and the live properties sorted by `(key, value)` and by `(parent, key)`. The executor is unchanged; a projection only answers "rows of this type", "edges of this node", "value of this property", and "parents with key = value" (which also seeds a property-equality slot). `Txn::query` uses the graph's cached projection when it projects exactly the txn's view; any commit drops it, since `reset` can reuse log IDs; historical views and `mquery` always read LMDB. `Projection::query_par` deals seeds round-robin to threads, each in its own read txn. Cost: ≈0.4 s and ≈300 MiB per million nodes, edges, and properties (each edge row carries copies of its two endpoints, so a hop reads nothing cold), so it is opt-in; the server does not build one yet.
   - Seeds carry the filter they already decided (the type group, the property index), so `matches` skips it. A one-slot pattern reports its seed without expansion. Expansion reuses its buffers across chains, carries each candidate edge's row so the next hop reads its endpoints without an ID lookup, and takes hop type literals from `Keys`, not the string index. Parallel runs give each thread a contiguous slice of a sliceable seed source (a type group, a property range, all rows), every nth seed otherwise.
 - **Streaming candidates per log entry:**
   - a new node
@@ -276,23 +276,23 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
 
    File: ours 299 MiB, theirs 100 MiB (columnar compression).
 
-   | query | ramp-graph on LMDB, 1 thread | ramp-graph projection, 1 thread | 8 threads | LadybugDB, 1 thread | 8 threads |
+   | query (best of 5 ours, best of 3 theirs) | ramp-graph on LMDB, 1 thread | ramp-graph projection, 1 thread | 8 threads | LadybugDB, 1 thread | 8 threads |
    |---|---|---|---|---|---|
-   | 10k point lookups | 0.048s | 0.052s | | 0.079s (one statement; 1.2s as 10k calls) | 0.045s |
-   | `n(type="node3")` | 0.067s | **0.006s** | 0.002s | 0.023s | 0.005s |
-   | `n(prop2="value2")` | 0.654s | **0.006s** | 0.002s | 0.006s | 0.002s |
-   | `e(type="edge3")` | 0.070s | **0.006s** | 0.002s | 0.091s | 0.031s |
-   | `n(type="node1")->e()->n()` | 0.317s | 0.053s | 0.013s | 0.028s | 0.011s |
-   | `n(type="node1")-e(type="edge2")-n()` | 0.482s | **0.104s** | 0.028s | 0.173s | 0.106s |
-   | `n(type="node1")-n()-n()` | 2.04s (400k) | **0.46s** (400k) | 0.093s | 0.73s (800k) | 0.29s (800k) |
+   | 10k point lookups | 0.048s | **0.053s** | | 0.079s (one statement; 1.2s as 10k calls) | 0.045s |
+   | `n(type="node3")` | 0.067s | **0.005s** | **0.002s** | 0.023s | 0.006s |
+   | `n(prop2="value2")` | 0.654s | **0.005s** | **0.002s** | 0.007s | 0.003s |
+   | `e(type="edge3")` | 0.070s | **0.005s** | **0.001s** | 0.111s | 0.038s |
+   | `n(type="node1")->e()->n()` | 0.317s | **0.025s** | **0.006s** | 0.033s | 0.010s |
+   | `n(type="node1")-e(type="edge2")-n()` | 0.482s | **0.059s** | **0.014s** | 0.207s | 0.117s |
+   | `n(type="node1")-n()-n()` | 2.04s (400k) | **0.41s** (400k) | **0.086s** | 0.88s (800k) | 0.41s (800k) |
 
-   The projection (PR #13) takes 0.35 s to build and 232 MiB for this graph. Bold beats LadybugDB's single thread with ours. Reading: transactional per-object writes are ours by 25× (nodes) to 150–400× (edges); thread for thread, our transactional path also beats its bulk loader, which only pulls ahead with 8 cores (`LB_THREADS` pins it). With the projection, every query beats LadybugDB's single thread except the 2-hop; thread for thread at 8, we win the type scan, the edge-type scan, the typed 2-hop, and the 3-node chain, tie the property scan, and trail the 2-hop by 20%. The 3-node chain is not like for like: Cypher and LGQL count different paths. Lookups issued one call at a time cost 120 µs each through its Python API.
+   The projection (PR #13) takes 0.4 s to build and 301 MiB for this graph. Bold is ahead of LadybugDB at the same thread count. Reading: transactional per-object writes are ours by 25× (nodes) to 150–400× (edges); thread for thread, our transactional path also beats its bulk loader, which only pulls ahead with 8 cores (`LB_THREADS` pins it). With the projection, every query is ahead at one thread and at eight. The 3-node chain is not like for like: Cypher and LGQL count different paths. Lookups issued one call at a time cost 120 µs each through its Python API.
 
-   The 2-hop gap is structural: a chain materialises its far node, one cold row read (≈100 ns) per result on top of ≈150 ns of executor, while a Cypher `count(*)` over an unfiltered end need not touch that node. Carrying edge rows through expansion already removed the ID → row lookups.
+   The 2-hop was the last row to fall. A chain materialises its far node; copying each edge's two endpoints into its projection row (`End`) made that read warm, and precomputing the fill order and hop types per pattern, passing fully-kept chains to the sink uncopied, and carrying edge rows through expansion took the executor from ≈250 ns to ≈125 ns per chain.
 
    What remains, in order:
    1. Keeping the projection warm in the server: build on first query, rebuild incrementally after small commits instead of dropping it.
-   2. A narrower row type (IDs and string IDs as `u32`) to halve the projection's footprint and its cold misses.
+   2. A narrower row type (IDs and string IDs as `u32`) to halve the projection's 300 MiB.
    3. A property index on disk, for `n(key=val)` without a projection.
 
    **Not yet measured:**

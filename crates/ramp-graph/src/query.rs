@@ -107,6 +107,33 @@ struct Walk<'w> {
     view: Option<LogId>,
     keys: &'w Keys,
     proj: Option<&'w Projection>,
+    /// Slot fill order from the seed slot: (slot to fill, filled neighbour).
+    order: &'w [(usize, usize)],
+    /// Per slot, the edge types a `type=` filter restricts a hop to.
+    hop_types: &'w [Option<Vec<&'w str>>],
+    /// Every slot is kept, so a chain can go to the sink as is.
+    all_kept: bool,
+}
+
+/// Fill order for a pattern of `n` slots seeded at `s`: rightwards, then leftwards.
+fn fill_order(n: usize, s: usize) -> Vec<(usize, usize)> {
+    (s + 1..n)
+        .map(|i| (i, i - 1))
+        .chain((0..s).rev().map(|i| (i, i + 1)))
+        .collect()
+}
+
+/// Per slot, the edge types a `type=` filter restricts a hop to.
+fn hop_types(p: &Pattern) -> Vec<Option<Vec<&str>>> {
+    p.slots
+        .iter()
+        .map(|slot| {
+            (slot.kind == Kind::Edge)
+                .then(|| slot.eq_set("type"))
+                .flatten()
+                .map(|ts| ts.into_iter().filter_map(Value::as_str).collect())
+        })
+        .collect()
 }
 
 type Seeds<'s> = Box<dyn Iterator<Item = Result<Entry>> + 's>;
@@ -143,8 +170,6 @@ struct Scratch {
     pool: Vec<(Vec<Entry>, Vec<u32>)>,
     /// The kept slots of the chain being reported.
     kept: Vec<Entry>,
-    /// Slot fill order for the current pattern and seed slot.
-    order: Vec<(usize, usize)>,
     /// The chain being filled.
     chain: Vec<Entry>,
     /// IDs held by `uniq` slots along the chain.
@@ -209,11 +234,15 @@ impl Txn<'_> {
             let Some(slot) = p.slots.get(p.seed) else {
                 continue;
             };
+            let (order, hop_types) = (fill_order(p.slots.len(), p.seed), hop_types(p));
             let walk = Walk {
                 p,
                 view,
                 keys: &keys,
                 proj,
+                order: &order,
+                hop_types: &hop_types,
+                all_kept: p.slots.iter().all(|s| s.keep),
             };
             let (seeds, satisfied) = self.seeds(slot, view, &keys, proj, part)?;
             let single = p.slots.len() == 1 && slot.keep;
@@ -318,11 +347,15 @@ impl Txn<'_> {
                         {
                             continue;
                         }
+                        let (order, hop_types) = (fill_order(p.slots.len(), si), hop_types(p));
                         let walk = Walk {
                             p,
                             view: after,
                             keys: &keys,
                             proj: None,
+                            order: &order,
+                            hop_types: &hop_types,
+                            all_kept: p.slots.iter().all(|s| s.keep),
                         };
                         self.expand(&walk, si, obj, &mut scratch, &mut |c| {
                             if emitted.insert((pi, c.iter().map(|e| e.id).collect::<Vec<_>>()))
@@ -518,25 +551,15 @@ impl Txn<'_> {
         let p = w.p;
         let n = p.slots.len();
         // Fill rightwards from the seed, then leftwards: (slot to fill, filled neighbor).
-        let Scratch {
-            order, chain, used, ..
-        } = scratch;
-        order.clear();
-        order.extend((s + 1..n).map(|i| (i, i - 1)));
-        order.extend((0..s).rev().map(|i| (i, i + 1)));
+        let Scratch { chain, used, .. } = scratch;
         chain.clear();
         chain.resize(n, seed);
         used.clear();
         if p.slots.get(s).is_some_and(|x| x.uniq) {
             used.push(seed.id);
         }
-        let (order, mut chain, mut used) = (
-            std::mem::take(order),
-            std::mem::take(chain),
-            std::mem::take(used),
-        );
-        let go = self.step(w, &order, (&mut chain, NO_ROW), &mut used, scratch, sink);
-        scratch.order = order;
+        let (mut chain, mut used) = (std::mem::take(chain), std::mem::take(used));
+        let go = self.step(w, w.order, (&mut chain, NO_ROW), &mut used, scratch, sink);
         scratch.chain = chain;
         scratch.used = used;
         go
@@ -558,8 +581,12 @@ impl Txn<'_> {
             view,
             keys,
             proj,
+            ..
         } = *w;
         let Some((&(pos, from), rest)) = order.split_first() else {
+            if w.all_kept {
+                return Ok(sink(chain));
+            }
             scratch.kept.clear();
             scratch.kept.extend(
                 p.slots
@@ -578,18 +605,14 @@ impl Txn<'_> {
         );
         let dir = if pos > from { prev.fwd } else { prev.bwd };
         // An edge slot with `type=` walks only those types' edges (via the [node, type] index).
-        let types = (slot.kind == Kind::Edge)
-            .then(|| slot.eq_set("type"))
-            .flatten();
-        let types: Option<Vec<&str>> =
-            types.map(|ts| ts.into_iter().filter_map(Value::as_str).collect());
+        let types = w.hop_types.get(pos).and_then(Option::as_deref);
         let (mut cands, mut rows) = scratch.pool.pop().unwrap_or_default();
         cands.clear();
         rows.clear();
         self.neighbors(
             (&cur, cur_row),
             dir,
-            types.as_deref(),
+            types,
             view,
             keys,
             proj,
