@@ -197,6 +197,19 @@ impl Entry {
     }
 }
 
+/// One edge to find or create with [`Txn::edges`].
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeSpec<'a> {
+    /// Source node.
+    pub src: LogId,
+    /// Target node.
+    pub tgt: LogId,
+    /// Edge type.
+    pub ty: &'a [u8],
+    /// Edge value.
+    pub val: &'a [u8],
+}
+
 /// Which edges of a node to visit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -1332,6 +1345,91 @@ impl<'a> Txn<'a> {
         self.put_idx(t.tgt_idx, &[tgt, ty, e.id])?;
         self.state.edge_delta += 1;
         Ok(e)
+    }
+
+    /// [`edge`](Self::edge) for a batch: the same entries, in `specs` order, but the
+    /// three index tables are each written in their own key order after all the log
+    /// records, so a large batch costs sequential B-tree inserts instead of random ones.
+    /// A spec repeated within the batch yields the same entry.
+    ///
+    /// # Errors
+    /// As [`edge`](Self::edge); nothing is written if any spec fails.
+    pub fn edge_batch(&mut self, specs: &[EdgeSpec<'_>]) -> Result<Vec<Entry>> {
+        let bad = || GraphError::Corrupt("edge batch index");
+        // Interned strings and liveness first, so a bad spec fails before any write.
+        let mut keys: Vec<(StrId, StrId, LogId, LogId)> = Vec::with_capacity(specs.len());
+        for s in specs {
+            self.live_node(s.src)?;
+            self.live_node(s.tgt)?;
+            let (ty, val) = (self.intern(s.ty)?, self.intern(s.val)?);
+            keys.push((ty, val, s.src, s.tgt));
+        }
+        // Existing edges, looked up in key order so the seeks share pages. Duplicates
+        // within the batch sort together and resolve to their first occurrence.
+        let mut order: Vec<usize> = (0..specs.len()).collect();
+        order.sort_by_key(|&i| keys.get(i).copied());
+        let mut out: Vec<Option<Entry>> = vec![None; specs.len()];
+        let mut fresh: Vec<usize> = Vec::new();
+        let mut run_start = 0;
+        while run_start < order.len() {
+            let first = *order.get(run_start).ok_or_else(bad)?;
+            let key = *keys.get(first).ok_or_else(bad)?;
+            let run_end = run_start
+                + order
+                    .get(run_start..)
+                    .unwrap_or_default()
+                    .partition_point(|&i| keys.get(i) == Some(&key));
+            let fields: [u64; 4] = key.into();
+            let found = self.lookup(self.g.t.edge_idx, &varint::pack(&fields), None)?;
+            match found {
+                Some(e) => {
+                    for &i in order.get(run_start..run_end).unwrap_or_default() {
+                        if let Some(slot) = out.get_mut(i) {
+                            *slot = Some(e);
+                        }
+                    }
+                }
+                None => fresh.push(run_start),
+            }
+            run_start = run_end;
+        }
+        // Log records in spec order of each run's first occurrence.
+        fresh.sort_by_key(|&r| order.get(r).copied());
+        let (mut ek, mut sk, mut tk) = (Vec::new(), Vec::new(), Vec::new());
+        for &r in &fresh {
+            let first = *order.get(r).ok_or_else(bad)?;
+            let key = *keys.get(first).ok_or_else(bad)?;
+            let (ty, val, src, tgt) = key;
+            let e = self.append(Record::Edge { ty, val, src, tgt }, 0)?;
+            ek.push([ty, val, src, tgt, e.id]);
+            sk.push([src, ty, e.id]);
+            tk.push([tgt, ty, e.id]);
+            self.state.edge_delta += 1;
+            for &i in order.get(r..).unwrap_or_default() {
+                if keys.get(i) != Some(&key) {
+                    break;
+                }
+                if let Some(slot) = out.get_mut(i) {
+                    *slot = Some(e);
+                }
+            }
+        }
+        let t = self.g.t;
+        ek.sort_unstable();
+        for k in &ek {
+            self.put_idx(t.edge_idx, k)?;
+        }
+        sk.sort_unstable();
+        for k in &sk {
+            self.put_idx(t.src_idx, k)?;
+        }
+        tk.sort_unstable();
+        for k in &tk {
+            self.put_idx(t.tgt_idx, k)?;
+        }
+        out.into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(GraphError::Corrupt("edge batch left a spec unresolved"))
     }
 
     /// Sets property `key` of `parent` (0 = the graph). Setting the current value is a
