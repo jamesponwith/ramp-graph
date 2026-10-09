@@ -295,13 +295,17 @@ fn reset() {
     t.commit().unwrap();
     let mut t = g.write().unwrap();
     assert_eq!(t.next_id().unwrap(), 2);
+    t.node(b"a", b"b").unwrap(); // warms the string cache, which reset must drop
     t.reset().unwrap();
     assert_eq!(t.next_id().unwrap(), 1);
     t.node(b"c", b"d").unwrap();
+    let n = t.node(b"a", b"b").unwrap();
+    assert_eq!(n.id, 2);
     t.commit().unwrap();
     let r = g.read().unwrap();
-    assert_eq!(r.next_id().unwrap(), 2);
-    assert_eq!(r.counts(None).unwrap(), (1, 0));
+    assert_eq!(r.next_id().unwrap(), 3);
+    assert_eq!(r.counts(None).unwrap(), (2, 0));
+    assert_eq!(r.string(r.string_id(b"a").unwrap().unwrap()).unwrap(), b"a");
 }
 
 #[test]

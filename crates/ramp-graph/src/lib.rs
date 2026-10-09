@@ -27,6 +27,7 @@ mod query;
 pub mod value;
 mod varint;
 
+use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::{Condvar, Mutex};
@@ -229,6 +230,9 @@ struct Tables {
     kv: Table,
 }
 
+/// Entries kept in a write txn's string cache before it is cleared.
+const STR_CACHE: usize = 1 << 12;
+
 /// Address space mapped past the end of the file. The map grows before a write txn that
 /// would have less, so one write txn can add at most this much data (as upstream).
 const PAD: usize = if cfg!(test) { 1 << 20 } else { 1 << 30 };
@@ -378,6 +382,7 @@ impl Graph {
             inner: Inner::Ro(self.env.read_txn()?),
             state: State::default(),
             parent: None,
+            strs: HashMap::new(),
             _ticket: Some(ticket),
         })
     }
@@ -396,6 +401,7 @@ impl Graph {
             inner: Inner::Rw(self.env.write_txn()?),
             state: State::default(),
             parent: None,
+            strs: HashMap::new(),
             _ticket: Some(ticket),
         };
         txn.state.begin = txn.next_id()?;
@@ -457,6 +463,8 @@ pub struct Txn<'a> {
     inner: Inner<'a>,
     state: State,
     parent: Option<&'a mut State>,
+    /// Strings this write txn has already found in the string table, by bytes.
+    strs: HashMap<Vec<u8>, StrId>,
     /// Held until the LMDB txn has ended (fields drop in order); nested txns ride on
     /// their parent's.
     _ticket: Option<Ticket<'a>>,
@@ -980,12 +988,33 @@ impl<'a> Txn<'a> {
         }
     }
 
+    /// [`string_id`](Self::string_id) through a per-txn cache of strings already on
+    /// disk: a repeated type or value costs one hash instead of two LMDB reads.
+    /// Only hits are cached, so a stream of unique values never fills it.
+    ///
+    /// # Errors
+    /// Fails on storage errors or corrupt data.
+    fn known(&mut self, bytes: &[u8]) -> Result<Option<StrId>> {
+        if let Some(&id) = self.strs.get(bytes) {
+            return Ok(Some(id));
+        }
+        let id = self.string_id(bytes)?;
+        if let Some(id) = id {
+            // ponytail: flat cap, cleared when full; an LRU if a hot set outgrows it
+            if self.strs.len() >= STR_CACHE {
+                self.strs.clear();
+            }
+            self.strs.insert(bytes.to_vec(), id);
+        }
+        Ok(id)
+    }
+
     /// Interns `bytes`, returning its ID.
     ///
     /// # Errors
     /// Fails on storage errors or corrupt data.
     fn intern(&mut self, bytes: &[u8]) -> Result<StrId> {
-        let known = self.string_id(bytes)?;
+        let known = self.known(bytes)?;
         self.intern_known(bytes, known)
     }
 
@@ -1085,7 +1114,7 @@ impl<'a> Txn<'a> {
     /// # Errors
     /// [`GraphError::ReadOnly`] if it would have to be created in a read txn.
     pub fn node(&mut self, ty: &[u8], val: &[u8]) -> Result<Entry> {
-        let (t0, v0) = (self.string_id(ty)?, self.string_id(val)?);
+        let (t0, v0) = (self.known(ty)?, self.known(val)?);
         if let (Some(t), Some(v)) = (t0, v0)
             && let Some(e) = self.lookup(self.g.t.node_idx, &varint::pack(&[t, v]), None)?
         {
@@ -1106,7 +1135,7 @@ impl<'a> Txn<'a> {
     pub fn edge(&mut self, src: LogId, tgt: LogId, ty: &[u8], val: &[u8]) -> Result<Entry> {
         self.live(src, "node")?;
         self.live(tgt, "node")?;
-        let (t0, v0) = (self.string_id(ty)?, self.string_id(val)?);
+        let (t0, v0) = (self.known(ty)?, self.known(val)?);
         if let (Some(t), Some(v)) = (t0, v0)
             && let Some(e) =
                 self.lookup(self.g.t.edge_idx, &varint::pack(&[t, v, src, tgt]), None)?
@@ -1132,7 +1161,7 @@ impl<'a> Txn<'a> {
         if parent != 0 {
             self.live(parent, "entry")?;
         }
-        let (k0, v0) = (self.string_id(key)?, self.string_id(val)?);
+        let (k0, v0) = (self.known(key)?, self.known(val)?);
         let cur = match k0 {
             Some(k) => self.lookup(self.g.t.prop_idx, &varint::pack(&[parent, k]), None)?,
             None => None,
@@ -1273,6 +1302,7 @@ impl<'a> Txn<'a> {
             next_log: 1,
             ..State::default()
         };
+        self.strs.clear();
         Ok(())
     }
 
@@ -1291,6 +1321,7 @@ impl<'a> Txn<'a> {
             inner: Inner::Rw(g.env.nested_write_txn(parent)?),
             state: self.state,
             parent: Some(&mut self.state),
+            strs: HashMap::new(),
             _ticket: None,
         })
     }
