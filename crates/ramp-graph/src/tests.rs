@@ -310,6 +310,99 @@ fn reset() {
 }
 
 #[test]
+fn edge_batch_matches_single_edges() {
+    // The same entries as edge() one at a time: existing edges found, duplicates within
+    // the batch shared, new ones created in spec order; a dead endpoint fails the batch.
+    let (_d, g) = graph();
+    let mut t = g.write().unwrap();
+    let nodes: Vec<LogId> = (0..6_u32)
+        .map(|i| t.node(b"t", i.to_string().as_bytes()).unwrap().id)
+        .collect();
+    let at = |i: usize| nodes[i];
+    let existing = t.edge(at(0), at(1), b"e", b"x").unwrap();
+    let specs = [
+        EdgeSpec {
+            src: at(0),
+            tgt: at(1),
+            ty: b"e",
+            val: b"x",
+        }, // exists
+        EdgeSpec {
+            src: at(2),
+            tgt: at(3),
+            ty: b"e",
+            val: b"",
+        },
+        EdgeSpec {
+            src: at(1),
+            tgt: at(0),
+            ty: b"e",
+            val: b"x",
+        }, // reverse: distinct
+        EdgeSpec {
+            src: at(2),
+            tgt: at(3),
+            ty: b"e",
+            val: b"",
+        }, // duplicate of #1
+        EdgeSpec {
+            src: at(4),
+            tgt: at(4),
+            ty: b"loop",
+            val: b"",
+        },
+        EdgeSpec {
+            src: at(5),
+            tgt: at(3),
+            ty: b"f",
+            val: b"y",
+        },
+    ];
+    let got = t.edge_batch(&specs).unwrap();
+    assert_eq!(got[0], existing);
+    assert_eq!(got[1], got[3]);
+    assert!(got[1].id < got[2].id && got[2].id < got[4].id && got[4].id < got[5].id);
+    // Running the batch again finds everything.
+    assert_eq!(t.edge_batch(&specs).unwrap(), got);
+    // The indexes agree with the single-edge path.
+    for (i, s) in specs.iter().enumerate() {
+        assert_eq!(t.edge(s.src, s.tgt, s.ty, s.val).unwrap(), got[i]);
+    }
+    t.commit().unwrap();
+    let r = g.read().unwrap();
+    assert_eq!(r.counts(None).unwrap(), (6, 5));
+    // Index contents as sets: the batch writes the same keys as single inserts would.
+    let sorted = |v: Vec<LogId>| {
+        let mut v = v;
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(
+        sorted(ids(r.node_edges(at(3), Direction::In, None, None))),
+        sorted(vec![got[1].id, got[5].id])
+    );
+    assert_eq!(
+        sorted(ids(r.node_edges(at(0), Direction::Both, None, None))),
+        sorted(vec![got[0].id, got[2].id])
+    );
+    assert_eq!(
+        sorted(ids(r.edges(Some(b"e"), None))),
+        sorted(vec![got[0].id, got[1].id, got[2].id])
+    );
+    assert_eq!(ids(r.edges(Some(b"loop"), None)), vec![got[4].id]);
+    drop(r);
+    let mut t = g.write().unwrap();
+    t.delete(at(5)).unwrap();
+    let err = t.edge_batch(&specs).unwrap_err();
+    assert!(matches!(err, GraphError::NotFound(id, "node") if id == at(5)));
+    assert_eq!(
+        t.next_id().unwrap(),
+        t.next_id().unwrap(),
+        "nothing written"
+    );
+}
+
+#[test]
 fn edge_endpoint_liveness_is_rechecked_after_delete() {
     // Endpoints are cached as live per txn; a delete (direct, cascaded, or in a nested
     // txn) must drop them from the cache.
