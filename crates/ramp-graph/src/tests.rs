@@ -732,6 +732,46 @@ fn projection_answers_like_lmdb() {
 }
 
 #[test]
+fn projection_props_of_matches_props() {
+    // Properties per row come from an offset table; a property's own properties are
+    // not rows and are found by search; both agree with the index in key order.
+    let (_d, g) = graph();
+    let mut t = g.write().unwrap();
+    let na = t.node(b"t", b"a").unwrap().id;
+    let nb = t.node(b"t", b"b").unwrap().id;
+    let nc = t.node(b"t", b"c").unwrap().id;
+    for (k, v) in [("z", 1), ("a", 2), ("m", 3)] {
+        t.set_value(na, k, &json!(v)).unwrap();
+    }
+    t.set_value(na, "nested", &json!("x")).unwrap();
+    let nested = t.prop(na, b"nested", None).unwrap().unwrap().id;
+    t.set_value(nested, "inner", &json!("y")).unwrap();
+    t.set_value(nested, "inner2", &json!("z")).unwrap();
+    let edge = t.edge(na, nc, b"e", b"").unwrap().id;
+    t.set_value(edge, "w", &json!(1)).unwrap();
+    t.set_value(nc, "gone", &json!(1)).unwrap();
+    t.unset(nc, b"gone").unwrap();
+    t.commit().unwrap();
+    let t = g.read().unwrap();
+    let proj = t.projection().unwrap();
+    for parent in [na, nb, nc, nested, edge] {
+        let want: Vec<(LogId, StrId, StrId)> = t
+            .props(parent, None)
+            .unwrap()
+            .filter_map(|p| match p.unwrap().record {
+                Record::Prop { parent, key, val } => Some((parent, key, val)),
+                Record::Node { .. } | Record::Edge { .. } | Record::Deletion { .. } => None,
+            })
+            .collect();
+        assert_eq!(proj.props_of(parent), want.as_slice(), "parent {parent}");
+    }
+    assert_eq!(proj.props_of(na).len(), 4);
+    assert_eq!(proj.props_of(nested).len(), 2);
+    assert!(proj.props_of(nb).is_empty() && proj.props_of(nc).is_empty());
+    assert!(proj.props_of(999).is_empty());
+}
+
+#[test]
 fn query_string_equality_by_id() {
     // `=`/`!=` against string literals compares interned IDs: same answers as resolving.
     let (_d, g) = graph();

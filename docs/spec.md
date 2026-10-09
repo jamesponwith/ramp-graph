@@ -166,6 +166,8 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
   - Each open graph costs 3 fds and ~2 MiB of RAM: LMDB preallocates a 2 MiB write-txn dirty list per env.
   - The in-memory index (status + graph props) is rebuilt at startup by opening every `<uuid>.db`.
 - `input.rs`: `as_dict`/`format_edge` rendering, POST-body application with upstream `merge_values`, and the depth/cost adapters (scanning forward, so cascades reach a fixpoint).
+- **Query responses are rendered straight into the output buffer** (`Render`): no `serde_json::Value` tree per object, properties from the projection when there is one, keys and types fetched once per response, each distinct property value rendered once. Object keys therefore come out in upstream's order (natives, then properties by key ID) rather than sorted; other endpoints still build `Value`s. Msgpack responses keep the `Value` path.
+- **A scan query on the current view builds the graph's projection** if a commit dropped the cached one (`Pattern::scans`: anything not seeded by `ID=` or a node `type=`/`value=` pair). Point lookups never pay for it. The rebuild after every commit is the ceiling for write-heavy graphs; incremental maintenance is the next step there.
 
 **Wire-compatible:**
 - endpoints, JSON/msgpack by `Accept`, stream framing (JSON array / concatenated msgpack)
@@ -262,6 +264,17 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
    | 1 writer, single-node requests | 5.0k req/s, p50 0.2 ms |
    | 4 writers, single-node requests | 8.0k req/s, p50 0.5 ms |
    | 8 readers, point-lookup queries | 6–9k req/s, p50 0.5 ms |
+
+   Large responses (2026-10-09, `curl` to `/dev/null`, 1M-node graph loaded over REST, best of 3). Before: the LMDB executor and a `Value` tree per object. After: the projection and direct rendering.
+
+   | query | objects | bytes | before | after |
+   |---|---|---|---|---|
+   | `n(type="node3")` | 200k | 13 MiB | 0.47s | 0.08s |
+   | `n(prop2="value2")` | 200k | 13 MiB | 1.02s | 0.08s |
+   | `n(type="node1")->e()->n()` | 600k | 40 MiB | 1.54s | 0.37s |
+   | `n(type="node3", value="333")` | 1 | 102 B | 0.3 ms | 0.3 ms |
+
+   Per object the render went from ≈1.8 µs to ≈0.5 µs; what is left is mostly the LMDB read of each object's own value string. The first scan after a commit also pays the projection build (≈0.4 s here).
 
    In-process, one 100-node batch costs ≈440 µs (parse 30, apply 290, adapters 45, commit 17), so a request adds ≈200 µs of transport. Commits are fsynced and that is not the bottleneck on NVMe: upstream's `-s`/`-m` nosync flags stay unported. A REST node costs ~3× a bench node because each request also merges properties (read, merge, encode, set) and runs the adapters.
 

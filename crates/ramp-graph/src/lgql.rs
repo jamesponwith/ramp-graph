@@ -120,6 +120,22 @@ pub struct Pattern {
 }
 
 impl Pattern {
+    /// Whether running this pattern scans objects (as opposed to starting from an `ID=`
+    /// or a node `type=`/`value=` pair, which the indexes answer directly). A scan is
+    /// what a [`Projection`](crate::Projection) speeds up.
+    #[must_use]
+    pub fn scans(&self) -> bool {
+        let Some(seed) = self.slots.get(self.seed) else {
+            return false;
+        };
+        if seed.eq_set("ID").is_some() {
+            return false;
+        }
+        !(seed.kind == Kind::Node
+            && seed.eq_set("type").is_some()
+            && seed.eq_set("value").is_some())
+    }
+
     /// Compiles a pattern.
     ///
     /// # Errors

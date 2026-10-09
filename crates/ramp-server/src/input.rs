@@ -1,7 +1,11 @@
 //! Rendering graph objects to JSON, applying client input, and the depth/cost adapters.
 
+use std::collections::HashMap;
+use std::io::Write;
+
 use ramp_graph::value::{self, Value};
-use ramp_graph::{Direction, Entry, LogId, Record, Txn};
+
+use ramp_graph::{Direction, Entry, LogId, Projection, Record, StrId, Txn};
 use serde_json::{Map, Number};
 
 use crate::api::ApiError;
@@ -72,6 +76,123 @@ pub(crate) fn props_dict(
         }
     }
     Ok(out)
+}
+
+/// Writes query results straight into a response buffer.
+///
+/// An object's native fields and properties go out as JSON without an intermediate
+/// `Value` tree; properties come from the projection when there is one; strings that
+/// repeat (keys, types) are fetched once per response.
+pub(crate) struct Render<'t, 'p> {
+    pub(crate) t: &'t Txn<'t>,
+    pub(crate) proj: Option<&'p Projection>,
+    strings: HashMap<StrId, String>,
+    /// Property values as JSON, by value string ID; values repeat far more than objects.
+    values: HashMap<StrId, Vec<u8>>,
+}
+
+/// Interned strings remembered per response before the cache is cleared.
+const STRINGS: usize = 1 << 12;
+
+impl<'t, 'p> Render<'t, 'p> {
+    pub(crate) fn new(t: &'t Txn<'t>, proj: Option<&'p Projection>) -> Self {
+        Self {
+            t,
+            proj,
+            strings: HashMap::new(),
+            values: HashMap::new(),
+        }
+    }
+
+    /// A property value rendered as JSON. Values that are not msgpack show as strings.
+    ///
+    /// # Errors
+    /// Storage errors.
+    fn value_json(&mut self, id: StrId) -> Result<&[u8], ApiError> {
+        if !self.values.contains_key(&id) {
+            if self.values.len() >= STRINGS {
+                self.values.clear();
+            }
+            let bytes = self.t.string(id)?;
+            let json = match value::decode(bytes) {
+                Ok(v) => serde_json::to_vec(&v),
+                Err(_) => serde_json::to_vec(&String::from_utf8_lossy(bytes)),
+            }
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+            self.values.insert(id, json);
+        }
+        Ok(self.values.get(&id).map_or(&[], Vec::as_slice))
+    }
+
+    /// The text of a string that tends to repeat (a key or a type).
+    ///
+    /// # Errors
+    /// Storage errors.
+    fn cached(&mut self, id: StrId) -> Result<&str, ApiError> {
+        if !self.strings.contains_key(&id) {
+            // ponytail: flat cap, cleared when full; an LRU if a response has more hot strings
+            if self.strings.len() >= STRINGS {
+                self.strings.clear();
+            }
+            self.strings.insert(id, text(self.t, id)?);
+        }
+        Ok(self.strings.get(&id).map_or("", String::as_str))
+    }
+
+    /// Writes `e` as `as_dict` would render it, in `view`.
+    ///
+    /// # Errors
+    /// Storage errors.
+    pub(crate) fn json(
+        &mut self,
+        out: &mut Vec<u8>,
+        e: &Entry,
+        view: Option<LogId>,
+    ) -> Result<(), ApiError> {
+        let t = self.t;
+        let s = |out: &mut Vec<u8>, v: &str| {
+            serde_json::to_writer(out, v).map_err(|e| ApiError::internal(e.to_string()))
+        };
+        let n = |out: &mut Vec<u8>, v: u64| write!(out, "{v}").map_err(ApiError::io);
+        out.extend_from_slice(b"{\"ID\":");
+        n(out, e.id)?;
+        match e.record {
+            Record::Node { ty, val } | Record::Edge { ty, val, .. } => {
+                out.extend_from_slice(b",\"type\":");
+                s(out, self.cached(ty)?)?;
+                out.extend_from_slice(b",\"value\":");
+                s(out, &String::from_utf8_lossy(t.string(val)?))?;
+                if let Record::Edge { src, tgt, .. } = e.record {
+                    out.extend_from_slice(b",\"srcID\":");
+                    n(out, src)?;
+                    out.extend_from_slice(b",\"tgtID\":");
+                    n(out, tgt)?;
+                }
+            }
+            Record::Prop { .. } | Record::Deletion { .. } => {}
+        }
+        // The projection covers exactly the current view; anything else reads the index.
+        let mut props: Vec<(StrId, StrId)> = Vec::new();
+        match self.proj.filter(|_| view.is_none()) {
+            Some(pj) => props.extend(pj.props_of(e.id).iter().map(|&(_, k, v)| (k, v))),
+            None => {
+                for p in t.props(e.id, view)? {
+                    if let Record::Prop { key, val, .. } = p?.record {
+                        props.push((key, val));
+                    }
+                }
+            }
+        }
+        for (key, val) in props {
+            out.push(b',');
+            s(out, self.cached(key)?)?;
+            out.push(b':');
+            let json = self.value_json(val)?;
+            out.extend_from_slice(json);
+        }
+        out.push(b'}');
+        Ok(())
+    }
 }
 
 /// Upstream `as_dict`: native fields, then properties.
@@ -492,6 +613,55 @@ mod tests {
         assert_eq!(m(json!(5), json!([2])), json!([2]));
         assert_eq!(m(json!({"a": 1}), json!(2)), json!(2));
         assert_eq!(merge(None, &json!([2, 2])), json!([2]));
+    }
+
+    #[test]
+    fn render_matches_as_dict() {
+        // Nodes, edges, msgpack and raw property values, nested properties, a historical
+        // view, with and without a projection: the same object `as_dict` builds. Keys
+        // come out in upstream's order (natives, then properties by key ID) rather than
+        // sorted, so compare parsed.
+        let dir = tempfile::tempdir().unwrap();
+        let graph = ramp_graph::Graph::open(dir.path().join("g.db")).unwrap();
+        let mut txn = graph.write().unwrap();
+        let na = txn.node(b"t", b"a \"quoted\"").unwrap().id;
+        let nb = txn.node(b"t", b"b").unwrap().id;
+        txn.set_value(na, "k", &json!({"n": [1, 2.5, "x"], "b": true}))
+            .unwrap();
+        txn.set_value(na, "zz", &json!(null)).unwrap();
+        let raw = txn.set(na, b"raw", b"not msgpack \xff").unwrap().id;
+        txn.set_value(raw, "deep", &json!("d")).unwrap();
+        let edge = txn.edge(na, nb, b"e", b"v").unwrap().id;
+        txn.set_value(edge, "w", &json!(7)).unwrap();
+        txn.commit().unwrap();
+        let mut txn = graph.write().unwrap();
+        txn.set_value(nb, "later", &json!("yes")).unwrap();
+        txn.commit().unwrap();
+        let txn = graph.read().unwrap();
+        let mid = txn.next_id().unwrap() - 1;
+        let check = |render: &mut Render<'_, '_>, id: LogId, view: Option<LogId>| {
+            let entry = txn.entry(id).unwrap().unwrap();
+            let mut out = Vec::new();
+            render.json(&mut out, &entry, view).unwrap();
+            let got: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(
+                got,
+                as_dict(&txn, &entry, view).unwrap(),
+                "{id} at {view:?}"
+            );
+            assert!(out.starts_with(b"{\"ID\":"), "natives first");
+        };
+        let mut render = Render::new(&txn, None);
+        for id in [na, nb, edge, raw] {
+            check(&mut render, id, None);
+            check(&mut render, id, Some(mid));
+        }
+        let proj = txn.projection().unwrap();
+        let mut render = Render::new(&txn, Some(&proj));
+        for id in [na, nb, edge, raw] {
+            check(&mut render, id, None);
+            check(&mut render, id, Some(mid));
+        }
     }
 
     #[test]
