@@ -6,7 +6,10 @@
 //! model would see. It is a baseline for a learned policy, not a substitute: a model
 //! conditioned on the task's prompt replaces it behind the same [`Policy`] trait.
 
-use crate::{Candidate, Context, Decision, MAX_REL, Policy, Rel, Task, UNREACHED};
+use crate::{
+    Candidate, Context, Decision, Dom, Filter, MAX_REL, Policy, Rel, Relation, Take, Task,
+    UNREACHED,
+};
 
 /// Breadth-first to a fixed depth: every relation, every edge.
 #[derive(Debug, Clone, Copy)]
@@ -20,7 +23,7 @@ impl Policy for Bfs {
         format!("bfs(depth={})", self.depth)
     }
 
-    fn decide(&mut self, _: &Task, _: &Context, batch: &[Candidate], out: &mut Vec<Decision>) {
+    fn decide(&mut self, _: &Task, _: &Context<'_>, batch: &[Candidate], out: &mut Vec<Decision>) {
         out.extend(batch.iter().map(|c| {
             let h = c.hops();
             if h >= self.depth || h == UNREACHED {
@@ -49,7 +52,13 @@ impl Policy for Rules {
         format!("rules(depth={}, cap={})", self.depth, self.cap)
     }
 
-    fn decide(&mut self, task: &Task, _: &Context, batch: &[Candidate], out: &mut Vec<Decision>) {
+    fn decide(
+        &mut self,
+        task: &Task,
+        _: &Context<'_>,
+        batch: &[Candidate],
+        out: &mut Vec<Decision>,
+    ) {
         out.extend(batch.iter().map(|c| {
             let h = c.hops();
             let degree: u32 = c.peek.iter().sum();
@@ -83,8 +92,15 @@ impl Policy for Rules {
 /// - Breadth: it takes all of a relation's remaining edges up to 1/64 of the remaining
 ///   budget; a hub that is reached at all is taken in chunks, and as it shrinks it gets
 ///   cheaper to finish.
+/// - Pushdown (if enabled): when the task names a target and the candidate sits on the
+///   shape with more of it beyond, it fetches only the next step's relation, filtered by
+///   the semi-join chain to the target, and prices that as a few edges, whatever the
+///   relation's size. A hub on the way to a hit costs what it returns.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct Guided;
+pub struct Guided {
+    /// Push the task's target down to the source as filters.
+    pub pushdown: bool,
+}
 
 fn interest(task: &Task, r: usize) -> f64 {
     task.relation_interest.get(r).copied().unwrap_or(0.0)
@@ -106,20 +122,69 @@ fn fit(task: &Task, c: &Candidate) -> f64 {
 }
 
 /// Every remaining edge of each relation `want` accepts.
-fn take_all(c: &Candidate, want: impl Fn(usize) -> bool) -> Vec<(Rel, u32)> {
+fn take_all(c: &Candidate, want: impl Fn(usize) -> bool) -> Vec<Take> {
     (0_u8..)
         .zip(c.remaining())
         .take(MAX_REL)
         .filter(|&(r, n)| n > 0 && want(usize::from(r)))
+        .map(|(r, n)| Take::all(r, n))
         .collect()
+}
+
+/// The relation joining domains `a` and `b`, either way round.
+fn joining(relations: &[Relation], a: Dom, b: Dom) -> Option<Rel> {
+    (0_u8..)
+        .zip(relations)
+        .find(|(_, r)| (r.from, r.to) == (a, b) || (r.from, r.to) == (b, a))
+        .map(|(i, _)| i)
+}
+
+/// The filtered fetch that leads from `c` towards the task's target, if there is one.
+///
+/// For a candidate on the task's shape with more of it beyond: the relation to its next
+/// step, and a filter that holds only on neighbours leading to the target (the target
+/// wrapped in one semi-join per remaining step of the shape). `None` if the task names
+/// no target, the candidate is off-shape, or the relation was already fetched filtered.
+fn pushdown(task: &Task, ctx: &Context<'_>, c: &Candidate) -> Option<(Rel, Filter)> {
+    if !ctx.filters {
+        return None;
+    }
+    let target = task.target.as_ref()?;
+    let at = usize::try_from(c.hops()).ok()?;
+    task.shape.iter().find_map(|shape| {
+        if shape.get(at) != Some(&c.domain) || at + 1 >= shape.len() {
+            return None;
+        }
+        let mut filter = target.clone();
+        for i in (at + 1..shape.len() - 1).rev() {
+            let (a, b) = (*shape.get(i)?, *shape.get(i + 1)?);
+            filter = Filter::Via {
+                rel: joining(ctx.relations, a, b)?,
+                then: Box::new(filter),
+            };
+        }
+        let rel = joining(ctx.relations, c.domain, *shape.get(at + 1)?)?;
+        let fresh = !c.pushed.get(usize::from(rel)).copied().unwrap_or(true);
+        fresh.then_some((rel, filter))
+    })
 }
 
 impl Policy for Guided {
     fn name(&self) -> String {
-        "guided".to_owned()
+        if self.pushdown {
+            "guided+pushdown".to_owned()
+        } else {
+            "guided".to_owned()
+        }
     }
 
-    fn decide(&mut self, task: &Task, ctx: &Context, batch: &[Candidate], out: &mut Vec<Decision>) {
+    fn decide(
+        &mut self,
+        task: &Task,
+        ctx: &Context<'_>,
+        batch: &[Candidate],
+        out: &mut Vec<Decision>,
+    ) {
         let left = ctx.budget.saturating_sub(ctx.fetched);
         let breadth = u32::try_from(left / 64).unwrap_or(u32::MAX).max(16);
         for c in batch {
@@ -156,6 +221,18 @@ impl Policy for Guided {
                 continue;
             }
             let route = c.cost[0].min(c.cost[1]);
+            if let Some((rel, filter)) = self.pushdown.then(|| pushdown(task, ctx, c)).flatten() {
+                // What comes back is what can complete a hit: a few edges, not the hub.
+                out.push(Decision {
+                    priority: -(route + 2.0_f64.ln()) / weight,
+                    take: vec![Take {
+                        rel,
+                        limit: breadth,
+                        filter: Some(filter),
+                    }],
+                });
+                continue;
+            }
             // What expanding it costs is what is left to fetch of what the task wants: a
             // fresh hub is expensive, a nearly finished one cheap to finish.
             let left: u32 = rem
@@ -171,7 +248,7 @@ impl Policy for Guided {
                     .zip(rem)
                     .take(MAX_REL)
                     .filter(|&(r, n)| n > 0 && interest(task, usize::from(r)) > 0.0)
-                    .map(|(r, n)| (r, n.min(breadth)))
+                    .map(|(r, n)| Take::all(r, n.min(breadth)))
                     .collect(),
             });
         }

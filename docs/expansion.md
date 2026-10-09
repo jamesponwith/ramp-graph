@@ -48,7 +48,8 @@ conditioned on the task's intent (the prompt) and on live evidence from the grap
 
 - **`Source`** is the world: an API, a corpus, a feed. `peek` returns per-relation edge
   counts without fetching, which most selector services can give. `fetch` pages one
-  relation at a time.
+  relation at a time. `fetch_where` returns only neighbours matching a `Filter`
+  (below), if the source can filter (`can_filter`; the default is no).
 - **`Task`** is the intent, and it is what a model is conditioned on:
   - interest per relation and per domain ("a financial link": accounts, logins and
     emails matter; employers don't);
@@ -115,12 +116,12 @@ power-law degrees. The biggest employer and VPN exit each have about 104k edges.
 is planted in the world; a run stops when all of it has been written, or at the budget.
 The table gives fetched edges to recover the signal ("fails" = budget spent without it).
 
-| scenario | what it tests | BFS | rules cap 100 | rules cap 1k | rules cap 10k | Guided |
-|---|---|---|---|---|---|---|
-| path-5hop | two people linked via account–ip(184)–account–email; both at the top employer | fails | 108 | 108 | 108 | **69** |
-| path-7hop | seven hops across five domains, through a device shared by 485 accounts | fails | 12,850 | 67,117 | fails | **4,593** |
-| pivot-busy | one-sided: from a watched person through an ip shared by ~4,800 accounts to a watched one; the seed's other accounts sit behind VPN hubs | fails | fails | fails | **132,391** | 185,743 |
-| alert | standing query: a watch-A person shares an account with a watch-B person; 0.3% of people are watch-B decoys | 104,192 | **158** | 158 | 158 | 204 |
+| scenario | what it tests | BFS | rules cap 100 | rules cap 1k | rules cap 10k | Guided | Guided + pushdown |
+|---|---|---|---|---|---|---|---|
+| path-5hop | two people linked via account–ip(184)–account–email; both at the top employer | fails | 108 | 108 | 108 | **69** | 69 |
+| path-7hop | seven hops across five domains, through a device shared by 485 accounts | fails | 12,850 | 67,117 | fails | **4,593** | 4,593 |
+| pivot-busy | one-sided: from a watched person through an ip shared by ~4,800 accounts to a watched one; the seed's other accounts sit behind VPN hubs | fails | fails | fails | 132,391 | 185,743 | **42** (source scanned 3.0M) |
+| alert | standing query: a watch-A person shares an account with a watch-B person; 0.3% of people are watch-B decoys | 104,192 | 158 | 158 | 158 | 204 | **2** (source scanned 110) |
 
 Rules and BFS run at the depth each scenario needs; they were handed that.
 
@@ -131,9 +132,12 @@ Reading:
 - **Guided, with no knobs, is the only policy that solves all four.** On the paths it is
   cheapest outright: 1.6× under the best rules on the 5-hop, 2.8× on the 7-hop. On the
   two one-sided tasks it costs 1.3–1.4× the best-tuned rules.
-- **pivot-busy is a needle in a haystack.** Nothing distinguishes the target's account
-  from the ~4,800 others behind the busy IP until it has been expanded, so any policy
-  pays for the haystack. The next lever is in the source (below), not the policy.
+- **pivot-busy is a needle in a haystack** without pushdown: nothing distinguishes the
+  target's account from the ~4,800 others behind the busy IP until it has been expanded,
+  so any policy pays for the haystack. With the target pushed down to the source, it
+  costs 42 fetched edges. The alert fired through the 104k-account VPN exit, where the
+  target also has an account (a genuine match of the standing query, hence 1/2 of the
+  planted edges), and the source scanned 3.0M entities answering the semi-joins.
 - "1st link" in the bench output shows the trap in connect tasks: both seeds share the
   top employer, so a meaningless hub link exists from the first step. Signal recovery,
   not connectivity, is the measure.
@@ -152,13 +156,42 @@ Reading:
   pattern towards the nearest selective slot first (any filter beyond a bare `type=`),
   in `query.rs`, which helps every query engine-wide.
 
+## Predicate pushdown
+
+A hub on the way to a hit is only expensive when it has to be fetched whole. A source that
+can filter takes a `Filter`:
+
+- `Attr { key, value }`: the neighbour has a property, such as a watchlist entry;
+- `Via { rel, then }`: the neighbour has, by `rel`, a neighbour matching `then`, a
+  semi-join one hop further out.
+
+`Take` carries an optional filter. The expander uses `fetch_where` when the source can
+filter, and an ordinary fetch when it cannot, so a policy never depends on support.
+`Guided { pushdown: true }` composes filters from the task's intent: a **target** (what
+the far end of a hit looks like) and the hit's **shape**. For a candidate on the shape
+with more of it beyond, it wraps the target in one `Via` per remaining step:
+
+- seed (person): accounts *that log in from an IP that has an account owned by a
+  watch-T person*;
+- IP: accounts *owned by a watch-T person*.
+
+It then fetches only that relation, filtered. Two things keep the cost model honest:
+- crossing an entity through a filter costs `ln(1 + what the filter returned)`, not
+  `ln(1 + degree)`, since the filtered hop is as specific as its result;
+- the policy prices a filtered expansion as a few edges only when the source reports it
+  can filter.
+
+Pushdown moves cost from fetching to the source. Both the 42 and the 2 above are fetched
+edges; the source scanned 3.0M and 110 entities to answer. That is a good trade when
+fetches are the scarce resource (quota, latency, downstream noise), and an indexed
+source answers such semi-joins far cheaper than a scan. Path tasks name no target, so
+they run as before. A reachability filter ("leads to seed B within k") is possible, but
+few sources could answer it.
+
 ## Next
 
-1. **Predicate pushdown to sources.** `fetch(id, rel, filter)` lets a hub be expanded
-   selectively ("accounts behind this IP whose owner is on watchlist T"), which is the
-   only way through pivot-busy without paying for the haystack.
-2. **A learned policy.** Train Jev on logged expansions: the candidates, the decision,
+1. **A learned policy.** Train Jev on logged expansions: the candidates, the decision,
    and whether what was fetched ended up in a hit.
-3. **Pipelined fetches.** Real sources have latency. Fetch the top-k candidates
+2. **Pipelined fetches.** Real sources have latency. Fetch the top-k candidates
    concurrently while writing and re-scoring the previous step.
-4. **Background projection rebuilds,** so a long expansion never pays one inline.
+3. **Background projection rebuilds,** so a long expansion never pays one inline.

@@ -8,8 +8,9 @@
 //! remembered, so a run can be scored on whether it recovered them.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{Counts, Dom, Id, MAX_REL, Rel, Relation, Source};
+use crate::{Counts, Dom, Filter, Id, MAX_REL, Rel, Relation, Source};
 
 /// Domain indexes.
 pub mod dom {
@@ -364,6 +365,7 @@ impl Builder {
             adj,
             planted: self.planted,
             attrs: self.attrs,
+            scanned: AtomicU64::new(0),
         }
     }
 }
@@ -377,9 +379,47 @@ pub struct World {
     adj: Vec<u32>,
     planted: Vec<(Id, Id, Rel)>,
     attrs: HashMap<u32, Vec<(&'static str, String)>>,
+    /// Entities examined answering filtered fetches: the source-side work pushdown costs.
+    scanned: AtomicU64,
 }
 
 impl World {
+    /// Entities examined answering filtered fetches so far.
+    #[must_use]
+    pub fn scanned(&self) -> u64 {
+        self.scanned.load(Ordering::Relaxed)
+    }
+
+    /// The neighbours of `id` by `rel`.
+    fn adjacent(&self, id: Id, rel: Rel) -> &[u32] {
+        let Ok(i) = usize::try_from(id) else {
+            return &[];
+        };
+        let slot = i * MAX_REL + usize::from(rel);
+        let (Some(&lo), Some(&hi)) = (self.off.get(slot), self.off.get(slot + 1)) else {
+            return &[];
+        };
+        let (Ok(lo), Ok(hi)) = (usize::try_from(lo), usize::try_from(hi)) else {
+            return &[];
+        };
+        self.adj.get(lo..hi).unwrap_or_default()
+    }
+
+    /// Whether `id` matches `filter`.
+    fn matches(&self, id: Id, filter: &Filter) -> bool {
+        self.scanned.fetch_add(1, Ordering::Relaxed);
+        match filter {
+            Filter::Attr { key, value } => u32::try_from(id)
+                .ok()
+                .and_then(|i| self.attrs.get(&i))
+                .is_some_and(|a| a.iter().any(|(k, v)| k == key && v == value)),
+            Filter::Via { rel, then } => self
+                .adjacent(id, *rel)
+                .iter()
+                .any(|&x| self.matches(Id::from(x), then)),
+        }
+    }
+
     /// Entities in the world.
     #[must_use]
     pub const fn len(&self) -> usize {
@@ -440,6 +480,29 @@ impl Source for World {
             .and_then(|i| self.counts.get(i))
             .copied()
             .unwrap_or_default()
+    }
+
+    fn can_filter(&self) -> bool {
+        true
+    }
+
+    fn fetch_where(
+        &self,
+        id: Id,
+        rel: Rel,
+        filter: &Filter,
+        limit: u32,
+        out: &mut Vec<Id>,
+    ) -> Option<()> {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        out.extend(
+            self.adjacent(id, rel)
+                .iter()
+                .map(|&x| Id::from(x))
+                .filter(|&x| self.matches(x, filter))
+                .take(limit),
+        );
+        Some(())
     }
 
     fn fetch(&self, id: Id, rel: Rel, offset: u32, limit: u32, out: &mut Vec<Id>) {

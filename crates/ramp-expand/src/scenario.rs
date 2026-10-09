@@ -5,7 +5,7 @@
 //! paths that only exist through hubs.
 
 use crate::world::{Builder, dom, rel};
-use crate::{Goal, Id, MAX_DOM, MAX_REL, Rel, Task};
+use crate::{Filter, Goal, Id, MAX_DOM, MAX_REL, Rel, Task};
 
 /// A planted task.
 #[derive(Debug, Clone)]
@@ -35,6 +35,7 @@ const fn task(seeds: Vec<Id>, goal: Goal, rels: [f64; MAX_REL], doms: [f64; MAX_
         domain_interest: doms,
         watch: None,
         standing: Vec::new(),
+        target: None,
         shape: Vec::new(),
         probes: Vec::new(),
         budget: 0,
@@ -194,6 +195,10 @@ fn pivot(world: &mut Builder, hubs: Hubs) -> Scenario {
         dom::ACCOUNT,
         dom::PERSON,
     ]];
+    task.target = Some(Filter::Attr {
+        key: "watch",
+        value: "T".to_owned(),
+    });
     Scenario {
         name: "pivot-busy",
         about: "from a watched person through an ip shared by ~5000 accounts to a watched one",
@@ -236,6 +241,10 @@ fn alert(world: &mut Builder, hubs: Hubs) -> Scenario {
         "n(type='person', watch='A')-n(type='account')-n(type='person', watch='B')".to_owned(),
     ];
     task.shape = vec![vec![dom::PERSON, dom::ACCOUNT, dom::PERSON]];
+    task.target = Some(Filter::Attr {
+        key: "watch",
+        value: "B".to_owned(),
+    });
     Scenario {
         name: "alert",
         about: "standing query: a watch-A person shares an account with a watch-B person",

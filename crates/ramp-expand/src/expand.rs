@@ -9,7 +9,8 @@ use ramp_graph::value::Value;
 use ramp_graph::{EdgeSpec, Graph, GraphError, LogId, Result, Txn};
 
 use crate::{
-    Candidate, Context, Counts, Decision, Goal, Id, MAX_DOM, Policy, Rel, Source, Task, UNREACHED,
+    Candidate, Context, Counts, Decision, Goal, Id, MAX_DOM, MAX_REL, Policy, Rel, Source, Take,
+    Task, UNREACHED,
 };
 
 /// Where [`Task::probes`] read.
@@ -32,6 +33,8 @@ pub struct Report {
     pub fetched_by_domain: [u64; MAX_DOM],
     /// Source calls (peeks and fetches).
     pub calls: u64,
+    /// Filtered fetches the source evaluated (part of `calls`).
+    pub filtered: u64,
     /// Entities written to the graph.
     pub nodes: u64,
     /// Edges written to the graph.
@@ -77,6 +80,7 @@ struct Known {
     is_watched: bool,
     alerts: u32,
     probes: Option<u32>,
+    pushed: [bool; MAX_REL],
     version: u32,
     decision: Decision,
     uf: usize,
@@ -89,7 +93,7 @@ impl Known {
 }
 
 /// An entity to expand and what to take of it.
-type Next = (Id, Vec<(Rel, u32)>);
+type Next = (Id, Vec<Take>);
 
 /// A frontier entry; stale once its entity's version moves on.
 #[derive(Debug, Clone, Copy)]
@@ -142,7 +146,7 @@ pub struct Expander<'a, S, P> {
     standing: Vec<Pattern>,
     /// First log entry the standing queries have not seen.
     queried: LogId,
-    ctx: Context,
+    ctx: Context<'a>,
     report: Report,
     started: Instant,
 }
@@ -176,6 +180,8 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
             graph,
             policy,
             ctx: Context {
+                relations: src.relations(),
+                filters: src.can_filter(),
                 budget: task.budget,
                 ..Context::default()
             },
@@ -292,13 +298,14 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
                 hops: [UNREACHED; 2],
                 cost: [f64::INFINITY; 2],
                 peek,
-                fetched: [0; crate::MAX_REL],
+                fetched: [0; MAX_REL],
                 degree: 0,
                 by_dom: [0; MAX_DOM],
                 watched: 0,
                 is_watched,
                 alerts: 0,
                 probes: None,
+                pushed: [false; MAX_REL],
                 version: 0,
                 decision: Decision::default(),
                 uf,
@@ -339,6 +346,7 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
             is_watched: k.is_watched,
             alerts: k.alerts,
             probes: k.probes,
+            pushed: k.pushed,
         })
     }
 
@@ -477,26 +485,47 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
 
         // Fetch what the policy asked for, within the budget.
         let started = Instant::now();
-        let mut got: Vec<(Id, Rel)> = Vec::new();
+        // Each neighbour with its relation and the cost of the hop to it.
+        let mut got: Vec<(Id, Rel, f64)> = Vec::new();
+        let degree = f64::from(me.peek.iter().sum::<u32>()).ln_1p();
         let mut buf = Vec::new();
-        let mut fetched = me.fetched;
-        for (r, limit) in take {
+        let (mut fetched, mut pushed) = (me.fetched, me.pushed);
+        for t in take {
             let left = u32::try_from(self.task.budget.saturating_sub(self.report.fetched))
                 .unwrap_or(u32::MAX);
-            let Some(f) = fetched.get_mut(usize::from(r)) else {
+            let (Some(f), Some(p)) = (
+                fetched.get_mut(usize::from(t.rel)),
+                pushed.get_mut(usize::from(t.rel)),
+            ) else {
                 continue;
             };
             buf.clear();
-            self.src.fetch(id, r, *f, limit.min(left), &mut buf);
             self.report.calls += 1;
-            let n = u32::try_from(buf.len()).unwrap_or(u32::MAX);
-            *f += n;
-            self.report.fetched += u64::from(n);
-            got.extend(buf.iter().map(|&o| (o, r)));
+            // A filtered fetch returns matches without paging the relation; a source
+            // that cannot filter is fetched from unfiltered instead.
+            let filtered = t.filter.as_ref().and_then(|filter| {
+                self.src
+                    .fetch_where(id, t.rel, filter, t.limit.min(left), &mut buf)
+            });
+            // Crossing a hub through a filter is as specific as what the filter returned.
+            let hop = if filtered.is_some() {
+                *p = true;
+                self.report.filtered += 1;
+                f64::from(u32::try_from(buf.len()).unwrap_or(u32::MAX)).ln_1p()
+            } else {
+                degree
+            };
+            if filtered.is_none() {
+                self.src.fetch(id, t.rel, *f, t.limit.min(left), &mut buf);
+                *f += u32::try_from(buf.len()).unwrap_or(u32::MAX);
+            }
+            self.report.fetched += u64::try_from(buf.len()).unwrap_or(u64::MAX);
+            got.extend(buf.iter().map(|&o| (o, t.rel, hop)));
         }
         self.report.fetch += started.elapsed();
         if let Some(k) = self.known.get_mut(&id) {
             k.fetched = fetched;
+            k.pushed = pushed;
         }
         let n = u64::try_from(got.len()).unwrap_or(u64::MAX);
         if let Some(d) = self.report.fetched_by_domain.get_mut(usize::from(me.dom)) {
@@ -527,16 +556,16 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
     ///
     /// # Errors
     /// Fails on storage errors.
-    fn write(&mut self, id: Id, me: &Known, got: &[(Id, Rel)]) -> Result<Vec<Id>> {
+    fn write(&mut self, id: Id, me: &Known, got: &[(Id, Rel, f64)]) -> Result<Vec<Id>> {
         let started = Instant::now();
         let mut t = self.graph.write()?;
         let first_new = t.next_id()?;
-        for &(o, _) in got {
+        for &(o, _, _) in got {
             self.discover(&mut t, o)?;
         }
         let relations = self.src.relations();
         let mut specs = Vec::with_capacity(got.len());
-        for &(o, r) in got {
+        for &(o, r, _) in got {
             let (Some(rel), Some(other)) = (relations.get(usize::from(r)), self.known.get(&o))
             else {
                 continue;
@@ -558,7 +587,7 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
         self.report.write += started.elapsed();
 
         let mut changed = Vec::with_capacity(got.len() + 1);
-        for (e, &(o, r)) in entries.iter().zip(got) {
+        for (e, &(o, r, step)) in entries.iter().zip(got) {
             let Some(other) = self.known.get(&o).cloned() else {
                 continue;
             };
@@ -582,7 +611,6 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
                 self.union(me.uf, other.uf);
             }
             // Distance from each side, through this entity.
-            let step = f64::from(me.peek.iter().sum::<u32>()).ln_1p();
             if let Some(k) = self.known.get_mut(&o) {
                 for (h, mine) in k.hops.iter_mut().zip(me.hops) {
                     *h = (*h).min(mine.saturating_add(1));
