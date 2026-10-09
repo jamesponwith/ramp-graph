@@ -804,20 +804,24 @@ fn projection_props_of_matches_props() {
     let t = g.read().unwrap();
     let proj = t.projection().unwrap();
     for parent in [na, nb, nc, nested, edge] {
-        let want: Vec<(LogId, StrId, StrId)> = t
+        let want: Vec<(StrId, StrId)> = t
             .props(parent, None)
             .unwrap()
             .filter_map(|p| match p.unwrap().record {
-                Record::Prop { parent, key, val } => Some((parent, key, val)),
+                Record::Prop { key, val, .. } => Some((key, val)),
                 Record::Node { .. } | Record::Edge { .. } | Record::Deletion { .. } => None,
             })
             .collect();
-        assert_eq!(proj.props_of(parent), want.as_slice(), "parent {parent}");
+        assert_eq!(
+            proj.props_of(parent).collect::<Vec<_>>(),
+            want,
+            "parent {parent}"
+        );
     }
-    assert_eq!(proj.props_of(na).len(), 4);
-    assert_eq!(proj.props_of(nested).len(), 2);
-    assert!(proj.props_of(nb).is_empty() && proj.props_of(nc).is_empty());
-    assert!(proj.props_of(999).is_empty());
+    assert_eq!(proj.props_of(na).count(), 4);
+    assert_eq!(proj.props_of(nested).count(), 2);
+    assert_eq!(proj.props_of(nb).count() + proj.props_of(nc).count(), 0);
+    assert_eq!(proj.props_of(999).count(), 0);
 }
 
 #[test]

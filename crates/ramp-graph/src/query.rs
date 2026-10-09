@@ -150,9 +150,13 @@ impl Part {
     const ALL: Self = Self { k: 0, n: 1 };
 
     fn slice<T>(self, s: &[T]) -> &[T] {
+        s.get(self.range(s.len())).unwrap_or_default()
+    }
+
+    /// This share of `0..len`.
+    pub(crate) fn range(self, len: usize) -> std::ops::Range<usize> {
         let n = self.n.max(1);
-        let (lo, hi) = (s.len() * self.k / n, s.len() * (self.k + 1) / n);
-        s.get(lo..hi).unwrap_or_default()
+        len * self.k / n..len * (self.k + 1) / n
     }
 
     fn takes(self, i: usize) -> bool {
@@ -521,16 +525,7 @@ impl Txn<'_> {
                         ),
                         Some(fi),
                     ),
-                    None => (
-                        Box::new(
-                            part.slice(pj.entries())
-                                .iter()
-                                .filter(move |e| matches!(e.record, Record::Edge { .. }) == edges)
-                                .copied()
-                                .map(Ok),
-                        ),
-                        None,
-                    ),
+                    None => (Box::new(pj.rows_of_kind(edges, part).map(Ok)), None),
                 }
             }
         })

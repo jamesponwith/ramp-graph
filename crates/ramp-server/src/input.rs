@@ -175,7 +175,7 @@ impl<'t, 'p> Render<'t, 'p> {
         // The projection covers exactly the current view; anything else reads the index.
         let mut props: Vec<(StrId, StrId)> = Vec::new();
         match self.proj.filter(|_| view.is_none()) {
-            Some(pj) => props.extend(pj.props_of(e.id).iter().map(|&(_, k, v)| (k, v))),
+            Some(pj) => props.extend(pj.props_of(e.id)),
             None => {
                 for p in t.props(e.id, view)? {
                     if let Record::Prop { key, val, .. } = p?.record {
