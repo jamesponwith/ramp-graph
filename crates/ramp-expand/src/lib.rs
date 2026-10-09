@@ -62,6 +62,27 @@ pub struct Relation {
     pub to: Dom,
 }
 
+/// A predicate a [`Source`] evaluates on a neighbour before returning it, so a hub can
+/// be expanded selectively instead of paid for whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Filter {
+    /// The neighbour has property `key` equal to `value`.
+    Attr {
+        /// Property name.
+        key: &'static str,
+        /// Required value.
+        value: String,
+    },
+    /// The neighbour has, by `rel`, at least one neighbour matching `then`: a semi-join
+    /// one hop further out.
+    Via {
+        /// The relation to look across.
+        rel: Rel,
+        /// What must hold on the far side.
+        then: Box<Self>,
+    },
+}
+
 /// The world being expanded into: an external API, a corpus, a feed.
 pub trait Source {
     /// Domain names, by [`Dom`].
@@ -76,6 +97,26 @@ pub trait Source {
     fn peek(&self, id: Id) -> Counts;
     /// Appends up to `limit` neighbours of `id` by `rel`, from position `offset`.
     fn fetch(&self, id: Id, rel: Rel, offset: u32, limit: u32, out: &mut Vec<Id>);
+
+    /// Whether [`fetch_where`](Self::fetch_where) filters (`false` by default).
+    fn can_filter(&self) -> bool {
+        false
+    }
+
+    /// Appends up to `limit` neighbours of `id` by `rel` that match `filter`, or returns
+    /// `None` if this source cannot filter (the default); the expander then fetches
+    /// without it.
+    fn fetch_where(
+        &self,
+        id: Id,
+        rel: Rel,
+        filter: &Filter,
+        limit: u32,
+        out: &mut Vec<Id>,
+    ) -> Option<()> {
+        let _: (Id, Rel, &Filter, u32, &mut Vec<Id>) = (id, rel, filter, limit, out);
+        None
+    }
 }
 
 /// What an expansion is for.
@@ -105,6 +146,9 @@ pub struct Task {
     pub watch: Option<&'static str>,
     /// LGQL patterns watched while expanding; matches are reported and fed back.
     pub standing: Vec<String>,
+    /// What the far end of a hit looks like (a watchlist entry), if the prompt says:
+    /// with [`Task::shape`], a policy can push it down to the source.
+    pub target: Option<Filter>,
     /// The shapes a goal match takes, as domains outward from a seed (`[person,
     /// account, ip, account, person]`): what the prompt says a hit looks like. Empty if
     /// it says nothing.
@@ -145,6 +189,8 @@ pub struct Candidate {
     pub alerts: u32,
     /// Matches of [`Task::probes`] rooted at it, once probed.
     pub probes: Option<u32>,
+    /// Per relation, whether a filtered fetch has been made.
+    pub pushed: [bool; MAX_REL],
 }
 
 impl Candidate {
@@ -171,9 +217,13 @@ impl Candidate {
     }
 }
 
-/// What the expansion has spent, for the policy.
+/// What the expansion has spent, and the source's relations, for the policy.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct Context {
+pub struct Context<'a> {
+    /// The source's relations, by [`Rel`].
+    pub relations: &'a [Relation],
+    /// Whether the source filters ([`Source::can_filter`]).
+    pub filters: bool,
     /// Edges fetched so far.
     pub fetched: u64,
     /// Edges fetched expanding each side.
@@ -184,13 +234,36 @@ pub struct Context {
     pub steps: u64,
 }
 
+/// One relation to fetch from an expanded entity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Take {
+    /// The relation.
+    pub rel: Rel,
+    /// How many more edges, at most.
+    pub limit: u32,
+    /// Only neighbours matching this, if the source can filter.
+    pub filter: Option<Filter>,
+}
+
+impl Take {
+    /// `limit` more edges of `rel`, unfiltered.
+    #[must_use]
+    pub const fn all(rel: Rel, limit: u32) -> Self {
+        Self {
+            rel,
+            limit,
+            filter: None,
+        }
+    }
+}
+
 /// A policy's answer for one candidate.
 #[derive(Debug, Clone, Default)]
 pub struct Decision {
     /// Higher is expanded sooner.
     pub priority: f64,
-    /// Relations to take, and how many more edges of each. Empty: do not expand.
-    pub take: Vec<(Rel, u32)>,
+    /// What to fetch. Empty: do not expand.
+    pub take: Vec<Take>,
 }
 
 /// Chooses what to expand. A System 1 model plugs in here.
@@ -198,7 +271,13 @@ pub trait Policy {
     /// A label for reports.
     fn name(&self) -> String;
     /// One decision per candidate, in order, appended to `out`.
-    fn decide(&mut self, task: &Task, ctx: &Context, batch: &[Candidate], out: &mut Vec<Decision>);
+    fn decide(
+        &mut self,
+        task: &Task,
+        ctx: &Context<'_>,
+        batch: &[Candidate],
+        out: &mut Vec<Decision>,
+    );
 }
 
 impl<P: Policy + ?Sized> Policy for &mut P {
@@ -206,7 +285,13 @@ impl<P: Policy + ?Sized> Policy for &mut P {
         (**self).name()
     }
 
-    fn decide(&mut self, task: &Task, ctx: &Context, batch: &[Candidate], out: &mut Vec<Decision>) {
+    fn decide(
+        &mut self,
+        task: &Task,
+        ctx: &Context<'_>,
+        batch: &[Candidate],
+        out: &mut Vec<Decision>,
+    ) {
         (**self).decide(task, ctx, batch, out);
     }
 }
@@ -216,7 +301,13 @@ impl<P: Policy + ?Sized> Policy for Box<P> {
         (**self).name()
     }
 
-    fn decide(&mut self, task: &Task, ctx: &Context, batch: &[Candidate], out: &mut Vec<Decision>) {
+    fn decide(
+        &mut self,
+        task: &Task,
+        ctx: &Context<'_>,
+        batch: &[Candidate],
+        out: &mut Vec<Decision>,
+    ) {
         (**self).decide(task, ctx, batch, out);
     }
 }

@@ -102,7 +102,7 @@ fn table(world: &World, s: &Scenario, budget: u64) -> Result<()> {
         degrees.join(", ")
     );
     println!(
-        "   {:<24} {:>9} {:>9} {:>8} {:>8} {:>8} {:>7} {:>9} {:>9} {:>8} {:>8}",
+        "   {:<24} {:>9} {:>9} {:>8} {:>8} {:>8} {:>7} {:>9} {:>9} {:>8} {:>8} {:>10}",
         "policy",
         "found at",
         "fetched",
@@ -113,7 +113,8 @@ fn table(world: &World, s: &Scenario, budget: u64) -> Result<()> {
         "edges/sig",
         "1st link",
         "wall ms",
-        "decide"
+        "decide",
+        "src scanned"
     );
     let policies: Vec<Box<dyn Policy>> = vec![
         Box::new(Bfs { depth: s.depth }),
@@ -129,11 +130,14 @@ fn table(world: &World, s: &Scenario, budget: u64) -> Result<()> {
             depth: s.depth,
             cap: 10_000,
         }),
-        Box::new(Guided),
+        Box::new(Guided::default()),
+        Box::new(Guided { pushdown: true }),
     ];
     for p in policies {
         let name = p.name();
+        let scanned = world.scanned();
         let (r, got) = run(world, s, p, budget, Reads::Projection)?;
+        let scanned = world.scanned() - scanned;
         let per = if got == 0 {
             "—".to_owned()
         } else {
@@ -145,7 +149,7 @@ fn table(world: &World, s: &Scenario, budget: u64) -> Result<()> {
             r.connected_at
         };
         println!(
-            "   {:<24} {:>9} {:>9} {:>8} {:>8} {:>8} {:>5}/{} {:>9} {:>9} {:>8.0} {:>8.1}",
+            "   {:<24} {:>9} {:>9} {:>8} {:>8} {:>8} {:>5}/{} {:>9} {:>9} {:>8.0} {:>8.1} {:>10}",
             name,
             cost(r.done_at),
             r.fetched,
@@ -158,6 +162,7 @@ fn table(world: &World, s: &Scenario, budget: u64) -> Result<()> {
             cost(first),
             ms(r.wall),
             ms(r.policy),
+            scanned,
         );
     }
     println!();
@@ -185,7 +190,7 @@ fn read_path(world: &World, s: &Scenario, budget: u64) -> Result<()> {
         "wall ms"
     );
     for reads in [Reads::Projection, Reads::Lmdb] {
-        let (r, _) = run(world, s, Box::new(Guided), budget, reads)?;
+        let (r, _) = run(world, s, Box::new(Guided::default()), budget, reads)?;
         let per = ms(r.probe) * 1e3 / f64::from(u32::try_from(r.probes.max(1)).unwrap_or(u32::MAX));
         println!(
             "   {:<12} {:>8} {:>8} {:>8} {:>10.0} {:>10.1} {:>10.0} {:>10.0} {:>10.0}",

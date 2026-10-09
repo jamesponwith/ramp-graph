@@ -77,7 +77,7 @@ fn guided_recovers_every_signal() {
     let (w, scenarios) = world();
     for name in ["path-5hop", "path-7hop", "pivot-busy", "alert"] {
         let s = scenario(&scenarios, name);
-        let (report, (nodes, edges)) = run(&w, s, Guided, 200_000, Reads::Projection);
+        let (report, (nodes, edges)) = run(&w, s, Guided::default(), 200_000, Reads::Projection);
         assert!(report.done_at.is_some(), "{name}: {report:?}");
         assert!(report.fetched <= 200_000);
         assert_eq!(
@@ -95,7 +95,7 @@ fn guided_recovers_every_signal() {
     let (report, _) = run(
         &w,
         scenario(&scenarios, "alert"),
-        Guided,
+        Guided::default(),
         200_000,
         Reads::Projection,
     );
@@ -122,8 +122,8 @@ fn hardcoded_limits_hold() {
 fn reads_change_cost_not_decisions() {
     let (w, scenarios) = world();
     let s = scenario(&scenarios, "explore");
-    let (a, _) = run(&w, s, Guided, 5_000, Reads::Projection);
-    let (b, _) = run(&w, s, Guided, 5_000, Reads::Lmdb);
+    let (a, _) = run(&w, s, Guided::default(), 5_000, Reads::Projection);
+    let (b, _) = run(&w, s, Guided::default(), 5_000, Reads::Lmdb);
     assert!(a.probes > 10, "{a:?}");
     let key = |r: &Report| (r.steps, r.fetched, r.nodes, r.edges, r.probes, r.decisions);
     assert_eq!(key(&a), key(&b));
@@ -136,8 +136,14 @@ fn shape_steers_alerts() {
     let s = scenario(&scenarios, "pivot-busy");
     let mut shapeless = s.clone();
     shapeless.task.shape.clear();
-    let (with, _) = run(&w, s, Guided, 400_000, Reads::Projection);
-    let (without, _) = run(&w, &shapeless, Guided, 400_000, Reads::Projection);
+    let (with, _) = run(&w, s, Guided::default(), 400_000, Reads::Projection);
+    let (without, _) = run(
+        &w,
+        &shapeless,
+        Guided::default(),
+        400_000,
+        Reads::Projection,
+    );
     assert!(
         with.done_at.is_some() && without.done_at.is_some(),
         "{with:?} {without:?}"
@@ -150,9 +156,81 @@ fn every_fetch_is_accounted() {
     let (r, _) = run(
         &w,
         scenario(&scenarios, "path-7hop"),
-        Guided,
+        Guided::default(),
         50_000,
         Reads::Projection,
     );
     assert_eq!(r.fetched_by_domain.iter().sum::<u64>(), r.fetched);
+}
+
+#[test]
+fn pushdown_cuts_through_hubs() {
+    // With the target pushed to the source, both alerts are found by fetching little
+    // more than the hit itself; the source pays in scanning instead.
+    let (w, scenarios) = world();
+    for name in ["pivot-busy", "alert"] {
+        let s = scenario(&scenarios, name);
+        let (plain, _) = run(&w, s, Guided::default(), 400_000, Reads::Projection);
+        let before = w.scanned();
+        let (pushed, _) = run(&w, s, Guided { pushdown: true }, 400_000, Reads::Projection);
+        assert!(pushed.done_at.is_some(), "{name}: {pushed:?}");
+        assert!(pushed.filtered > 0 && w.scanned() > before, "{name}");
+        assert!(
+            pushed.fetched * 4 < plain.fetched.max(1),
+            "{name}: {} vs {}",
+            pushed.fetched,
+            plain.fetched
+        );
+    }
+    // Without a target there is nothing to push: path tasks run as before.
+    let s = scenario(&scenarios, "path-7hop");
+    let (a, _) = run(&w, s, Guided::default(), 50_000, Reads::Projection);
+    let (b, _) = run(&w, s, Guided { pushdown: true }, 50_000, Reads::Projection);
+    assert_eq!((a.fetched, a.steps, b.filtered), (b.fetched, b.steps, 0));
+}
+
+/// A world whose source cannot filter.
+struct Plain<'w>(&'w World);
+
+impl Source for Plain<'_> {
+    fn domains(&self) -> &[&'static str] {
+        self.0.domains()
+    }
+    fn relations(&self) -> &[Relation] {
+        self.0.relations()
+    }
+    fn domain(&self, id: Id) -> Dom {
+        self.0.domain(id)
+    }
+    fn attrs(&self, id: Id, out: &mut Vec<(&'static str, String)>) {
+        self.0.attrs(id, out);
+    }
+    fn peek(&self, id: Id) -> Counts {
+        self.0.peek(id)
+    }
+    fn fetch(&self, id: Id, rel: Rel, offset: u32, limit: u32, out: &mut Vec<Id>) {
+        self.0.fetch(id, rel, offset, limit, out);
+    }
+}
+
+#[test]
+fn pushdown_falls_back_without_source_support() {
+    let (w, scenarios) = world();
+    let s = scenario(&scenarios, "alert");
+    let dir = tempfile::tempdir().unwrap();
+    let g = Graph::open(dir.path().join("g.db")).unwrap();
+    let mut task = s.task.clone();
+    task.budget = 400_000;
+    let plain = Plain(&w);
+    let ex = Expander::new(
+        &plain,
+        &g,
+        Guided { pushdown: true },
+        task,
+        Reads::Projection,
+    )
+    .unwrap();
+    let r = ex.run(|_| false).unwrap();
+    assert!(r.done_at.is_some(), "{r:?}");
+    assert_eq!(r.filtered, 0);
 }
