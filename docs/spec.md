@@ -214,14 +214,17 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
 4. ✅ REST server (`ramp-server`): all upstream endpoints except exec/UI, collection index, permissions, depth/cost adapters.
 5. ✅ Benchmark `crates/ramp-graph/benches/insert.rs` (`just bench`): a port of upstream `bench.py`.
 
-   **Results.** 2026-10-07, i5-1135G7 laptop, idle (load avg 0.15). Upstream was built from the pinned rev on CPython 3.14 (no PyPy available). Three interleaved rounds, best of each (spread ≤3%):
+   **Results.** ramp-graph measured 2026-10-08 at `134cb2f` (after the LMDB map-growth change), i5-1135G7 laptop, idle (load avg 0.09). Upstream numbers are from 2026-10-07 on the same machine, built from the pinned rev on CPython 3.14 (no PyPy available). Three interleaved rounds, best of each (spread ≤3%):
 
    | phase | upstream | ramp-graph | speedup |
    |---|---|---|---|
-   | 1M nodes | 150k/s | 573k/s | 3.8× |
-   | 1M props | 375k/s | 536k/s | 1.4× |
-   | 1M edges | 110k/s | 220k/s | 2.0× |
+   | 1M nodes | 150k/s | 584k/s | 3.9× |
+   | 1M props | 375k/s | 542k/s | 1.4× |
+   | 1M edges | 110k/s | 229k/s | 2.1× |
+   | commit | — | 69ms | |
    | file | 293 MiB | 300 MiB | ≈ |
+
+   Growing the map before each write txn costs nothing measurable: every phase is within noise of the fixed-1-TiB numbers from 2026-10-07 (573k/s, 536k/s, 220k/s).
 
    **Write-path optimisations.** Next log/string IDs are cached per write txn, as upstream does (nested txns inherit and fold back the cache). Each string is looked up once per insert.
 
@@ -229,13 +232,16 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
 
    | query | upstream | ramp-graph | speedup |
    |---|---|---|---|
-   | 10k point lookups | 0.689s | 0.043s | 16× |
-   | `n(type="node3")` (200k) | 0.787s | 0.095s | 8.3× |
-   | `n(prop2="value2")` (full scan) | 3.957s | 0.688s | 5.8× |
-   | `e(type="edge3")` (200k) | 0.787s | 0.104s | 7.6× |
-   | `n(type="node1")->e()->n()` | 5.479s | 0.373s | 15× |
-   | `n(type="node1")-n()-n()` (400k) | 30.0s | 2.29s | 13× |
-   | node count at a mid-txn view | 8ms | 10ms | ≈ |
+   | 10k point lookups | 0.689s | 0.047s | 15× |
+   | `n(type="node3")` (200k) | 0.787s | 0.089s | 8.8× |
+   | `n(prop2="value2")` (full scan) | 3.957s | 0.671s | 5.9× |
+   | `e(type="edge3")` (200k) | 0.787s | 0.089s | 8.8× |
+   | `n(type="node1")->e()->n()` | 5.479s | 0.344s | 16× |
+   | `n(type="node1")-e(type="edge2")-n()` (200k) | not measured | 0.528s | |
+   | `n(type="node1")-n()-n()` (400k) | 30.0s | 2.07s | 14× |
+   | node count at a mid-txn view | 8ms | 9ms | ≈ |
+
+   The typed-edge query was added in PR #4 after the upstream mirror was run; its A/B against the untyped expansion is in that PR (0.720s → 0.630s at the time).
 
    A count at a mid-txn view replays the log from the last txn boundary, as upstream does. That is slow only for a view inside one huge transaction.
 
