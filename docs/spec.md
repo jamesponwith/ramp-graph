@@ -235,9 +235,9 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
    | REST large results | 200k objects in 80 ms, 600k in 370 ms | n/a measured | — |
    | REST writes | 5k durable commits/s (1 writer), 200k nodes/s batched | FalkorDB 22.8k nodes/s batched (published) | ahead |
    | projection | 0.34 s to build, 171 MiB | LadybugDB keeps its columns on disk | — |
-   | on-disk size | 299 MiB (compaction changes nothing: the file is dense) | LadybugDB 100 MiB | behind: a full log plus five indexes against compressed columns |
+   | on-disk size | 299 MiB live, 238 MiB as a snapshot (`Graph::snapshot` rewrites every table in key order with `MDB_APPEND`, so pages are full; the live file's out-of-order index inserts leave them about half full) | LadybugDB 100 MiB; upstream LemonGraph 293 MiB | behind LadybugDB, ahead of upstream: a full log plus five indexes against compressed columns |
 
-   The one row behind by design is on-disk size: the log keeps every version for historical views, and five indexes keep every lookup a seek. Everything else is ahead of what was measured here, thread for thread.
+   The one row behind by design is on-disk size against a columnar store: the log keeps every version for historical views, five indexes keep every lookup a seek, and LMDB does not compress. Per table on this graph (live): log 75 MiB, strings 23 + 37, node index 34, edge index 52, property index 19, adjacency 21 + 28. Everything else is ahead of what was measured here, thread for thread.
 
    **Results.** ramp-graph measured 2026-10-08 at `902115a` (map growth, MDB_APPEND, per-txn string cache), i5-1135G7 laptop, idle (load avg 0.09). Upstream numbers are from 2026-10-07 on the same machine, built from the pinned rev on CPython 3.14 (no PyPy available). Three interleaved rounds, best of each (spread ≤3%):
 

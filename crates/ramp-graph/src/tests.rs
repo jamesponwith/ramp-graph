@@ -503,11 +503,67 @@ fn snapshot_and_reopen() {
     let mut t = g.write().unwrap();
     load(&mut t);
     t.commit().unwrap();
+    // Out-of-order inserts and a delete, so pages are half full and history matters.
+    let mut t = g.write().unwrap();
+    for i in (0..3000_u32).rev() {
+        let n = t.node(b"many", i.to_string().as_bytes()).unwrap().id;
+        t.set_value(n, "k", &json!(i)).unwrap();
+    }
+    let gone = t.node(b"many", b"7").unwrap().id;
+    let del = t.delete(gone).unwrap();
+    t.kv_put(b"d", b"key", b"value").unwrap();
+    t.commit().unwrap();
     let copy = d.path().join("copy.db");
     g.snapshot(&copy).unwrap();
+    assert!(g.snapshot(&copy).is_err(), "refuses to overwrite");
+    let dump = |g: &Graph| {
+        let t = g.read().unwrap();
+        let log: Vec<Entry> = t.log(1, None).unwrap().map(Result::unwrap).collect();
+        let strings: Vec<Vec<u8>> = (1..=200)
+            .map_while(|i| t.string(i).ok().map(<[u8]>::to_vec))
+            .collect();
+        (
+            log,
+            strings,
+            t.counts(None).unwrap(),
+            t.next_id().unwrap(),
+            t.kv_get(b"d", b"key").unwrap().map(<[u8]>::to_vec),
+        )
+    };
+    let before = dump(&g);
+    let size = std::fs::metadata(d.path().join("g.db")).unwrap().len();
     drop(g);
+    assert!(
+        !d.path().join("copy.db-lock").exists(),
+        "no lock file left behind"
+    );
+    assert!(
+        std::fs::metadata(&copy).unwrap().len() < size,
+        "packed is smaller"
+    );
     let g = Graph::open(&copy).unwrap();
-    assert_eq!(g.read().unwrap().counts(None).unwrap(), (3, 2));
+    assert_eq!(dump(&g), before);
+    let t = g.read().unwrap();
+    assert_eq!(t.counts(None).unwrap(), (3 + 2999, 2));
+    assert_eq!(t.counts(Some(del)).unwrap().0, 3 + 3000, "history survives");
+    drop(t);
+    // Still writable, and the indexes still find what is there.
+    let mut t = g.write().unwrap();
+    assert_eq!(
+        t.node(b"many", b"42").unwrap(),
+        t.node(b"many", b"42").unwrap()
+    );
+    let id = t.node(b"many", b"new").unwrap().id;
+    t.commit().unwrap();
+    assert_eq!(
+        g.read()
+            .unwrap()
+            .node_lookup(b"many", b"new", None)
+            .unwrap()
+            .unwrap()
+            .id,
+        id
+    );
 }
 
 #[test]

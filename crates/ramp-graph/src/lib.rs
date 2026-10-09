@@ -38,9 +38,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use heed::types::Bytes;
-use heed::{
-    CompactionOption, Database, Env, EnvFlags, EnvOpenOptions, PutFlags, RoTxn, RwTxn, WithTls,
-};
+use heed::{Database, Env, EnvFlags, EnvOpenOptions, PutFlags, RoTxn, RwTxn, WithTls};
 
 /// Position in the graph log. IDs start at 1; 0 means "none" (or "the graph itself"
 /// when used as a property parent).
@@ -310,6 +308,46 @@ impl Hasher for IdHasher {
     }
 }
 
+impl Tables {
+    /// Opens (creating if missing) every table in `env`.
+    ///
+    /// # Errors
+    /// Fails on storage errors.
+    fn create(env: &Env) -> Result<Self> {
+        let mut w = env.write_txn()?;
+        let mut table = |name| env.create_database::<Bytes, Bytes>(&mut w, Some(name));
+        let t = Self {
+            log: table("log")?,
+            scalar: table("scalar")?,
+            scalar_idx: table("scalar_idx")?,
+            node_idx: table("node_idx")?,
+            edge_idx: table("edge_idx")?,
+            prop_idx: table("prop_idx")?,
+            src_idx: table("srcnode_idx")?,
+            tgt_idx: table("tgtnode_idx")?,
+            txnlog: table("txnlog")?,
+            kv: table("kv")?,
+        };
+        w.commit()?;
+        Ok(t)
+    }
+
+    const fn all(&self) -> [Table; 10] {
+        [
+            self.log,
+            self.scalar,
+            self.scalar_idx,
+            self.node_idx,
+            self.edge_idx,
+            self.prop_idx,
+            self.src_idx,
+            self.tgt_idx,
+            self.txnlog,
+            self.kv,
+        ]
+    }
+}
+
 /// Address space mapped past the end of the file. The map grows before a write txn that
 /// would have less, so one write txn can add at most this much data (as upstream).
 const PAD: usize = if cfg!(test) { 1 << 20 } else { 1 << 30 };
@@ -387,21 +425,7 @@ impl Graph {
         // SAFETY: the file is only modified through LMDB, whose lock file arbitrates between
         // processes; `Graph`'s docs forbid modifying it any other way.
         let env = unsafe { opts.open(path) }?;
-        let mut w = env.write_txn()?;
-        let mut table = |name| env.create_database::<Bytes, Bytes>(&mut w, Some(name));
-        let t = Tables {
-            log: table("log")?,
-            scalar: table("scalar")?,
-            scalar_idx: table("scalar_idx")?,
-            node_idx: table("node_idx")?,
-            edge_idx: table("edge_idx")?,
-            prop_idx: table("prop_idx")?,
-            src_idx: table("srcnode_idx")?,
-            tgt_idx: table("tgtnode_idx")?,
-            txnlog: table("txnlog")?,
-            kv: table("kv")?,
-        };
-        w.commit()?;
+        let t = Tables::create(&env)?;
         Ok(Self {
             env,
             t,
@@ -541,14 +565,51 @@ impl Graph {
         Ok(self.env.real_disk_size()?)
     }
 
-    /// Writes a consistent, compacted copy of the graph to a new file at `path`.
+    /// Writes a consistent, packed copy of the graph to a new file at `path`.
+    ///
+    /// Every table is rewritten in key order with `MDB_APPEND`, so each page is full:
+    /// the live file's out-of-order index inserts leave pages about half full, and a
+    /// plain compacting copy keeps them that way.
     ///
     /// # Errors
-    /// Fails if `path` exists or cannot be written.
+    /// Fails if `path` exists or cannot be written; a partial file is removed.
     pub fn snapshot(&self, path: impl AsRef<Path>) -> Result<()> {
-        let ticket = self.ticket()?; // the copy runs its own read txn
-        self.env.copy_to_path(path, CompactionOption::Enabled)?;
-        drop(ticket);
+        let path = path.as_ref();
+        if path.exists() {
+            return Err(GraphError::Io(format!("{} exists", path.display())));
+        }
+        let packed = self.pack_into(path);
+        if packed.is_err() {
+            std::fs::remove_file(path).unwrap_or_default(); // best effort
+        }
+        packed
+    }
+
+    /// # Errors
+    /// Fails on storage errors.
+    fn pack_into(&self, path: &Path) -> Result<()> {
+        let src = self.read()?;
+        let mut opts = EnvOpenOptions::new();
+        opts.map_size(map_size(self.size()?)).max_dbs(10);
+        // SAFETY: NO_SUB_DIR selects the single-file layout; NO_LOCK skips the lock file,
+        // which is sound because this env is private to this call until it is dropped.
+        unsafe { opts.flags(EnvFlags::NO_SUB_DIR | EnvFlags::NO_LOCK) };
+        // SAFETY: the file is new and only this function opens it.
+        let env = unsafe { opts.open(path) }?;
+        let dst = Tables::create(&env)?;
+        for (from, to) in self.t.all().into_iter().zip(dst.all()) {
+            let mut w = env.write_txn()?;
+            for (n, kv) in from.iter(src.ro())?.enumerate() {
+                let (k, v) = kv?;
+                to.put_with_flags(&mut w, PutFlags::APPEND, k, v)?;
+                // Bounded txns, so a large graph never builds one huge dirty list.
+                if n % (1 << 16) == (1 << 16) - 1 {
+                    w.commit()?;
+                    w = env.write_txn()?;
+                }
+            }
+            w.commit()?;
+        }
         Ok(())
     }
 }
