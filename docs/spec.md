@@ -160,7 +160,7 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
 
 ## REST (`crates/ramp-server`; upstream `RESTAPI`, `server/__init__.py`)
 
-`ramp-server [-i ip] [-p port] [dir]`: a single process. axum is used only as the transport. One fallback handler reads the body (1 GiB cap, 60 s timeout) and runs synchronous routing (`api.rs`) on a blocking thread, because LMDB txns are thread-bound.
+`ramp-server [-i ip] [-p port] [-n max_open] [-m projection_mib] [dir]`: a single process. axum is used only as the transport. One fallback handler reads the body (1 GiB cap, 60 s timeout) and runs synchronous routing (`api.rs`) on a blocking thread, because LMDB txns are thread-bound.
 - `store.rs`: one open `Graph` per UUID (LMDB forbids double opens).
   - At most `-n` (default 64) stay open while idle, closed least recently used first. A graph a request holds is never closed.
   - Each open graph costs 3 fds and ~2 MiB of RAM: LMDB preallocates a 2 MiB write-txn dirty list per env.
@@ -168,6 +168,7 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
 - `input.rs`: `as_dict`/`format_edge` rendering, POST-body application with upstream `merge_values`, and the depth/cost adapters (scanning forward, so cascades reach a fixpoint).
 - **Query responses are rendered straight into the output buffer** (`Render`): no `serde_json::Value` tree per object, properties from the projection when there is one, keys and types fetched once per response, each distinct property value rendered once. Object keys therefore come out in upstream's order (natives, then properties by key ID) rather than sorted; other endpoints still build `Value`s. Msgpack responses keep the `Value` path.
 - **A scan query on the current view builds the graph's projection** if a commit dropped the cached one (`Pattern::scans`: anything not seeded by `ID=` or a node `type=`/`value=` pair). Point lookups never pay for it. The rebuild after every commit is the ceiling for write-heavy graphs; incremental maintenance is the next step there.
+  - Projections across open graphs stay within `-m` MiB (default 1024): after a build, the least recently used graphs' projections are dropped until the total fits, the one just built last. A graph whose projection alone exceeds the budget rebuilds on every scan.
 
 **Wire-compatible:**
 - endpoints, JSON/msgpack by `Accept`, stream framing (JSON array / concatenated msgpack)

@@ -37,6 +37,8 @@ pub(crate) struct Store {
     open: Mutex<Handles>,
     // ponytail: rebuilt by opening every graph at startup; persist it if startup gets slow.
     index: RwLock<BTreeMap<String, Status>>,
+    /// Bytes of projections kept across all open graphs.
+    projection_budget: usize,
 }
 
 /// Open graphs, closed least-recently-used first once there are more than `max`.
@@ -96,7 +98,11 @@ impl Store {
     /// The HTTP error to send instead.
     /// At most `max_open` graphs stay open while idle (each holds three file descriptors
     /// and ~2 MiB of RAM).
-    pub(crate) fn open(dir: impl Into<PathBuf>, max_open: usize) -> Result<Self, ApiError> {
+    pub(crate) fn open(
+        dir: impl Into<PathBuf>,
+        max_open: usize,
+        projection_budget: usize,
+    ) -> Result<Self, ApiError> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).map_err(ApiError::io)?;
         let store = Self {
@@ -107,6 +113,7 @@ impl Store {
                 max: max_open,
             }),
             index: RwLock::default(),
+            projection_budget,
         };
         let names: Vec<String> = std::fs::read_dir(&store.dir)
             .map_err(ApiError::io)?
@@ -153,6 +160,41 @@ impl Store {
         open.insert(uuid, &g);
         drop(open);
         Ok(g)
+    }
+
+    /// Keeps the projections of open graphs within the budget, dropping least recently
+    /// used graphs' projections first; `keep` (the one just built) goes last, and only
+    /// if it alone is over budget. A dropped projection is rebuilt by the next scan.
+    ///
+    /// # Errors
+    /// The HTTP error to send instead.
+    pub(crate) fn fit_projections(&self, keep: &str) -> Result<(), ApiError> {
+        // ponytail: a graph larger than the budget rebuilds on every scan; estimate from the file and refuse if that bites
+        let mut held: Vec<(bool, u64, Arc<Graph>, usize)> = self
+            .open
+            .lock()
+            .map_err(poisoned)?
+            .graphs
+            .iter()
+            .filter_map(|(u, (g, used))| {
+                Some((
+                    u == keep,
+                    *used,
+                    Arc::clone(g),
+                    g.cached_projection()?.bytes(),
+                ))
+            })
+            .collect();
+        held.sort_by_key(|&(is_keep, used, _, _)| (is_keep, used));
+        let mut total: usize = held.iter().map(|&(_, _, _, b)| b).sum();
+        for (_, _, g, bytes) in held {
+            if total <= self.projection_budget {
+                break;
+            }
+            g.drop_projection();
+            total = total.saturating_sub(bytes);
+        }
+        Ok(())
     }
 
     /// Recomputes a graph's index entry from its current state.
@@ -326,7 +368,7 @@ mod tests {
     #[test]
     fn idle_graphs_close_lru_first() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path(), 2).unwrap();
+        let store = Store::open(dir.path(), 2, usize::MAX).unwrap();
         let uuids = [
             "0b9e2f7c-5a1d-11ef-8d3e-0242ac120001",
             "0b9e2f7c-5a1d-11ef-8d3e-0242ac120002",
@@ -367,6 +409,54 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn projections_fit_the_budget_lru_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let uuids = [
+            "0b9e2f7c-5a1d-11ef-8d3e-0242ac120001",
+            "0b9e2f7c-5a1d-11ef-8d3e-0242ac120002",
+            "0b9e2f7c-5a1d-11ef-8d3e-0242ac120003",
+        ];
+        let mut graphs = Vec::new();
+        let mut one = 0;
+        let store = Store::open(dir.path(), 8, 0).unwrap();
+        for u in &uuids {
+            let g = store.graph(u, Open::New).unwrap();
+            let mut t = g.write().unwrap();
+            for i in 0..50_u32 {
+                t.node(b"t", i.to_string().as_bytes()).unwrap();
+            }
+            t.commit().unwrap();
+            one = g.read().unwrap().projection().unwrap().bytes();
+            graphs.push(g);
+        }
+        let cached = |i: usize| graphs[i].cached_projection().is_some();
+        // Room for two: the least recently opened loses its projection.
+        let store = Store {
+            projection_budget: one * 2 + 1,
+            ..store
+        };
+        store.fit_projections(uuids[2]).unwrap();
+        assert_eq!([cached(0), cached(1), cached(2)], [false, true, true]);
+        // Touching a graph makes it recent; the just-built one is dropped last.
+        graphs[0].read().unwrap().projection().unwrap();
+        store.graph(uuids[0], Open::Existing).unwrap();
+        store.fit_projections(uuids[0]).unwrap();
+        assert_eq!([cached(0), cached(1), cached(2)], [true, false, true]);
+        let store = Store {
+            projection_budget: one - 1,
+            ..store
+        };
+        store.fit_projections(uuids[0]).unwrap();
+        assert_eq!([cached(0), cached(1), cached(2)], [false, false, false]);
+        // A commit drops the cache on its own; nothing to fit afterwards.
+        graphs[2].read().unwrap().projection().unwrap();
+        let mut t = graphs[2].write().unwrap();
+        t.node(b"t", b"new").unwrap();
+        t.commit().unwrap();
+        assert!(!cached(2));
     }
 
     #[test]
