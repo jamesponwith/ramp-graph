@@ -111,11 +111,36 @@ struct Walk<'w> {
 
 type Seeds<'s> = Box<dyn Iterator<Item = Result<Entry>> + 's>;
 
+/// Share `k` of `n` of a seed stream: a contiguous slice where the source is one,
+/// every `n`th seed otherwise.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Part {
+    pub(crate) k: usize,
+    pub(crate) n: usize,
+}
+
+impl Part {
+    const ALL: Self = Self { k: 0, n: 1 };
+
+    fn slice<T>(self, s: &[T]) -> &[T] {
+        let n = self.n.max(1);
+        let (lo, hi) = (s.len() * self.k / n, s.len() * (self.k + 1) / n);
+        s.get(lo..hi).unwrap_or_default()
+    }
+
+    fn takes(self, i: usize) -> bool {
+        i % self.n.max(1) == self.k
+    }
+}
+
+/// "Row unknown" for an entry that did not come from a projection.
+const NO_ROW: u32 = u32::MAX;
+
 /// Buffers reused across chains so expansion allocates nothing per hop or result.
 #[derive(Debug, Default)]
 struct Scratch {
-    /// Candidate lists, one per recursion depth, kept for reuse.
-    pool: Vec<Vec<Entry>>,
+    /// Candidate lists with their projection rows, one per recursion depth, kept for reuse.
+    pool: Vec<(Vec<Entry>, Vec<u32>)>,
     /// The kept slots of the chain being reported.
     kept: Vec<Entry>,
     /// Slot fill order for the current pattern and seed slot.
@@ -161,11 +186,11 @@ impl Txn<'_> {
         before: Option<LogId>,
         mut sink: impl FnMut(usize, &[Entry]) -> bool,
     ) -> Result<()> {
-        self.run(proj, patterns, before, |_| true, &mut sink)
+        self.run(proj, patterns, before, Part::ALL, &mut sink)
     }
 
-    /// The query loop: seeds whose ordinal passes `take` are expanded; `sink` returning
-    /// `false` ends it.
+    /// The query loop: this `part` of the seeds is expanded; `sink` returning `false`
+    /// ends it.
     ///
     /// # Errors
     /// Fails on storage errors.
@@ -174,7 +199,7 @@ impl Txn<'_> {
         proj: Option<&Projection>,
         patterns: &[Pattern],
         before: Option<LogId>,
-        take: impl Fn(usize) -> bool + Sync,
+        part: Part,
         sink: &mut dyn FnMut(usize, &[Entry]) -> bool,
     ) -> Result<()> {
         let view = self.view(before)?;
@@ -190,7 +215,7 @@ impl Txn<'_> {
                 keys: &keys,
                 proj,
             };
-            let (seeds, satisfied) = self.seeds(slot, view, &keys, proj, &take)?;
+            let (seeds, satisfied) = self.seeds(slot, view, &keys, proj, part)?;
             let single = p.slots.len() == 1 && slot.keep;
             for seed in seeds {
                 let seed = seed?;
@@ -327,16 +352,16 @@ impl Txn<'_> {
         view: Option<LogId>,
         keys: &Keys,
         proj: Option<&'s Projection>,
-        take: &'s (dyn Fn(usize) -> bool + Sync),
+        part: Part,
     ) -> Result<(Seeds<'s>, Option<usize>)> {
         let strs = |key| -> Option<Vec<&str>> {
             slot.eq_set(key)
                 .map(|vs| vs.into_iter().filter_map(Value::as_str).collect())
         };
-        let part = move |it: Seeds<'s>| -> Seeds<'s> {
+        let share = move |it: Seeds<'s>| -> Seeds<'s> {
             Box::new(
                 it.enumerate()
-                    .filter(move |(i, _)| take(*i))
+                    .filter(move |(i, _)| part.takes(*i))
                     .map(|(_, e)| e),
             )
         };
@@ -355,10 +380,10 @@ impl Txn<'_> {
                     out.push(Ok(e));
                 }
             }
-            return Ok((part(Box::new(out.into_iter())), None));
+            return Ok((share(Box::new(out.into_iter())), None));
         }
         if let Some(pj) = proj {
-            return self.projection_seeds(pj, slot, keys, strs("type"), strs("value"), take);
+            return self.projection_seeds(pj, slot, keys, strs("type"), strs("value"), part);
         }
         let table = match slot.kind {
             Kind::Node => self.g.t.node_idx,
@@ -383,7 +408,7 @@ impl Txn<'_> {
             }
             (_, None, _) => Box::new(self.by_type(table, None, view)?),
         };
-        Ok((part(it), None))
+        Ok((share(it), None))
     }
 
     /// [`seeds`](Self::seeds) from a projection: by type group, by a property equality
@@ -399,7 +424,7 @@ impl Txn<'_> {
         keys: &Keys,
         types: Option<Vec<&str>>,
         values: Option<Vec<&str>>,
-        take: &'s (dyn Fn(usize) -> bool + Sync),
+        part: Part,
     ) -> Result<(Seeds<'s>, Option<usize>)> {
         let edges = slot.kind == Kind::Edge;
         // The one filter a seed source already decided, so `matches` can skip it.
@@ -407,14 +432,6 @@ impl Txn<'_> {
             let mut hits = slot.filters.iter().enumerate().filter(|(_, f)| pred(f));
             let first = hits.next()?.0;
             hits.next().is_none().then_some(first)
-        };
-        let rows = move |it: Box<dyn Iterator<Item = u32> + 's>| -> Seeds<'s> {
-            Box::new(
-                it.enumerate()
-                    .filter(move |(i, _)| take(*i))
-                    .filter_map(move |(_, r)| pj.row(r))
-                    .map(Ok),
-            )
         };
         Ok(match (slot.kind, types, values) {
             (Kind::Node, Some(ts), Some(vs)) => {
@@ -424,15 +441,8 @@ impl Txn<'_> {
                         out.extend(self.node_lookup(t.as_bytes(), v.as_bytes(), None)?);
                     }
                 }
-                let it: Seeds<'s> = Box::new(out.into_iter().map(Ok));
-                (
-                    Box::new(
-                        it.enumerate()
-                            .filter(move |(i, _)| take(*i))
-                            .map(|(_, e)| e),
-                    ),
-                    None,
-                )
+                let mine: Vec<Entry> = part.slice(&out).to_vec();
+                (Box::new(mine.into_iter().map(Ok)), None)
             }
             (_, Some(ts), _) => {
                 let mut ids = Vec::new();
@@ -442,10 +452,12 @@ impl Txn<'_> {
                 let satisfied =
                     only(&|f| f.path.as_slice() == ["type"] && matches!(f.test, Test::In(_)));
                 (
-                    rows(Box::new(
+                    Box::new(
                         ids.into_iter()
-                            .flat_map(move |ty| pj.rows_of_type(edges, ty)),
-                    )),
+                            .flat_map(move |ty| part.slice(pj.type_group(edges, ty)))
+                            .filter_map(move |&(_, r)| pj.row(r))
+                            .map(Ok),
+                    ),
                     satisfied,
                 )
             }
@@ -470,15 +482,22 @@ impl Txn<'_> {
                     Some((fi, key, vals)) => (
                         Box::new(
                             vals.into_iter()
-                                .flat_map(move |v| pj.parents_with(key, v))
-                                .enumerate()
-                                .filter(move |(i, _)| take(*i))
-                                .filter_map(move |(_, parent)| pj.entry(parent))
+                                .flat_map(move |v| part.slice(pj.kv_range(key, v)))
+                                .filter_map(move |&(_, _, parent)| pj.entry(parent))
                                 .map(Ok),
                         ),
                         Some(fi),
                     ),
-                    None => (rows(Box::new(pj.rows_of_kind(edges))), None),
+                    None => (
+                        Box::new(
+                            part.slice(pj.entries())
+                                .iter()
+                                .filter(move |e| matches!(e.record, Record::Edge { .. }) == edges)
+                                .copied()
+                                .map(Ok),
+                        ),
+                        None,
+                    ),
                 }
             }
         })
@@ -516,7 +535,7 @@ impl Txn<'_> {
             std::mem::take(chain),
             std::mem::take(used),
         );
-        let go = self.step(w, &order, &mut chain, &mut used, scratch, sink);
+        let go = self.step(w, &order, (&mut chain, NO_ROW), &mut used, scratch, sink);
         scratch.order = order;
         scratch.chain = chain;
         scratch.used = used;
@@ -529,7 +548,7 @@ impl Txn<'_> {
         &self,
         w: &Walk<'_>,
         order: &[(usize, usize)],
-        chain: &mut [Entry],
+        (chain, cur_row): (&mut [Entry], u32),
         seen: &mut Vec<LogId>,
         scratch: &mut Scratch,
         sink: &mut dyn FnMut(&[Entry]) -> bool,
@@ -564,12 +583,22 @@ impl Txn<'_> {
             .flatten();
         let types: Option<Vec<&str>> =
             types.map(|ts| ts.into_iter().filter_map(Value::as_str).collect());
-        let mut cands = scratch.pool.pop().unwrap_or_default();
+        let (mut cands, mut rows) = scratch.pool.pop().unwrap_or_default();
         cands.clear();
-        self.neighbors(&cur, dir, types.as_deref(), view, keys, proj, &mut cands)?;
+        rows.clear();
+        self.neighbors(
+            (&cur, cur_row),
+            dir,
+            types.as_deref(),
+            view,
+            keys,
+            proj,
+            (&mut cands, &mut rows),
+        )?;
         let mut go = true;
         for i in 0..cands.len() {
             let Some(&cand) = cands.get(i) else { break };
+            let cand_row = rows.get(i).copied().unwrap_or(NO_ROW);
             if slot.uniq && seen.contains(&cand.id)
                 || !self.matches(&cand, slot, view, keys, proj)?
             {
@@ -579,7 +608,7 @@ impl Txn<'_> {
             if slot.uniq {
                 seen.push(cand.id);
             }
-            go = self.step(w, rest, chain, seen, scratch, sink)?;
+            go = self.step(w, rest, (chain, cand_row), seen, scratch, sink)?;
             if slot.uniq {
                 seen.pop();
             }
@@ -587,7 +616,7 @@ impl Txn<'_> {
                 break;
             }
         }
-        scratch.pool.push(cands);
+        scratch.pool.push((cands, rows));
         Ok(go)
     }
 
@@ -595,21 +624,27 @@ impl Txn<'_> {
     ///
     /// # Errors
     /// Fails on storage errors.
+    /// Edges of a node, or endpoints of an edge (`Out` = target, `In` = source), appended
+    /// to `out`; with a projection, their rows go to `rows` so the next hop needs no
+    /// ID → row lookup (`e_row` is this entry's row, or [`NO_ROW`]).
+    ///
+    /// # Errors
+    /// Fails on storage errors.
     #[expect(clippy::too_many_arguments, reason = "one call site, hot path")]
     fn neighbors(
         &self,
-        e: &Entry,
+        (e, e_row): (&Entry, u32),
         dir: Direction,
         types: Option<&[&str]>,
         view: Option<LogId>,
         keys: &Keys,
         proj: Option<&Projection>,
-        out: &mut Vec<Entry>,
+        (out, rows): (&mut Vec<Entry>, &mut Vec<u32>),
     ) -> Result<()> {
         match (e.record, types) {
             (Record::Node { .. }, None) => {
                 if let Some(pj) = proj {
-                    return pj.node_edges(e.id, dir, None, out);
+                    return pj.node_edges(e.id, dir, None, out, rows);
                 }
                 for edge in self.node_edges(e.id, dir, None, view)? {
                     out.push(edge?);
@@ -621,7 +656,9 @@ impl Txn<'_> {
                     // Type literals were interned once per query.
                     let ty = keys.literals.get("type").and_then(|m| m.get(*t).copied());
                     match (proj, ty) {
-                        (Some(pj), Some(Some(ty))) => pj.node_edges(e.id, dir, Some(ty), out)?,
+                        (Some(pj), Some(Some(ty))) => {
+                            pj.node_edges(e.id, dir, Some(ty), out, rows)?;
+                        }
                         (Some(_), _) => {}
                         (None, _) => {
                             for edge in self.node_edges(e.id, dir, Some(t.as_bytes()), view)? {
@@ -633,18 +670,20 @@ impl Txn<'_> {
                 Ok(())
             }
             (Record::Edge { src, tgt, .. }, _) => {
-                let ids = match dir {
-                    Direction::In => [Some(src), None],
-                    Direction::Out => [Some(tgt), None],
-                    Direction::Both if src == tgt => [Some(src), None],
-                    Direction::Both => [Some(src), Some(tgt)],
+                // `In` leaves through the source, `Out` through the target.
+                let dirs: &[Direction] = match dir {
+                    Direction::In => &[Direction::In],
+                    Direction::Out => &[Direction::Out],
+                    Direction::Both if src == tgt => &[Direction::In],
+                    Direction::Both => &[Direction::In, Direction::Out],
                 };
-                for id in ids.into_iter().flatten() {
-                    let node = match proj {
-                        Some(pj) => pj.entry(id),
-                        None => self.entry(id)?,
-                    };
-                    out.push(node.ok_or(GraphError::NotFound(id, "node"))?);
+                if let Some(pj) = proj {
+                    let row = (e_row != NO_ROW).then_some(e_row);
+                    return pj.edge_ends(e.id, row, dirs, out, rows);
+                }
+                for &d in dirs {
+                    let id = if d == Direction::In { src } else { tgt };
+                    out.push(self.entry(id)?.ok_or(GraphError::NotFound(id, "node"))?);
                 }
                 Ok(())
             }
@@ -853,8 +892,8 @@ impl Txn<'_> {
         let edges = |dir| -> Result<Vec<Entry>> {
             match proj {
                 Some(pj) => {
-                    let mut out = Vec::new();
-                    pj.node_edges(e.id, dir, None, &mut out)?;
+                    let (mut out, mut rows) = (Vec::new(), Vec::new());
+                    pj.node_edges(e.id, dir, None, &mut out, &mut rows)?;
                     Ok(out)
                 }
                 None => self.node_edges(e.id, dir, None, view)?.collect(),

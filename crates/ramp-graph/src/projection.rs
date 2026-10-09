@@ -13,6 +13,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::query::Part;
 use crate::{Direction, Entry, Graph, GraphError, LogId, Record, Result, StrId, Txn};
 
 /// Row index into [`Projection::rows`].
@@ -47,6 +48,9 @@ pub struct Projection {
     /// CSR of edges entering each node row, as `out_*`.
     in_off: Vec<u32>,
     in_adj: Vec<Row>,
+    /// Per row, an edge's `(source row, target row)`; `(0, 0)` for nodes. Lets a hop
+    /// from an edge reach its far node without the ID → row lookup.
+    ends: Vec<(Row, Row)>,
     /// Live properties as `(key, value, parent)`, sorted.
     by_kv: Vec<(StrId, StrId, LogId)>,
     /// Live properties as `(parent, key, value)`, sorted; one per `(parent, key)`.
@@ -184,6 +188,15 @@ impl Projection {
         nodes_by_type.sort_unstable();
         edges_by_type.sort_unstable();
         let [out_off, out_adj, in_off, in_adj] = csr(&rows, &edges_by_type, by_row)?;
+        let ends = rows
+            .iter()
+            .map(|e| match e.record {
+                Record::Edge { src, tgt, .. } => {
+                    (by_row(src).unwrap_or(0), by_row(tgt).unwrap_or(0))
+                }
+                Record::Node { .. } | Record::Prop { .. } | Record::Deletion { .. } => (0, 0),
+            })
+            .collect();
 
         let mut by_kv: Vec<(StrId, StrId, LogId)> =
             props.iter().map(|&(p, k, v)| (k, v, p)).collect();
@@ -200,6 +213,7 @@ impl Projection {
             out_adj,
             in_off,
             in_adj,
+            ends,
             by_kv,
             by_pk,
         })
@@ -234,28 +248,51 @@ impl Projection {
     }
 
     /// Rows of live nodes (`edges == false`) or edges of type `ty`, in log order.
-    pub(crate) fn rows_of_type(&self, edges: bool, ty: StrId) -> impl Iterator<Item = Row> + '_ {
+    pub(crate) fn type_group(&self, edges: bool, ty: StrId) -> &[(StrId, Row)] {
         let groups = if edges {
             &self.edges_by_type
         } else {
             &self.nodes_by_type
         };
         let lo = groups.partition_point(|&(t, _)| t < ty);
-        groups
-            .get(lo..)
-            .unwrap_or_default()
-            .iter()
-            .take_while(move |&&(t, _)| t == ty)
-            .map(|&(_, r)| r)
+        let hi = lo
+            + groups
+                .get(lo..)
+                .unwrap_or_default()
+                .partition_point(|&(t, _)| t == ty);
+        groups.get(lo..hi).unwrap_or_default()
     }
 
-    /// Rows of all live nodes or edges, in log order.
-    pub(crate) fn rows_of_kind(&self, edges: bool) -> impl Iterator<Item = Row> + '_ {
-        self.rows
-            .iter()
-            .enumerate()
-            .filter(move |(_, e)| matches!(e.record, Record::Edge { .. }) == edges)
-            .filter_map(|(i, _)| Row::try_from(i).ok())
+    /// Row of a live node or edge.
+    #[must_use]
+    pub(crate) fn row_of(&self, id: LogId) -> Option<Row> {
+        let s = *self.slot.get(usize::try_from(id).ok()?)?;
+        s.checked_sub(1)
+    }
+
+    /// Appends the endpoints of edge `edge` (row `row` if the caller knows it) for
+    /// `dirs` (`In`: source, `Out`: target) to `out`, with their rows to `rows`.
+    ///
+    /// # Errors
+    /// Fails if the edge is not in the projection.
+    pub(crate) fn edge_ends(
+        &self,
+        edge: LogId,
+        row: Option<Row>,
+        dirs: &[Direction],
+        out: &mut Vec<Entry>,
+        rows: &mut Vec<Row>,
+    ) -> Result<()> {
+        let r = row.or_else(|| self.row_of(edge));
+        let (src, tgt) = r
+            .and_then(|r| self.ends.get(index(r)).copied())
+            .ok_or(GraphError::NotFound(edge, "edge"))?;
+        for &d in dirs {
+            let n = if d == Direction::Out { tgt } else { src };
+            out.push(self.by_row(n)?);
+            rows.push(n);
+        }
+        Ok(())
     }
 
     /// The entry in row `r`.
@@ -276,6 +313,7 @@ impl Projection {
         dir: Direction,
         ty: Option<StrId>,
         out: &mut Vec<Entry>,
+        rows: &mut Vec<Row>,
     ) -> Result<()> {
         let Some(n) = self
             .slot
@@ -290,6 +328,7 @@ impl Projection {
                 let e = self.by_row(r)?;
                 if ty.is_none_or(|t| matches!(e.record, Record::Edge { ty, .. } if ty == t)) {
                     out.push(e);
+                    rows.push(r);
                 }
             }
         }
@@ -301,6 +340,7 @@ impl Projection {
                     && ty.is_none_or(|t| matches!(e.record, Record::Edge { ty, .. } if ty == t))
                 {
                     out.push(e);
+                    rows.push(r);
                 }
             }
         }
@@ -319,15 +359,16 @@ impl Projection {
             .map(|&(_, _, v)| v)
     }
 
-    /// Parents of live properties `key == val`, in parent order.
-    pub(crate) fn parents_with(&self, key: StrId, val: StrId) -> impl Iterator<Item = LogId> + '_ {
+    /// Live properties `key == val` as `(key, val, parent)`, in parent order.
+    pub(crate) fn kv_range(&self, key: StrId, val: StrId) -> &[(StrId, StrId, LogId)] {
         let lo = self.by_kv.partition_point(|&(k, v, _)| (k, v) < (key, val));
-        self.by_kv
-            .get(lo..)
-            .unwrap_or_default()
-            .iter()
-            .take_while(move |&&(k, v, _)| k == key && v == val)
-            .map(|&(_, _, p)| p)
+        let hi = lo
+            + self
+                .by_kv
+                .get(lo..)
+                .unwrap_or_default()
+                .partition_point(|&(k, v, _)| (k, v) == (key, val));
+        self.by_kv.get(lo..hi).unwrap_or_default()
     }
 
     /// Bytes this projection holds, for sizing.
@@ -338,6 +379,7 @@ impl Projection {
             + (self.nodes_by_type.len() + self.edges_by_type.len()) * size_of::<(StrId, Row)>()
             + (self.out_off.len() + self.in_off.len()) * size_of::<u32>()
             + (self.out_adj.len() + self.in_adj.len()) * size_of::<Row>()
+            + self.ends.len() * size_of::<(Row, Row)>()
             + self.by_kv.len() * size_of::<(StrId, StrId, LogId)>()
             + self.by_pk.len() * size_of::<(LogId, StrId, StrId)>()
     }
@@ -386,7 +428,7 @@ impl Projection {
                             Some(self),
                             patterns,
                             None,
-                            |i| i % threads == k,
+                            Part { k, n: threads },
                             &mut |pi, chain| {
                                 if stop.load(Ordering::Relaxed) {
                                     return false;
