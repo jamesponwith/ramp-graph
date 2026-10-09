@@ -1,0 +1,25 @@
+[package]
+name = "ramp-expand"
+description = "Budgeted graph expansion steered by a policy, with standing queries"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["graph", "expansion", "search"]
+categories = ["database"]
+readme = false
+
+[dependencies]
+ramp-graph.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "expand"
+harness = false

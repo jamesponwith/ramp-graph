@@ -180,12 +180,35 @@ struct Walk<'w> {
     all_kept: bool,
 }
 
-/// Fill order for a pattern of `n` slots seeded at `s`: rightwards, then leftwards.
-fn fill_order(n: usize, s: usize) -> Vec<(usize, usize)> {
-    (s + 1..n)
-        .map(|i| (i, i - 1))
-        .chain((0..s).rev().map(|i| (i, i + 1)))
-        .collect()
+/// Whether a slot's filters go beyond a bare `type=`: such a slot kills most chains that
+/// reach it, so it is worth reaching early.
+fn selective(slot: &Slot) -> bool {
+    slot.filters
+        .iter()
+        .any(|f| f.path.as_slice() != ["type"] || !matches!(f.test, Test::In(_)))
+}
+
+/// Fill order for `p` seeded at slot `seed`: towards the nearer selective slot first.
+///
+/// A chain that will fail a selective slot fails before it has fanned out on the far
+/// side: a new edge into a hub, with the selective slot on the other side of it, is
+/// checked against that slot instead of walking the hub. Rightwards first on a tie, or
+/// with no selective slot.
+fn fill_order(p: &Pattern, seed: usize) -> Vec<(usize, usize)> {
+    let len = p.slots.len();
+    let left = (0..seed)
+        .rev()
+        .find(|&i| p.slots.get(i).is_some_and(selective));
+    let right = (seed + 1..len).find(|&i| p.slots.get(i).is_some_and(selective));
+    let rightwards = (seed + 1..len).map(|i| (i, i - 1));
+    let leftwards = (0..seed).rev().map(|i| (i, i + 1));
+    match (left, right) {
+        (Some(near), Some(far)) if seed - near < far - seed => {
+            leftwards.chain(rightwards).collect()
+        }
+        (Some(_), None) => leftwards.chain(rightwards).collect(),
+        _ => rightwards.chain(leftwards).collect(),
+    }
 }
 
 /// Per slot, the edge types a `type=` filter restricts a hop to.
@@ -305,7 +328,7 @@ impl Txn<'_> {
             let Some(slot) = p.slots.get(p.seed) else {
                 continue;
             };
-            let (order, hop_types) = (fill_order(p.slots.len(), p.seed), hop_types(p));
+            let (order, hop_types) = (fill_order(p, p.seed), hop_types(p));
             let walk = Walk {
                 p,
                 view,
@@ -415,7 +438,7 @@ impl Txn<'_> {
                         {
                             continue;
                         }
-                        let (order, hop_types) = (fill_order(p.slots.len(), si), hop_types(p));
+                        let (order, hop_types) = (fill_order(p, si), hop_types(p));
                         let walk = Walk {
                             p,
                             view: after,
