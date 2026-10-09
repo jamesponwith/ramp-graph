@@ -32,7 +32,9 @@ use std::path::Path;
 use std::sync::{Condvar, Mutex};
 
 use heed::types::Bytes;
-use heed::{CompactionOption, Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn, WithTls};
+use heed::{
+    CompactionOption, Database, Env, EnvFlags, EnvOpenOptions, PutFlags, RoTxn, RwTxn, WithTls,
+};
 
 /// Position in the graph log. IDs start at 1; 0 means "none" (or "the graph itself"
 /// when used as a property parent).
@@ -1001,7 +1003,8 @@ impl<'a> Txn<'a> {
             .ok_or(GraphError::Corrupt("string id overflow"))?;
         let t = self.g.t;
         let w = self.rw()?;
-        t.scalar.put(w, &id.to_be_bytes(), bytes)?;
+        t.scalar
+            .put_with_flags(w, PutFlags::APPEND, &id.to_be_bytes(), bytes)?;
         let mut k = fnv64(bytes).to_be_bytes().to_vec();
         k.extend_from_slice(&id.to_be_bytes());
         t.scalar_idx.put(w, &k, &[])?;
@@ -1032,7 +1035,12 @@ impl<'a> Txn<'a> {
             self.end(supersedes, e.id)?;
         }
         let t = self.g.t;
-        t.log.put(self.rw()?, &varint::pack(&[e.id]), &e.encode())?;
+        t.log.put_with_flags(
+            self.rw()?,
+            PutFlags::APPEND,
+            &varint::pack(&[e.id]),
+            &e.encode(),
+        )?;
         Ok(e)
     }
 
@@ -1307,8 +1315,9 @@ impl<'a> Txn<'a> {
                     .checked_add_signed(self.state.edge_delta)
                     .ok_or_else(bad)?;
                 let t = self.g.t;
-                t.txnlog.put(
+                t.txnlog.put_with_flags(
                     self.rw()?,
+                    PutFlags::APPEND,
                     &varint::pack(&[end]),
                     &varint::pack(&[nodes, edges]),
                 )?;
