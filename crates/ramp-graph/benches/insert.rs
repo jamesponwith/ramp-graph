@@ -87,6 +87,16 @@ fn main() -> Result<()> {
     t.commit()?;
     phase("commit", 1, start);
     println!("size       {} MiB", g.size()? >> 20);
+    let start = Instant::now();
+    g.snapshot(dir.path().join("compact.db"))?;
+    let compact = std::fs::metadata(dir.path().join("compact.db"))
+        .map_err(|e| ramp_graph::GraphError::Io(e.to_string()))?
+        .len();
+    println!(
+        "compacted  {} MiB in {:.2}s",
+        compact >> 20,
+        start.elapsed().as_secs_f64()
+    );
 
     // The same edges through `edge_batch`, in one batch and in REST-sized ones.
     for batch in [n, 10_000] {
