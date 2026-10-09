@@ -451,11 +451,18 @@ mod tests {
         };
         store.fit_projections(uuids[0]).unwrap();
         assert_eq!([cached(0), cached(1), cached(2)], [false, false, false]);
-        // A commit drops the cache on its own; nothing to fit afterwards.
+        // A commit keeps the cached projection (the next scan advances it), so the
+        // budget still counts it.
         graphs[2].read().unwrap().projection().unwrap();
         let mut t = graphs[2].write().unwrap();
         t.node(b"t", b"new").unwrap();
         t.commit().unwrap();
+        assert!(cached(2));
+        let store = Store {
+            projection_budget: 0,
+            ..store
+        };
+        store.fit_projections(uuids[0]).unwrap();
         assert!(!cached(2));
     }
 

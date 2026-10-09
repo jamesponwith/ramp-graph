@@ -34,6 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Bound;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -378,6 +379,9 @@ pub struct Graph {
     /// When the last projection build finished and how long it took, for
     /// [`Txn::projection_if_due`].
     built: Mutex<Option<(Instant, Duration)>>,
+    /// Resets committed in this process. A reset reuses log IDs, so a projection from
+    /// before one cannot be advanced.
+    epoch: AtomicU64,
 }
 
 /// Whether a rebuild at `now` keeps builds to at most one per `duty + 1` build-times:
@@ -433,6 +437,7 @@ impl Graph {
             idle: Condvar::new(),
             projection: Mutex::default(),
             built: Mutex::default(),
+            epoch: AtomicU64::new(0),
         })
     }
 
@@ -492,6 +497,10 @@ impl Graph {
             .projection
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
     }
 
     /// The cached projection, whatever view it projects.
@@ -625,6 +634,8 @@ struct State {
     next_log: LogId,
     /// Next string ID (0 = not yet known).
     next_str: StrId,
+    /// The txn reset the graph.
+    reset: bool,
 }
 
 enum Inner<'a> {
@@ -700,51 +711,77 @@ impl<'a> Txn<'a> {
         }
     }
 
-    /// A read-optimised [`Projection`] of this txn's view, built now unless the graph
-    /// has one cached for exactly this view. [`query`](Self::query) calls on this view
-    /// use it until the next commit. Costs one sequential scan of the log and
-    /// [`Projection::bytes`] of RAM.
+    /// A read-optimised [`Projection`] of this txn's view. A cached one for an earlier
+    /// view is advanced over the log entries since (cheap: proportional to them); one
+    /// is built from scratch when there is none, a reset intervened, or its delta has
+    /// grown past a fraction of its base. [`query`](Self::query) calls on this view use
+    /// it. Only read txns update the cache: a write txn's view includes writes that may
+    /// never commit.
     ///
     /// # Errors
     /// Fails on storage errors.
     pub fn projection(&self) -> Result<Arc<Projection>> {
-        let end = self.next_id()?;
-        if let Some(s) = self.g.cached_projection()
-            && s.end() == end
-        {
-            return Ok(s);
-        }
-        let started = Instant::now();
-        let s = Arc::new(Projection::build(self)?);
-        *self
-            .g
-            .projection
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&s));
-        *self.g.built.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some((Instant::now(), started.elapsed()));
-        Ok(s)
+        self.projection_for(None)?
+            .ok_or(GraphError::Corrupt("projection not built"))
     }
 
-    /// [`projection`](Self::projection), unless building one now would spend more than
-    /// one part in `duty + 1` of this graph's time on builds: then `None`, and the
-    /// caller reads LMDB. On a graph that is written and scanned constantly, this
-    /// caps rebuilding at that duty cycle instead of one rebuild per scan.
+    /// [`projection`](Self::projection), except that a full build happens only when it
+    /// keeps builds to at most one part in `duty + 1` of this graph's time; otherwise
+    /// `None`, and the caller reads LMDB. Advancing a cached projection is always done.
     ///
     /// # Errors
     /// Fails on storage errors.
     pub fn projection_if_due(&self, duty: u32) -> Result<Option<Arc<Projection>>> {
+        self.projection_for(Some(duty))
+    }
+
+    /// # Errors
+    /// Fails on storage errors.
+    fn projection_for(&self, duty: Option<u32>) -> Result<Option<Arc<Projection>>> {
         let end = self.next_id()?;
-        if let Some(s) = self.g.cached_projection()
-            && s.end() == end
-        {
-            return Ok(Some(s));
-        }
+        let epoch = self.g.epoch();
+        let cacheable = matches!(self.inner, Inner::Ro(_));
         let last = *self.g.built.lock().unwrap_or_else(PoisonError::into_inner);
-        if !rebuild_due(last, Instant::now(), duty) {
+        let due = duty.is_none_or(|d| rebuild_due(last, Instant::now(), d));
+        {
+            let mut slot = self
+                .g
+                .projection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(p) = slot
+                .as_mut()
+                .filter(|p| p.epoch() == epoch && p.end() <= end && !(due && p.wants_rebuild()))
+            {
+                if p.end() == end {
+                    return Ok(Some(Arc::clone(p)));
+                }
+                if cacheable {
+                    // Advanced in place unless a query still holds it (then copied).
+                    Arc::make_mut(p).advance(self)?;
+                    return Ok(Some(Arc::clone(p)));
+                }
+                let mut mine = Projection::clone(p);
+                drop(slot);
+                mine.advance(self)?;
+                return Ok(Some(Arc::new(mine)));
+            }
+        }
+        if !due {
             return Ok(None);
         }
-        self.projection().map(Some)
+        let started = Instant::now();
+        let s = Arc::new(Projection::build(self, epoch)?);
+        if cacheable {
+            *self
+                .g
+                .projection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&s));
+            *self.g.built.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some((Instant::now(), started.elapsed()));
+        }
+        Ok(Some(s))
     }
 
     /// Normalizes a view bound: `None`, or one that covers the whole log, means "now".
@@ -1715,6 +1752,7 @@ impl<'a> Txn<'a> {
         self.state = State {
             begin: 1,
             next_log: 1,
+            reset: true,
             ..State::default()
         };
         self.strs.clear();
@@ -1787,8 +1825,11 @@ impl<'a> Txn<'a> {
             Inner::Ro(t) => t.commit()?,
             Inner::Rw(t) => {
                 t.commit()?;
-                if parent.is_none() {
-                    *g.projection.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                // Other commits only append to the log, and a projection advances over
+                // them; a reset reuses log IDs, so one from before it is useless.
+                if parent.is_none() && state.reset {
+                    g.epoch.fetch_add(1, Ordering::AcqRel);
+                    g.drop_projection();
                 }
             }
         }

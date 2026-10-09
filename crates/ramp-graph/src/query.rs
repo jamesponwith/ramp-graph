@@ -214,7 +214,7 @@ pub(crate) struct Part {
 impl Part {
     const ALL: Self = Self { k: 0, n: 1 };
 
-    fn slice<T>(self, s: &[T]) -> &[T] {
+    pub(crate) fn slice<T>(self, s: &[T]) -> &[T] {
         s.get(self.range(s.len())).unwrap_or_default()
     }
 
@@ -224,7 +224,7 @@ impl Part {
         len * self.k / n..len * (self.k + 1) / n
     }
 
-    fn takes(self, i: usize) -> bool {
+    pub(crate) fn takes(self, i: usize) -> bool {
         i % self.n.max(1) == self.k
     }
 }
@@ -241,6 +241,8 @@ struct Scratch {
     kept: Vec<Entry>,
     /// The chain being filled.
     chain: Vec<Entry>,
+    /// Each chain slot's projection row ([`NO_ROW`] if unknown).
+    chain_rows: Vec<u32>,
     /// IDs held by `uniq` slots along the chain.
     used: Vec<LogId>,
 }
@@ -262,7 +264,7 @@ impl Txn<'_> {
             None => self
                 .g
                 .cached_projection()
-                .filter(|s| s.end() == self.state.next_log),
+                .filter(|s| s.end() == self.state.next_log && s.epoch() == self.g.epoch()),
             Some(_) => None,
         };
         self.query_with(proj.as_deref(), patterns, before, sink)
@@ -582,8 +584,7 @@ impl Txn<'_> {
                 (
                     Box::new(
                         ids.into_iter()
-                            .flat_map(move |ty| part.slice(pj.type_group(edges, ty)))
-                            .filter_map(move |&(_, r)| pj.row(r))
+                            .flat_map(move |ty| pj.type_rows(edges, ty, part))
                             .map(Ok),
                     ),
                     satisfied,
@@ -610,8 +611,7 @@ impl Txn<'_> {
                     Some((fi, key, vals)) => (
                         Box::new(
                             vals.into_iter()
-                                .flat_map(move |v| part.slice(pj.kv_range(key, v)))
-                                .filter_map(move |&(_, _, parent)| pj.entry(parent))
+                                .flat_map(move |v| pj.parents_with(key, v, part))
                                 .map(Ok),
                         ),
                         Some(fi),
@@ -637,16 +637,35 @@ impl Txn<'_> {
         let p = w.p;
         let n = p.slots.len();
         // Fill rightwards from the seed, then leftwards: (slot to fill, filled neighbor).
-        let Scratch { chain, used, .. } = scratch;
+        let Scratch {
+            chain,
+            chain_rows,
+            used,
+            ..
+        } = scratch;
         chain.clear();
         chain.resize(n, seed);
+        chain_rows.clear();
+        chain_rows.resize(n, NO_ROW);
         used.clear();
         if p.slots.get(s).is_some_and(|x| x.uniq) {
             used.push(seed.id);
         }
-        let (mut chain, mut used) = (std::mem::take(chain), std::mem::take(used));
-        let go = self.step(w, w.order, (&mut chain, NO_ROW), &mut used, scratch, sink);
+        let (mut chain, mut chain_rows, mut used) = (
+            std::mem::take(chain),
+            std::mem::take(chain_rows),
+            std::mem::take(used),
+        );
+        let go = self.step(
+            w,
+            w.order,
+            (&mut chain, &mut chain_rows),
+            &mut used,
+            scratch,
+            sink,
+        );
         scratch.chain = chain;
+        scratch.chain_rows = chain_rows;
         scratch.used = used;
         go
     }
@@ -657,7 +676,7 @@ impl Txn<'_> {
         &self,
         w: &Walk<'_>,
         order: &[(usize, usize)],
-        (chain, cur_row): (&mut [Entry], u32),
+        (chain, chain_rows): (&mut [Entry], &mut [u32]),
         seen: &mut Vec<LogId>,
         scratch: &mut Scratch,
         sink: &mut dyn FnMut(&[Entry]) -> bool,
@@ -689,6 +708,8 @@ impl Txn<'_> {
             p.slots.get(from).ok_or_else(bad)?,
             *chain.get(from).ok_or_else(bad)?,
         );
+        // The hop starts from slot `from`, which need not be the slot filled last.
+        let cur_row = chain_rows.get(from).copied().unwrap_or(NO_ROW);
         let dir = if pos > from { prev.fwd } else { prev.bwd };
         // An edge slot with `type=` walks only those types' edges (via the [node, type] index).
         let types = w.hop_types.get(pos).and_then(Option::as_deref);
@@ -714,10 +735,11 @@ impl Txn<'_> {
                 continue;
             }
             *chain.get_mut(pos).ok_or_else(bad)? = cand;
+            *chain_rows.get_mut(pos).ok_or_else(bad)? = cand_row;
             if slot.uniq {
                 seen.push(cand.id);
             }
-            go = self.step(w, rest, (chain, cand_row), seen, scratch, sink)?;
+            go = self.step(w, rest, (chain, chain_rows), seen, scratch, sink)?;
             if slot.uniq {
                 seen.pop();
             }
