@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Number, Value};
 
 use crate::lgql::{Cmp, Filter, Kind, Pattern, Slot, Test};
+use crate::projection::Projection;
 use crate::{Direction, Entry, GraphError, LogId, Record, Result, StrId, Txn, value, varint};
 
 const fn kind(e: &Entry) -> Option<Kind> {
@@ -61,7 +62,7 @@ impl Keys {
             };
             let packed = !NATIVE_STR.contains(&key.as_str());
             let literals = k.literals.entry(key.clone()).or_default();
-            for v in vals {
+            for v in vals.iter().filter_map(Value::as_str) {
                 if !literals.contains_key(v) {
                     let id = if packed {
                         t.string_id(&value::encode(&Value::from(v))?)?
@@ -76,11 +77,12 @@ impl Keys {
     }
 
     /// Whether any of `key`'s literals `literals` is interned as `id`.
-    fn any_is(&self, key: &str, literals: &[&str], id: StrId) -> bool {
+    fn any_is(&self, key: &str, literals: &[Value], id: StrId) -> bool {
         self.literals.get(key).is_some_and(|m| {
             literals
                 .iter()
-                .any(|l| m.get(*l).copied().flatten() == Some(id))
+                .filter_map(Value::as_str)
+                .any(|l| m.get(l).copied().flatten() == Some(id))
         })
     }
 }
@@ -89,10 +91,10 @@ impl Keys {
 const NATIVE_STR: [&str; 2] = ["type", "value"];
 
 /// The literals of a single-key `=`/`!=` test, if every one is a string.
-fn eq_strings(f: &Filter) -> Option<Vec<&str>> {
+fn eq_strings(f: &Filter) -> Option<&[Value]> {
     match (f.path.as_slice(), &f.test) {
-        ([_], Test::In(vals) | Test::NotIn(vals)) => {
-            vals.iter().map(Value::as_str).collect::<Option<Vec<_>>>()
+        ([_], Test::In(vals) | Test::NotIn(vals)) if vals.iter().all(Value::is_string) => {
+            Some(vals)
         }
         _ => None,
     }
@@ -104,9 +106,25 @@ struct Walk<'w> {
     p: &'w Pattern,
     view: Option<LogId>,
     keys: &'w Keys,
+    proj: Option<&'w Projection>,
 }
 
 type Seeds<'s> = Box<dyn Iterator<Item = Result<Entry>> + 's>;
+
+/// Buffers reused across chains so expansion allocates nothing per hop or result.
+#[derive(Debug, Default)]
+struct Scratch {
+    /// Candidate lists, one per recursion depth, kept for reuse.
+    pool: Vec<Vec<Entry>>,
+    /// The kept slots of the chain being reported.
+    kept: Vec<Entry>,
+    /// Slot fill order for the current pattern and seed slot.
+    order: Vec<(usize, usize)>,
+    /// The chain being filled.
+    chain: Vec<Entry>,
+    /// IDs held by `uniq` slots along the chain.
+    used: Vec<LogId>,
+}
 
 impl Txn<'_> {
     /// Runs `patterns` against view `before`, calling `sink(pattern index, chain)` for
@@ -118,19 +136,74 @@ impl Txn<'_> {
         &self,
         patterns: &[Pattern],
         before: Option<LogId>,
-        mut sink: impl FnMut(usize, Vec<Entry>) -> bool,
+        sink: impl FnMut(usize, &[Entry]) -> bool,
+    ) -> Result<()> {
+        // A cached projection is used only when it projects exactly this txn's view.
+        let proj = match self.view(before)? {
+            None => self
+                .g
+                .cached_projection()
+                .filter(|s| s.end() == self.state.next_log),
+            Some(_) => None,
+        };
+        self.query_with(proj.as_deref(), patterns, before, sink)
+    }
+
+    /// [`query`](Self::query) against `proj` (which must project this txn's current
+    /// view) or, with `None`, against LMDB.
+    ///
+    /// # Errors
+    /// Fails on storage errors.
+    pub(crate) fn query_with(
+        &self,
+        proj: Option<&Projection>,
+        patterns: &[Pattern],
+        before: Option<LogId>,
+        mut sink: impl FnMut(usize, &[Entry]) -> bool,
+    ) -> Result<()> {
+        self.run(proj, patterns, before, |_| true, &mut sink)
+    }
+
+    /// The query loop: seeds whose ordinal passes `take` are expanded; `sink` returning
+    /// `false` ends it.
+    ///
+    /// # Errors
+    /// Fails on storage errors.
+    pub(crate) fn run(
+        &self,
+        proj: Option<&Projection>,
+        patterns: &[Pattern],
+        before: Option<LogId>,
+        take: impl Fn(usize) -> bool + Sync,
+        sink: &mut dyn FnMut(usize, &[Entry]) -> bool,
     ) -> Result<()> {
         let view = self.view(before)?;
         let keys = Keys::new(self, patterns)?;
+        let mut scratch = Scratch::default();
         for (pi, p) in patterns.iter().enumerate() {
             let Some(slot) = p.slots.get(p.seed) else {
                 continue;
             };
-            for seed in self.seeds(slot, view)? {
+            let walk = Walk {
+                p,
+                view,
+                keys: &keys,
+                proj,
+            };
+            let (seeds, satisfied) = self.seeds(slot, view, &keys, proj, &take)?;
+            let single = p.slots.len() == 1 && slot.keep;
+            for seed in seeds {
                 let seed = seed?;
-                if self.matches(&seed, slot, view, &keys)?
-                    && !self.expand(p, p.seed, seed, view, &keys, &mut |c| sink(pi, c))?
-                {
+                if !self.matches_except(&seed, slot, view, &keys, proj, satisfied)? {
+                    continue;
+                }
+                // A one-slot pattern has nothing to expand: the seed is the chain.
+                let go = if single {
+                    sink(pi, std::slice::from_ref(&seed))
+                } else {
+                    self.expand(&walk, p.seed, seed, &mut scratch, &mut |c| sink(pi, c))?
+                };
+                if !go {
                     return Ok(());
                 }
             }
@@ -150,10 +223,11 @@ impl Txn<'_> {
         patterns: &[Pattern],
         start: LogId,
         stop: Option<LogId>,
-        mut sink: impl FnMut(usize, LogId, Vec<Entry>) -> bool,
+        mut sink: impl FnMut(usize, LogId, &[Entry]) -> bool,
     ) -> Result<()> {
         let next = self.next_id()?;
         let keys = Keys::new(self, patterns)?;
+        let mut scratch = Scratch::default();
         let end = stop.map_or(next, |s| s.saturating_add(1).min(next));
         // Edge slots testing `src.*`/`tgt.*` change when an endpoint's property does.
         let via_ends = patterns.iter().flat_map(|p| &p.slots).any(|s| {
@@ -214,12 +288,18 @@ impl Txn<'_> {
                 let existed = id < x && obj.live_at(before);
                 for (pi, p) in patterns.iter().enumerate() {
                     for (si, slot) in p.slots.iter().enumerate() {
-                        if !self.matches(&obj, slot, after, &keys)?
-                            || existed && self.matches(&obj, slot, before, &keys)?
+                        if !self.matches(&obj, slot, after, &keys, None)?
+                            || existed && self.matches(&obj, slot, before, &keys, None)?
                         {
                             continue;
                         }
-                        self.expand(p, si, obj, after, &keys, &mut |c| {
+                        let walk = Walk {
+                            p,
+                            view: after,
+                            keys: &keys,
+                            proj: None,
+                        };
+                        self.expand(&walk, si, obj, &mut scratch, &mut |c| {
                             if emitted.insert((pi, c.iter().map(|e| e.id).collect::<Vec<_>>()))
                                 && !sink(pi, x, c)
                             {
@@ -241,15 +321,33 @@ impl Txn<'_> {
     ///
     /// # Errors
     /// Fails on storage errors.
-    fn seeds<'s>(&'s self, slot: &Slot, view: Option<LogId>) -> Result<Seeds<'s>> {
+    fn seeds<'s>(
+        &'s self,
+        slot: &Slot,
+        view: Option<LogId>,
+        keys: &Keys,
+        proj: Option<&'s Projection>,
+        take: &'s (dyn Fn(usize) -> bool + Sync),
+    ) -> Result<(Seeds<'s>, Option<usize>)> {
         let strs = |key| -> Option<Vec<&str>> {
             slot.eq_set(key)
                 .map(|vs| vs.into_iter().filter_map(Value::as_str).collect())
         };
+        let part = move |it: Seeds<'s>| -> Seeds<'s> {
+            Box::new(
+                it.enumerate()
+                    .filter(move |(i, _)| take(*i))
+                    .map(|(_, e)| e),
+            )
+        };
         if let Some(ids) = slot.eq_set("ID") {
             let mut out = Vec::new();
             for id in ids.into_iter().filter_map(Value::as_u64) {
-                if let Some(e) = self.entry(id)?
+                let found = match proj {
+                    Some(pj) => pj.entry(id),
+                    None => self.entry(id)?,
+                };
+                if let Some(e) = found
                     && view.is_none_or(|b| id < b)
                     && e.live_at(view)
                     && kind(&e) == Some(slot.kind)
@@ -257,13 +355,16 @@ impl Txn<'_> {
                     out.push(Ok(e));
                 }
             }
-            return Ok(Box::new(out.into_iter()));
+            return Ok((part(Box::new(out.into_iter())), None));
+        }
+        if let Some(pj) = proj {
+            return self.projection_seeds(pj, slot, keys, strs("type"), strs("value"), take);
         }
         let table = match slot.kind {
             Kind::Node => self.g.t.node_idx,
             Kind::Edge => self.g.t.edge_idx,
         };
-        Ok(match (slot.kind, strs("type"), strs("value")) {
+        let it: Seeds<'s> = match (slot.kind, strs("type"), strs("value")) {
             (Kind::Node, Some(ts), Some(vs)) => {
                 let mut out = Vec::new();
                 for t in &ts {
@@ -281,6 +382,105 @@ impl Txn<'_> {
                 Box::new(its.into_iter().flatten())
             }
             (_, None, _) => Box::new(self.by_type(table, None, view)?),
+        };
+        Ok((part(it), None))
+    }
+
+    /// [`seeds`](Self::seeds) from a projection: by type group, by a property equality
+    /// (the first single-key `=` on string literals), or every row of the slot's kind.
+    /// `(type, value)` pairs still go through the node index.
+    ///
+    /// # Errors
+    /// Fails on storage errors.
+    fn projection_seeds<'s>(
+        &'s self,
+        pj: &'s Projection,
+        slot: &Slot,
+        keys: &Keys,
+        types: Option<Vec<&str>>,
+        values: Option<Vec<&str>>,
+        take: &'s (dyn Fn(usize) -> bool + Sync),
+    ) -> Result<(Seeds<'s>, Option<usize>)> {
+        let edges = slot.kind == Kind::Edge;
+        // The one filter a seed source already decided, so `matches` can skip it.
+        let only = |pred: &dyn Fn(&Filter) -> bool| -> Option<usize> {
+            let mut hits = slot.filters.iter().enumerate().filter(|(_, f)| pred(f));
+            let first = hits.next()?.0;
+            hits.next().is_none().then_some(first)
+        };
+        let rows = move |it: Box<dyn Iterator<Item = u32> + 's>| -> Seeds<'s> {
+            Box::new(
+                it.enumerate()
+                    .filter(move |(i, _)| take(*i))
+                    .filter_map(move |(_, r)| pj.row(r))
+                    .map(Ok),
+            )
+        };
+        Ok(match (slot.kind, types, values) {
+            (Kind::Node, Some(ts), Some(vs)) => {
+                let mut out: Vec<Entry> = Vec::new();
+                for t in &ts {
+                    for v in &vs {
+                        out.extend(self.node_lookup(t.as_bytes(), v.as_bytes(), None)?);
+                    }
+                }
+                let it: Seeds<'s> = Box::new(out.into_iter().map(Ok));
+                (
+                    Box::new(
+                        it.enumerate()
+                            .filter(move |(i, _)| take(*i))
+                            .map(|(_, e)| e),
+                    ),
+                    None,
+                )
+            }
+            (_, Some(ts), _) => {
+                let mut ids = Vec::new();
+                for t in ts {
+                    ids.extend(self.string_id(t.as_bytes())?);
+                }
+                let satisfied =
+                    only(&|f| f.path.as_slice() == ["type"] && matches!(f.test, Test::In(_)));
+                (
+                    rows(Box::new(
+                        ids.into_iter()
+                            .flat_map(move |ty| pj.rows_of_type(edges, ty)),
+                    )),
+                    satisfied,
+                )
+            }
+            (_, None, _) => {
+                let by_prop = slot.filters.iter().enumerate().find_map(|(fi, f)| {
+                    let ([k], Some(literals)) = (f.path.as_slice(), eq_strings(f)) else {
+                        return None;
+                    };
+                    if NATIVE_STR.contains(&k.as_str()) || matches!(f.test, Test::NotIn(_)) {
+                        return None;
+                    }
+                    let key = keys.keys.get(k).copied().flatten()?;
+                    let vals: Vec<StrId> = literals
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter_map(|l| keys.literals.get(k)?.get(l).copied().flatten())
+                        .collect();
+                    Some((fi, key, vals))
+                });
+                match by_prop {
+                    // One live value per (parent, key), so a parent appears once.
+                    Some((fi, key, vals)) => (
+                        Box::new(
+                            vals.into_iter()
+                                .flat_map(move |v| pj.parents_with(key, v))
+                                .enumerate()
+                                .filter(move |(i, _)| take(*i))
+                                .filter_map(move |(_, parent)| pj.entry(parent))
+                                .map(Ok),
+                        ),
+                        Some(fi),
+                    ),
+                    None => (rows(Box::new(pj.rows_of_kind(edges))), None),
+                }
+            }
         })
     }
 
@@ -290,26 +490,37 @@ impl Txn<'_> {
     /// Fails on storage errors.
     fn expand(
         &self,
-        p: &Pattern,
+        w: &Walk<'_>,
         s: usize,
         seed: Entry,
-        view: Option<LogId>,
-        keys: &Keys,
-        sink: &mut dyn FnMut(Vec<Entry>) -> bool,
+        scratch: &mut Scratch,
+        sink: &mut dyn FnMut(&[Entry]) -> bool,
     ) -> Result<bool> {
+        let p = w.p;
         let n = p.slots.len();
         // Fill rightwards from the seed, then leftwards: (slot to fill, filled neighbor).
-        let order: Vec<(usize, usize)> = (s + 1..n)
-            .map(|i| (i, i - 1))
-            .chain((0..s).rev().map(|i| (i, i + 1)))
-            .collect();
-        let mut chain = vec![seed; n];
-        let mut used = Vec::new();
+        let Scratch {
+            order, chain, used, ..
+        } = scratch;
+        order.clear();
+        order.extend((s + 1..n).map(|i| (i, i - 1)));
+        order.extend((0..s).rev().map(|i| (i, i + 1)));
+        chain.clear();
+        chain.resize(n, seed);
+        used.clear();
         if p.slots.get(s).is_some_and(|x| x.uniq) {
             used.push(seed.id);
         }
-        let walk = Walk { p, view, keys };
-        self.step(&walk, &order, &mut chain, &mut used, sink)
+        let (order, mut chain, mut used) = (
+            std::mem::take(order),
+            std::mem::take(chain),
+            std::mem::take(used),
+        );
+        let go = self.step(w, &order, &mut chain, &mut used, scratch, sink);
+        scratch.order = order;
+        scratch.chain = chain;
+        scratch.used = used;
+        go
     }
 
     /// # Errors
@@ -320,18 +531,25 @@ impl Txn<'_> {
         order: &[(usize, usize)],
         chain: &mut [Entry],
         seen: &mut Vec<LogId>,
-        sink: &mut dyn FnMut(Vec<Entry>) -> bool,
+        scratch: &mut Scratch,
+        sink: &mut dyn FnMut(&[Entry]) -> bool,
     ) -> Result<bool> {
-        let Walk { p, view, keys } = *w;
+        let Walk {
+            p,
+            view,
+            keys,
+            proj,
+        } = *w;
         let Some((&(pos, from), rest)) = order.split_first() else {
-            let kept = p
-                .slots
-                .iter()
-                .zip(chain.iter())
-                .filter(|(s, _)| s.keep)
-                .map(|(_, e)| *e)
-                .collect();
-            return Ok(sink(kept));
+            scratch.kept.clear();
+            scratch.kept.extend(
+                p.slots
+                    .iter()
+                    .zip(chain.iter())
+                    .filter(|(s, _)| s.keep)
+                    .map(|(_, e)| *e),
+            );
+            return Ok(sink(&scratch.kept));
         };
         let bad = || GraphError::Corrupt("pattern slot out of range");
         let (slot, prev, cur) = (
@@ -346,59 +564,91 @@ impl Txn<'_> {
             .flatten();
         let types: Option<Vec<&str>> =
             types.map(|ts| ts.into_iter().filter_map(Value::as_str).collect());
-        for cand in self.neighbors(&cur, dir, types.as_deref(), view)? {
-            if slot.uniq && seen.contains(&cand.id) || !self.matches(&cand, slot, view, keys)? {
+        let mut cands = scratch.pool.pop().unwrap_or_default();
+        cands.clear();
+        self.neighbors(&cur, dir, types.as_deref(), view, keys, proj, &mut cands)?;
+        let mut go = true;
+        for i in 0..cands.len() {
+            let Some(&cand) = cands.get(i) else { break };
+            if slot.uniq && seen.contains(&cand.id)
+                || !self.matches(&cand, slot, view, keys, proj)?
+            {
                 continue;
             }
             *chain.get_mut(pos).ok_or_else(bad)? = cand;
             if slot.uniq {
                 seen.push(cand.id);
             }
-            let go = self.step(w, rest, chain, seen, sink)?;
+            go = self.step(w, rest, chain, seen, scratch, sink)?;
             if slot.uniq {
                 seen.pop();
             }
             if !go {
-                return Ok(false);
+                break;
             }
         }
-        Ok(true)
+        scratch.pool.push(cands);
+        Ok(go)
     }
 
     /// Edges of a node, or endpoints of an edge (`Out` = target, `In` = source).
     ///
     /// # Errors
     /// Fails on storage errors.
+    #[expect(clippy::too_many_arguments, reason = "one call site, hot path")]
     fn neighbors(
         &self,
         e: &Entry,
         dir: Direction,
         types: Option<&[&str]>,
         view: Option<LogId>,
-    ) -> Result<Vec<Entry>> {
+        keys: &Keys,
+        proj: Option<&Projection>,
+        out: &mut Vec<Entry>,
+    ) -> Result<()> {
         match (e.record, types) {
-            (Record::Node { .. }, None) => self.node_edges(e.id, dir, None, view)?.collect(),
+            (Record::Node { .. }, None) => {
+                if let Some(pj) = proj {
+                    return pj.node_edges(e.id, dir, None, out);
+                }
+                for edge in self.node_edges(e.id, dir, None, view)? {
+                    out.push(edge?);
+                }
+                Ok(())
+            }
             (Record::Node { .. }, Some(types)) => {
-                let mut out = Vec::new();
                 for t in types {
-                    for edge in self.node_edges(e.id, dir, Some(t.as_bytes()), view)? {
-                        out.push(edge?);
+                    // Type literals were interned once per query.
+                    let ty = keys.literals.get("type").and_then(|m| m.get(*t).copied());
+                    match (proj, ty) {
+                        (Some(pj), Some(Some(ty))) => pj.node_edges(e.id, dir, Some(ty), out)?,
+                        (Some(_), _) => {}
+                        (None, _) => {
+                            for edge in self.node_edges(e.id, dir, Some(t.as_bytes()), view)? {
+                                out.push(edge?);
+                            }
+                        }
                     }
                 }
-                Ok(out)
+                Ok(())
             }
             (Record::Edge { src, tgt, .. }, _) => {
                 let ids = match dir {
-                    Direction::In => vec![src],
-                    Direction::Out => vec![tgt],
-                    Direction::Both if src == tgt => vec![src],
-                    Direction::Both => vec![src, tgt],
+                    Direction::In => [Some(src), None],
+                    Direction::Out => [Some(tgt), None],
+                    Direction::Both if src == tgt => [Some(src), None],
+                    Direction::Both => [Some(src), Some(tgt)],
                 };
-                ids.into_iter()
-                    .map(|id| self.entry(id)?.ok_or(GraphError::NotFound(id, "node")))
-                    .collect()
+                for id in ids.into_iter().flatten() {
+                    let node = match proj {
+                        Some(pj) => pj.entry(id),
+                        None => self.entry(id)?,
+                    };
+                    out.push(node.ok_or(GraphError::NotFound(id, "node"))?);
+                }
+                Ok(())
             }
-            (Record::Prop { .. } | Record::Deletion { .. }, _) => Ok(Vec::new()),
+            (Record::Prop { .. } | Record::Deletion { .. }, _) => Ok(()),
         }
     }
 
@@ -412,34 +662,83 @@ impl Txn<'_> {
         key: &str,
         view: Option<LogId>,
         keys: &Keys,
+        proj: Option<&Projection>,
     ) -> Result<Option<Value>> {
         let id = match keys.keys.get(key) {
             Some(&id) => id,
             None => self.string_id(key.as_bytes())?,
         };
         let Some(id) = id else { return Ok(None) };
-        match self.lookup(self.g.t.prop_idx, &varint::pack(&[parent, id]), view)? {
-            Some(Entry {
-                record: Record::Prop { val, .. },
-                ..
-            }) => Ok(value::decode(self.string(val)?).ok()),
-            _ => Ok(None),
+        match self.prop_id(parent, id, view, proj)? {
+            Some(val) => Ok(value::decode(self.string(val)?).ok()),
+            None => Ok(None),
         }
+    }
+
+    /// Value ID of live property `key` on `parent` in `view`.
+    ///
+    /// # Errors
+    /// Fails on storage errors.
+    fn prop_id(
+        &self,
+        parent: LogId,
+        key: StrId,
+        view: Option<LogId>,
+        proj: Option<&Projection>,
+    ) -> Result<Option<StrId>> {
+        if let Some(pj) = proj {
+            return Ok(pj.prop(parent, key));
+        }
+        Ok(
+            match self.lookup(self.g.t.prop_idx, &varint::pack(&[parent, key]), view)? {
+                Some(Entry {
+                    record: Record::Prop { val, .. },
+                    ..
+                }) => Some(val),
+                _ => None,
+            },
+        )
     }
 
     /// Whether `e` satisfies every filter of `slot` in `view`.
     ///
     /// # Errors
     /// Fails on storage errors.
-    fn matches(&self, e: &Entry, slot: &Slot, view: Option<LogId>, keys: &Keys) -> Result<bool> {
+    fn matches(
+        &self,
+        e: &Entry,
+        slot: &Slot,
+        view: Option<LogId>,
+        keys: &Keys,
+        proj: Option<&Projection>,
+    ) -> Result<bool> {
+        self.matches_except(e, slot, view, keys, proj, None)
+    }
+
+    /// [`matches`](Self::matches), trusting filter `skip` (one a seed source decided).
+    ///
+    /// # Errors
+    /// Fails on storage errors.
+    fn matches_except(
+        &self,
+        e: &Entry,
+        slot: &Slot,
+        view: Option<LogId>,
+        keys: &Keys,
+        proj: Option<&Projection>,
+        skip: Option<usize>,
+    ) -> Result<bool> {
         if kind(e) != Some(slot.kind) {
             return Ok(false);
         }
-        for f in &slot.filters {
-            let ok = match self.eq_by_id(e, f, view, keys)? {
+        for (fi, f) in slot.filters.iter().enumerate() {
+            if skip == Some(fi) {
+                continue;
+            }
+            let ok = match self.eq_by_id(e, f, view, keys, proj)? {
                 Some(ok) => ok,
                 None => self
-                    .resolve(e, &f.path, view, keys)?
+                    .resolve(e, &f.path, view, keys, proj)?
                     .is_some_and(|v| holds(&f.test, &v)),
             };
             if !ok {
@@ -462,6 +761,7 @@ impl Txn<'_> {
         f: &Filter,
         view: Option<LogId>,
         keys: &Keys,
+        proj: Option<&Projection>,
     ) -> Result<Option<bool>> {
         let (Some(literals), [k]) = (eq_strings(f), f.path.as_slice()) else {
             return Ok(None);
@@ -473,24 +773,19 @@ impl Txn<'_> {
             // `src`/`tgt` are handled before properties in `resolve`.
             (Record::Edge { .. }, "src" | "tgt") => return Ok(None),
             _ => {
-                if self.native(e, k, view)?.is_some() {
+                if self.native(e, k, view, proj)?.is_some() {
                     return Ok(None);
                 }
                 let Some(key) = keys.keys.get(k).copied().flatten() else {
                     return Ok(Some(false));
                 };
-                return Ok(Some(
-                    match self.lookup(self.g.t.prop_idx, &varint::pack(&[e.id, key]), view)? {
-                        Some(Entry {
-                            record: Record::Prop { val, .. },
-                            ..
-                        }) => keys.any_is(k, &literals, val) != negated,
-                        _ => false,
-                    },
-                ));
+                return Ok(Some(match self.prop_id(e.id, key, view, proj)? {
+                    Some(val) => keys.any_is(k, literals, val) != negated,
+                    None => false,
+                }));
             }
         };
-        Ok(Some(keys.any_is(k, &literals, id) != negated))
+        Ok(Some(keys.any_is(k, literals, id) != negated))
     }
 
     /// The value at `path` on `e` in `view`, if any.
@@ -503,6 +798,7 @@ impl Txn<'_> {
         path: &[String],
         view: Option<LogId>,
         keys: &Keys,
+        proj: Option<&Projection>,
     ) -> Result<Option<Value>> {
         let Some((k0, rest)) = path.split_first() else {
             return Ok(None);
@@ -513,14 +809,18 @@ impl Txn<'_> {
             if rest.is_empty() {
                 return Ok(Some(Value::from(end)));
             }
-            let Some(node) = self.entry(end)? else {
+            let node = match proj {
+                Some(pj) => pj.entry(end),
+                None => self.entry(end)?,
+            };
+            let Some(node) = node else {
                 return Ok(None);
             };
-            return self.resolve(&node, rest, view, keys);
+            return self.resolve(&node, rest, view, keys, proj);
         }
-        let base = match self.native(e, k0, view)? {
+        let base = match self.native(e, k0, view, proj)? {
             Some(v) => Some(v),
-            None => self.prop_value(e.id, k0, view, keys)?,
+            None => self.prop_value(e.id, k0, view, keys, proj)?,
         };
         Ok(base.and_then(|b| {
             rest.iter().try_fold(b, |v, k| match v {
@@ -538,14 +838,28 @@ impl Txn<'_> {
     ///
     /// # Errors
     /// Fails on storage errors.
-    fn native(&self, e: &Entry, k0: &str, view: Option<LogId>) -> Result<Option<Value>> {
+    fn native(
+        &self,
+        e: &Entry,
+        k0: &str,
+        view: Option<LogId>,
+        proj: Option<&Projection>,
+    ) -> Result<Option<Value>> {
         let s = |id| -> Result<Value> {
             Ok(Value::String(
                 String::from_utf8_lossy(self.string(id)?).into_owned(),
             ))
         };
-        let edges =
-            |dir| -> Result<Vec<Entry>> { self.node_edges(e.id, dir, None, view)?.collect() };
+        let edges = |dir| -> Result<Vec<Entry>> {
+            match proj {
+                Some(pj) => {
+                    let mut out = Vec::new();
+                    pj.node_edges(e.id, dir, None, &mut out)?;
+                    Ok(out)
+                }
+                None => self.node_edges(e.id, dir, None, view)?.collect(),
+            }
+        };
         let degree = |dir| -> Result<Value> { Ok(Value::from(edges(dir)?.len())) };
         let ids = |dir| -> Result<Value> { Ok(edges(dir)?.iter().map(|e| e.id).collect()) };
         // Distinct nodes at the other end of this node's edges (self-loops excluded).
@@ -583,10 +897,14 @@ impl Txn<'_> {
             (Record::Node { .. }, "neighbor_types") => {
                 let mut types = serde_json::Map::new();
                 for n in neighbors()? {
+                    let node = match proj {
+                        Some(pj) => pj.entry(n),
+                        None => self.entry(n)?,
+                    };
                     if let Some(Entry {
                         record: Record::Node { ty, .. },
                         ..
-                    }) = self.entry(n)?
+                    }) = node
                     {
                         let count = types
                             .entry(s(ty)?.as_str().unwrap_or_default().to_owned())

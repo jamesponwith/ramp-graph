@@ -23,15 +23,18 @@
 //! ```
 
 pub mod lgql;
+mod projection;
 mod query;
 pub mod value;
 mod varint;
+
+pub use projection::Projection;
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Bound;
 use std::path::Path;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use heed::types::Bytes;
 use heed::{
@@ -281,6 +284,9 @@ pub struct Graph {
     /// Txns active in this process, which LMDB requires to be zero to resize the map.
     txns: Mutex<Active>,
     idle: Condvar,
+    /// The last [`Projection`] built; dropped by any commit, used by queries whose view
+    /// is exactly the one it projects.
+    projection: Mutex<Option<Arc<Projection>>>,
 }
 
 /// See [`Graph::txns`] (upstream `db_t.txns` in `lib/db.c`).
@@ -342,6 +348,7 @@ impl Graph {
             t,
             txns: Mutex::default(),
             idle: Condvar::new(),
+            projection: Mutex::default(),
         })
     }
 
@@ -393,6 +400,15 @@ impl Graph {
         self.idle.notify_all();
         drop(a);
         grown
+    }
+
+    /// The cached projection, whatever view it projects.
+    #[must_use]
+    pub fn cached_projection(&self) -> Option<Arc<Projection>> {
+        self.projection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Starts a read transaction: a consistent snapshot that never blocks writers.
@@ -553,6 +569,29 @@ impl<'a> Txn<'a> {
                 .ok_or(GraphError::Corrupt("log id overflow")),
             None => Ok(1),
         }
+    }
+
+    /// A read-optimised [`Projection`] of this txn's view, built now unless the graph
+    /// has one cached for exactly this view. [`query`](Self::query) calls on this view
+    /// use it until the next commit. Costs one sequential scan of the log and
+    /// [`Projection::bytes`] of RAM.
+    ///
+    /// # Errors
+    /// Fails on storage errors.
+    pub fn projection(&self) -> Result<Arc<Projection>> {
+        let end = self.next_id()?;
+        if let Some(s) = self.g.cached_projection()
+            && s.end() == end
+        {
+            return Ok(s);
+        }
+        let s = Arc::new(Projection::build(self)?);
+        *self
+            .g
+            .projection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&s));
+        Ok(s)
     }
 
     /// Normalizes a view bound: `None`, or one that covers the whole log, means "now".
@@ -1460,6 +1499,7 @@ impl<'a> Txn<'a> {
                 )?;
             }
         }
+        let g = self.g;
         let Txn {
             inner,
             state,
@@ -1469,7 +1509,12 @@ impl<'a> Txn<'a> {
         } = self;
         match inner {
             Inner::Ro(t) => t.commit()?,
-            Inner::Rw(t) => t.commit()?,
+            Inner::Rw(t) => {
+                t.commit()?;
+                if parent.is_none() {
+                    *g.projection.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                }
+            }
         }
         drop(ticket);
         if let Some(p) = parent {

@@ -1,6 +1,7 @@
 //! Conformance tests ported from upstream `test.py`, plus regressions for upstream bugs.
 
 use super::*;
+use std::sync::Mutex;
 
 fn graph() -> (tempfile::TempDir, Graph) {
     let dir = tempfile::tempdir().unwrap();
@@ -621,6 +622,116 @@ fn query_values_and_types() {
 }
 
 #[test]
+fn projection_answers_like_lmdb() {
+    // Every query shape the executor has, with and without a projection, on a graph
+    // with deletions, a superseded property, a self-loop, edge properties, and a
+    // property on a property.
+    let (_d, g) = graph();
+    let mut t = g.write().unwrap();
+    let mut ids = Vec::new();
+    for x in 0..40_u64 {
+        let id = t
+            .node(format!("t{}", x % 3).as_bytes(), x.to_string().as_bytes())
+            .unwrap()
+            .id;
+        t.set_value(id, &format!("p{}", x % 2), &json!(format!("v{}", x % 4)))
+            .unwrap();
+        t.set_value(id, "n", &json!(x)).unwrap();
+        ids.push(id);
+    }
+    for x in 0..40_u64 {
+        let y = (x * 7 + 3) % 40;
+        let at = |i: u64| ids[usize::try_from(i).unwrap()];
+        let e = t
+            .edge(at(x), at(y), format!("e{}", y % 3).as_bytes(), b"")
+            .unwrap();
+        t.set_value(e.id, "w", &json!(x % 5)).unwrap();
+    }
+    let lp = t.edge(ids[5], ids[5], b"loop", b"").unwrap();
+    t.set_value(lp.id, "w", &json!(9)).unwrap();
+    t.set_value(ids[1], "p1", &json!("v0")).unwrap(); // supersedes
+    let p = t.set(ids[2], b"o", b"\xc0").unwrap();
+    t.set_value(p.id, "k", &json!("deep")).unwrap();
+    t.delete(ids[7]).unwrap(); // takes its edges and props
+    t.unset(ids[8], b"n").unwrap();
+    t.commit().unwrap();
+
+    let patterns = [
+        "n()",
+        "e()",
+        "n(type='t1')",
+        "n(type='t2', value='8')",
+        "n(p1='v0')",
+        "n(p0=['v2','v3'])",
+        "n(n>=30)",
+        "n(n!=1)",
+        "n(ID=[3,5,7,9])",
+        "e(type='e2')",
+        "e(w=4)",
+        "e(src.type='t0')",
+        "n(type='t1')->e()->n()",
+        "n(type='t1')<-e()<-n()",
+        "n(type='t0')-e(type=['e1','loop'])-n()",
+        "n(value='5')-n()",
+        "n(type='t1')-n()-n()",
+        "n(edge_count>=3)",
+        "n(neighbor_count=1)",
+        "n(outbound_count=1)->e()->n(inbound_count>1)",
+    ];
+    let t = g.read().unwrap();
+    let plain: Vec<_> = patterns.iter().map(|p| q(&t, p, None)).collect();
+    assert!(g.cached_projection().is_none());
+    let proj = t.projection().unwrap();
+    assert_eq!(proj.end(), t.next_id().unwrap());
+    assert!(proj.bytes() > 0);
+    for (p, want) in patterns.iter().zip(&plain) {
+        assert_eq!(&q(&t, p, None), want, "{p}");
+        assert!(
+            !want.is_empty() || p.contains("ID=") || p.contains("neighbor_count=1"),
+            "{p} tests nothing"
+        );
+    }
+    // The parallel runner yields the same chains, in some order.
+    for (p, want) in patterns.iter().zip(&plain) {
+        let pat = Pattern::parse(p).unwrap();
+        // Sinks run on other threads, which cannot use this thread's txn: label afterwards.
+        let got = Mutex::new(Vec::new());
+        proj.query_par(&g, &[pat], 3, |_, _, c| {
+            got.lock().unwrap().push(c.to_vec());
+            true
+        })
+        .unwrap();
+        let mut got: Vec<String> = got
+            .into_inner()
+            .unwrap()
+            .iter()
+            .map(|c| c.iter().map(|e| label(&t, e)).collect::<Vec<_>>().join(" "))
+            .collect();
+        got.sort();
+        assert_eq!(&got, want, "{p} in parallel");
+    }
+    // Stopping from one thread stops the rest.
+    let seen = std::sync::atomic::AtomicUsize::new(0);
+    proj.query_par(&g, &[Pattern::parse("n()").unwrap()], 3, |_, _, _| {
+        seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2
+    })
+    .unwrap();
+    assert!(seen.into_inner() < 39);
+    // A historical view never uses the projection: fewer nodes existed at log position 20.
+    assert!(q(&t, "n(type='t1')", Some(20)).len() < plain[2].len());
+    drop(t);
+    // Any commit drops it; the next query goes back to LMDB and sees the change.
+    let mut w = g.write().unwrap();
+    w.delete(ids[0]).unwrap();
+    w.commit().unwrap();
+    assert!(g.cached_projection().is_none());
+    let t = g.read().unwrap();
+    assert_eq!(q(&t, "n(value='0')", None), Vec::<String>::new());
+    assert_eq!(t.projection().unwrap().end(), t.next_id().unwrap());
+    assert_eq!(q(&t, "n(value='0')", None), Vec::<String>::new());
+}
+
+#[test]
 fn query_string_equality_by_id() {
     // `=`/`!=` against string literals compares interned IDs: same answers as resolving.
     let (_d, g) = graph();
@@ -709,7 +820,7 @@ fn query_list_valued_natives() {
     assert_eq!(q(&t, "n(outbound_count=0)", None), Vec::<String>::new());
     let ids = |key: &str, n: LogId| {
         let e = t.entry(n).unwrap().unwrap();
-        t.resolve(&e, &[key.to_owned()], None, &query::Keys::default())
+        t.resolve(&e, &[key.to_owned()], None, &query::Keys::default(), None)
             .unwrap()
             .unwrap()
     };
