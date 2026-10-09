@@ -833,7 +833,7 @@ impl<'r> Ctx<'r> {
             if crawl {
                 let mut found = Vec::new();
                 t.query(&patterns, view, |_, c| {
-                    found.push(c);
+                    found.push(c.to_vec());
                     limit == 0 || found.len() < limit
                 })?;
                 let (nodes, edges) = spider(t, found.into_iter(), view)?;
@@ -1103,7 +1103,7 @@ fn stream_chains(
     out: &mut Streamer<'_, '_>,
     limit: usize,
     row: impl Fn(usize, Vec<Value>) -> Res<Value>,
-    run: impl FnOnce(&mut dyn FnMut(usize, Option<LogId>, Vec<Entry>) -> bool) -> Result<(), GraphError>,
+    run: impl FnOnce(&mut dyn FnMut(usize, Option<LogId>, &[Entry]) -> bool) -> Result<(), GraphError>,
 ) -> Res<()> {
     debug_assert!(!patterns.is_empty(), "callers handle the no-query case");
     let (mut n, mut failed) = (0, None);

@@ -44,6 +44,11 @@ fn timed(name: &str, f: impl FnOnce() -> Result<u64>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+#[repr(align(128))]
+struct Padded(std::sync::atomic::AtomicU64);
+
+#[expect(clippy::print_stdout, reason = "benchmark report")]
 fn main() -> Result<()> {
     let n: u64 = std::env::args()
         .skip(1)
@@ -82,28 +87,73 @@ fn main() -> Result<()> {
     t.commit()?;
 
     let t = g.read()?;
+    bench(&t, n)?;
+    let built = Instant::now();
+    let proj = t.projection()?;
+    println!(
+        "projection build {:>8.3}s  {} MiB",
+        built.elapsed().as_secs_f64(),
+        proj.bytes() >> 20
+    );
+    println!("-- with projection");
+    bench(&t, n)?;
+    let threads = std::thread::available_parallelism().map_or(1, usize::from);
+    println!("-- with projection, {threads} threads");
+    let patterns = [
+        "n(type=\"node3\")",
+        "n(prop2=\"value2\")",
+        "e(type=\"edge3\")",
+        "n(type=\"node1\")->e()->n()",
+        "n(type=\"node1\")-n()-n()",
+        "n(type=\"node1\")-e(type=\"edge2\")-n()",
+    ];
+    for src in patterns {
+        let p = Pattern::parse(src).map_err(|e| GraphError::Value(e.to_string()))?;
+        timed(src, || {
+            // One counter per thread, a cache line apart, so counting is not the bottleneck.
+            let counts: Vec<Padded> = (0..threads).map(|_| Padded::default()).collect();
+            proj.query_par(&g, &[p], threads, |k, _, _| {
+                if let Some(c) = counts.get(k) {
+                    c.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                true
+            })?;
+            Ok(counts
+                .iter()
+                .map(|c| c.0.load(std::sync::atomic::Ordering::Relaxed))
+                .sum())
+        })?;
+    }
+    Ok(())
+}
+
+/// Runs the query set in `t`, which picks up a cached projection of its view.
+///
+/// # Errors
+/// Fails on storage errors.
+fn bench(t: &Txn<'_>, n: u64) -> Result<()> {
     let points: Vec<String> = (0..10_000_u64)
         .map(|i| (i * 104_729) % n)
         .map(|k| format!("n(type=\"node{}\", value=\"{k}\")", k % 5))
         .collect();
-    timed("10k point lookups", || run(&t, &points))?;
+    timed("10k point lookups", || run(t, &points))?;
     timed("n(type=\"node3\")", || {
-        run(&t, &["n(type=\"node3\")".to_owned()])
+        run(t, &["n(type=\"node3\")".to_owned()])
     })?;
     timed("n(prop2=\"value2\")", || {
-        run(&t, &["n(prop2=\"value2\")".to_owned()])
+        run(t, &["n(prop2=\"value2\")".to_owned()])
     })?;
     timed("e(type=\"edge3\")", || {
-        run(&t, &["e(type=\"edge3\")".to_owned()])
+        run(t, &["e(type=\"edge3\")".to_owned()])
     })?;
     timed("n(type=\"node1\")->e()->n()", || {
-        run(&t, &["n(type=\"node1\")->e()->n()".to_owned()])
+        run(t, &["n(type=\"node1\")->e()->n()".to_owned()])
     })?;
     timed("n(type=\"node1\")-n()-n()", || {
-        run(&t, &["n(type=\"node1\")-n()-n()".to_owned()])
+        run(t, &["n(type=\"node1\")-n()-n()".to_owned()])
     })?;
     let pushdown = "n(type=\"node1\")-e(type=\"edge2\")-n()".to_owned();
-    timed(&pushdown.clone(), || run(&t, &[pushdown]))?;
+    timed(&pushdown.clone(), || run(t, &[pushdown]))?;
     timed("counts at mid", || {
         t.counts(Some(n / 2)).map(|(nodes, _)| nodes)
     })?;
