@@ -18,7 +18,7 @@ struct Got {
 
 fn server() -> T {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path().join("graphs"), 256).unwrap();
+    let store = Store::open(dir.path().join("graphs"), 256, usize::MAX).unwrap();
     T { _dir: dir, store }
 }
 
@@ -508,13 +508,13 @@ fn reopen_reindexes() {
     let u = {
         let s = T {
             _dir: tempfile::tempdir().unwrap(),
-            store: Store::open(&path, 256).unwrap(),
+            store: Store::open(&path, 256, usize::MAX).unwrap(),
         };
         s.create(json!({"meta": {"name": "kept"}}))
     };
     let s = T {
         _dir: dir,
-        store: Store::open(&path, 256).unwrap(),
+        store: Store::open(&path, 256, usize::MAX).unwrap(),
     };
     assert_eq!(
         s.get(&format!("/graph/{u}/status")).body["meta"]["name"],

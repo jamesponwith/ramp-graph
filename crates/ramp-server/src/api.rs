@@ -868,6 +868,9 @@ impl<'r> Ctx<'r> {
             let proj = (start.is_none() && view.is_none() && patterns.iter().any(Pattern::scans))
                 .then(|| t.projection())
                 .transpose()?;
+            if proj.is_some() {
+                self.store.fit_projections(uuid)?;
+            }
             stream_chains(
                 t,
                 proj.as_deref(),

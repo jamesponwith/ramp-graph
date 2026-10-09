@@ -402,6 +402,14 @@ impl Graph {
         grown
     }
 
+    /// Forgets the cached projection; a query that wants one builds it again.
+    pub fn drop_projection(&self) {
+        *self
+            .projection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
     /// The cached projection, whatever view it projects.
     #[must_use]
     pub fn cached_projection(&self) -> Option<Arc<Projection>> {
