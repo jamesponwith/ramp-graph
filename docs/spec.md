@@ -269,8 +269,9 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
 
    | load, 1M nodes + 1M props + 1M edges | nodes | edges |
    |---|---|---|
-   | ramp-graph, one txn, per-object API | 828k/s | 343k/s |
-   | LadybugDB `COPY` from Parquet (bulk, 8 cores, needs a schema and a file) | 1.0M/s | 610k/s |
+   | ramp-graph, one txn, per-object API, 1 thread | **828k/s** | **343k/s** |
+   | LadybugDB `COPY` from Parquet, 1 thread (bulk; needs a schema and a file) | 737k/s | 330k/s |
+   | LadybugDB `COPY`, 8 threads | 1.0M/s | 610k/s |
    | LadybugDB `CREATE`, 10k-row batches, one txn or auto-commit | 33k/s | 2.4k/s at 10k, 850/s at 20k, superlinear |
 
    File: ours 299 MiB, theirs 100 MiB (columnar compression).
@@ -285,7 +286,7 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
    | `n(type="node1")-e(type="edge2")-n()` | 0.482s | **0.104s** | 0.028s | 0.173s | 0.106s |
    | `n(type="node1")-n()-n()` | 2.04s (400k) | **0.46s** (400k) | 0.093s | 0.73s (800k) | 0.29s (800k) |
 
-   The projection (PR #13) takes 0.35 s to build and 232 MiB for this graph. Bold beats LadybugDB's single thread with ours. Reading: transactional per-object writes are ours by 25× (nodes) to 150–400× (edges), and its bulk loader is only 1.2–1.8× ahead of our transactional path. With the projection, every query beats LadybugDB's single thread except the 2-hop; thread for thread at 8, we win the type scan, the edge-type scan, the typed 2-hop, and the 3-node chain, tie the property scan, and trail the 2-hop by 20%. The 3-node chain is not like for like: Cypher and LGQL count different paths. Lookups issued one call at a time cost 120 µs each through its Python API.
+   The projection (PR #13) takes 0.35 s to build and 232 MiB for this graph. Bold beats LadybugDB's single thread with ours. Reading: transactional per-object writes are ours by 25× (nodes) to 150–400× (edges); thread for thread, our transactional path also beats its bulk loader, which only pulls ahead with 8 cores (`LB_THREADS` pins it). With the projection, every query beats LadybugDB's single thread except the 2-hop; thread for thread at 8, we win the type scan, the edge-type scan, the typed 2-hop, and the 3-node chain, tie the property scan, and trail the 2-hop by 20%. The 3-node chain is not like for like: Cypher and LGQL count different paths. Lookups issued one call at a time cost 120 µs each through its Python API.
 
    The 2-hop gap is structural: a chain materialises its far node, one cold row read (≈100 ns) per result on top of ≈150 ns of executor, while a Cypher `count(*)` over an unfiltered end need not touch that node. Carrying edge rows through expansion already removed the ID → row lookups.
 

@@ -6,6 +6,7 @@ by the unique value string, the one property per node as a column, one rel table
     .venv/bin/python -I -u scripts/bench-ladybugdb.py [N=1000000] [all|copy|create|query]
 
 `create` (per-object CREATE in one txn) scales superlinearly on edges; run it at <= 20000.
+LB_THREADS=1 pins COPY to one thread for a thread-for-thread load comparison.
 Results print counts next to timings so they can be checked against the Rust benches."""
 import os, shutil, sys, time, tempfile
 import pyarrow as pa, pyarrow.parquet as pq
@@ -57,6 +58,8 @@ def timed(label, f):
     print(f"{label:<42} {dt:8.3f}s  {r}", flush=True); return dt
 
 def load_copy(c, nodes, edges):
+    if os.environ.get("LB_THREADS"):
+        c.set_max_threads_for_exec(int(os.environ["LB_THREADS"]))
     pq.write_table(nodes, f"{WORK}/nodes.parquet"); pq.write_table(edges, f"{WORK}/edges.parquet")
     tn = timed("COPY nodes (+props as columns)", lambda: (c.execute(f"COPY N FROM '{WORK}/nodes.parquet'"), "")[1])
     te = timed("COPY edges", lambda: (c.execute(f"COPY E FROM '{WORK}/edges.parquet'"), "")[1])
