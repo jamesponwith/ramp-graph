@@ -370,7 +370,7 @@ fn growth_waits_for_readers_on_other_threads() {
         let reader = s.spawn(move || {
             let r = g.read().unwrap();
             tx.send(()).unwrap();
-            std::thread::park_timeout(std::time::Duration::from_millis(200));
+            std::thread::park_timeout(Duration::from_millis(200));
             r.counts(None).unwrap()
         });
         rx.recv().unwrap();
@@ -729,6 +729,55 @@ fn projection_answers_like_lmdb() {
     assert_eq!(q(&t, "n(value='0')", None), Vec::<String>::new());
     assert_eq!(t.projection().unwrap().end(), t.next_id().unwrap());
     assert_eq!(q(&t, "n(value='0')", None), Vec::<String>::new());
+}
+
+#[test]
+fn projection_rebuilds_within_a_duty_cycle() {
+    let now = Instant::now();
+    let cost = Duration::from_millis(100);
+    assert!(rebuild_due(None, now, 4), "never built");
+    assert!(!rebuild_due(Some((now, cost)), now, 4), "just built");
+    assert!(
+        !rebuild_due(Some((now, cost)), now + Duration::from_millis(399), 4),
+        "too soon"
+    );
+    assert!(rebuild_due(
+        Some((now, cost)),
+        now + Duration::from_millis(400),
+        4
+    ));
+    assert!(rebuild_due(Some((now, cost)), now, 0), "duty 0: always");
+
+    // End to end: a cached one is returned whatever the timing; after a commit, a
+    // rebuild is due only once the last build is old enough relative to its cost.
+    let (_d, g) = graph();
+    let mut t = g.write().unwrap();
+    t.node(b"t", b"a").unwrap();
+    t.commit().unwrap();
+    let t = g.read().unwrap();
+    let first = t.projection_if_due(4).unwrap().expect("never built: due");
+    assert!(Arc::ptr_eq(
+        &first,
+        &t.projection_if_due(4).unwrap().unwrap()
+    ));
+    drop(t);
+    let mut w = g.write().unwrap();
+    w.node(b"t", b"b").unwrap();
+    w.commit().unwrap();
+    // Pretend the last build was slow and recent: not due. Then old: due.
+    let t = g.read().unwrap();
+    *g.built.lock().unwrap() = Some((Instant::now(), Duration::from_secs(60)));
+    assert!(t.projection_if_due(4).unwrap().is_none());
+    *g.built.lock().unwrap() = Some((
+        Instant::now()
+            .checked_sub(Duration::from_secs(300))
+            .unwrap(),
+        Duration::from_secs(60),
+    ));
+    assert_eq!(
+        t.projection_if_due(4).unwrap().unwrap().end(),
+        t.next_id().unwrap()
+    );
 }
 
 #[test]

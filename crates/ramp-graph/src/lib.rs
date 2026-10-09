@@ -35,6 +35,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use heed::types::Bytes;
 use heed::{
@@ -287,6 +288,15 @@ pub struct Graph {
     /// The last [`Projection`] built; dropped by any commit, used by queries whose view
     /// is exactly the one it projects.
     projection: Mutex<Option<Arc<Projection>>>,
+    /// When the last projection build finished and how long it took, for
+    /// [`Txn::projection_if_due`].
+    built: Mutex<Option<(Instant, Duration)>>,
+}
+
+/// Whether a rebuild at `now` keeps builds to at most one per `duty + 1` build-times:
+/// the last build must have ended at least `duty` times its own cost ago.
+fn rebuild_due(last: Option<(Instant, Duration)>, now: Instant, duty: u32) -> bool {
+    last.is_none_or(|(at, cost)| now.saturating_duration_since(at) >= cost * duty)
 }
 
 /// See [`Graph::txns`] (upstream `db_t.txns` in `lib/db.c`).
@@ -349,6 +359,7 @@ impl Graph {
             txns: Mutex::default(),
             idle: Condvar::new(),
             projection: Mutex::default(),
+            built: Mutex::default(),
         })
     }
 
@@ -593,13 +604,37 @@ impl<'a> Txn<'a> {
         {
             return Ok(s);
         }
+        let started = Instant::now();
         let s = Arc::new(Projection::build(self)?);
         *self
             .g
             .projection
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&s));
+        *self.g.built.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((Instant::now(), started.elapsed()));
         Ok(s)
+    }
+
+    /// [`projection`](Self::projection), unless building one now would spend more than
+    /// one part in `duty + 1` of this graph's time on builds: then `None`, and the
+    /// caller reads LMDB. On a graph that is written and scanned constantly, this
+    /// caps rebuilding at that duty cycle instead of one rebuild per scan.
+    ///
+    /// # Errors
+    /// Fails on storage errors.
+    pub fn projection_if_due(&self, duty: u32) -> Result<Option<Arc<Projection>>> {
+        let end = self.next_id()?;
+        if let Some(s) = self.g.cached_projection()
+            && s.end() == end
+        {
+            return Ok(Some(s));
+        }
+        let last = *self.g.built.lock().unwrap_or_else(PoisonError::into_inner);
+        if !rebuild_due(last, Instant::now(), duty) {
+            return Ok(None);
+        }
+        self.projection().map(Some)
     }
 
     /// Normalizes a view bound: `None`, or one that covers the whole log, means "now".
