@@ -219,6 +219,7 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
    - Fifo fixes: indexes are read from storage on each push, so two handles never clobber each other; no broken rebase.
 3. ✅ LGQL parser + ad-hoc executor + streaming `mquery`. Edge-type pushdown and per-query key resolution done (PRs #4, #5); in-memory projection with parallel execution (PR #13).
 4. ✅ REST server (`ramp-server`): all upstream endpoints except exec/UI, collection index, permissions, depth/cost adapters.
+6. ✅ Steered expansion (`ramp-expand`, design and results in [`docs/expansion.md`](expansion.md)): budgeted expansion into a source too large to copy, with a `Policy` seam for a System 1 model, standing queries over each step's new log entries, and live-query probes on the projection. Benchmarked on five planted scenarios in a 2M-entity heavy-tailed world. Engine change it drove: patterns are filled towards the nearest selective slot first (any filter beyond a bare `type=`), so a standing query seeded on a new edge into a hub checks the selective end before walking the hub.
 5. ✅ Benchmark `crates/ramp-graph/benches/insert.rs` (`just bench`): a port of upstream `bench.py`.
 
    **Scorecard** (2026-10-09, i5-1135G7 laptop, 1M nodes + 1M properties + 1M edges unless noted; every number below is reproduced by a bench or script in this repo):

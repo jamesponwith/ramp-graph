@@ -824,6 +824,16 @@ impl Projection {
         self.base.prop(parent, key)
     }
 
+    /// Appends the live edges of `node` in direction `dir` to `out`, in the order
+    /// [`Txn::node_edges`] yields them.
+    ///
+    /// # Errors
+    /// Fails on a corrupt projection.
+    pub fn edges_of(&self, node: LogId, dir: Direction, out: &mut Vec<Entry>) -> Result<()> {
+        let mut rows = Vec::new();
+        self.node_edges(node, dir, None, out, &mut rows)
+    }
+
     /// Live properties of `parent` as `(key, value)` string IDs, in key-ID order (the
     /// order [`Txn::props`] yields them).
     #[must_use]
