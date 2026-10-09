@@ -93,7 +93,7 @@ fn main() -> Result<()> {
         .map_err(|e| ramp_graph::GraphError::Io(e.to_string()))?
         .len();
     println!(
-        "compacted  {} MiB in {:.2}s",
+        "snapshot   {} MiB in {:.2}s (packed)",
         compact >> 20,
         start.elapsed().as_secs_f64()
     );
