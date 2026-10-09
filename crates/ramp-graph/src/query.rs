@@ -37,7 +37,7 @@ pub(crate) struct Keys {
     /// Per key of a single-key `=`/`!=` test, the ID of each string literal: of its
     /// raw bytes for `type`/`value`, of its msgpack encoding for a property. `None`
     /// means no object holds that string.
-    lits: HashMap<String, HashMap<String, Option<StrId>>>,
+    literals: HashMap<String, HashMap<String, Option<StrId>>>,
 }
 
 impl Keys {
@@ -60,25 +60,26 @@ impl Keys {
                 continue;
             };
             let packed = !NATIVE_STR.contains(&key.as_str());
-            let lits = k.lits.entry(key.clone()).or_default();
+            let literals = k.literals.entry(key.clone()).or_default();
             for v in vals {
-                if !lits.contains_key(v) {
+                if !literals.contains_key(v) {
                     let id = if packed {
                         t.string_id(&value::encode(&Value::from(v))?)?
                     } else {
                         t.string_id(v.as_bytes())?
                     };
-                    lits.insert(v.to_owned(), id);
+                    literals.insert(v.to_owned(), id);
                 }
             }
         }
         Ok(k)
     }
 
-    /// Whether any of `key`'s literals `lits` is interned as `id`.
-    fn any_is(&self, key: &str, lits: &[&str], id: StrId) -> bool {
-        self.lits.get(key).is_some_and(|m| {
-            lits.iter()
+    /// Whether any of `key`'s literals `literals` is interned as `id`.
+    fn any_is(&self, key: &str, literals: &[&str], id: StrId) -> bool {
+        self.literals.get(key).is_some_and(|m| {
+            literals
+                .iter()
                 .any(|l| m.get(*l).copied().flatten() == Some(id))
         })
     }
@@ -462,7 +463,7 @@ impl Txn<'_> {
         view: Option<LogId>,
         keys: &Keys,
     ) -> Result<Option<bool>> {
-        let (Some(lits), [k]) = (eq_strings(f), f.path.as_slice()) else {
+        let (Some(literals), [k]) = (eq_strings(f), f.path.as_slice()) else {
             return Ok(None);
         };
         let negated = matches!(f.test, Test::NotIn(_));
@@ -483,13 +484,13 @@ impl Txn<'_> {
                         Some(Entry {
                             record: Record::Prop { val, .. },
                             ..
-                        }) => keys.any_is(k, &lits, val) != negated,
+                        }) => keys.any_is(k, &literals, val) != negated,
                         _ => false,
                     },
                 ));
             }
         };
-        Ok(Some(keys.any_is(k, &lits, id) != negated))
+        Ok(Some(keys.any_is(k, &literals, id) != negated))
     }
 
     /// The value at `path` on `e` in `view`, if any.
