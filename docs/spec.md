@@ -219,6 +219,26 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
 4. ✅ REST server (`ramp-server`): all upstream endpoints except exec/UI, collection index, permissions, depth/cost adapters.
 5. ✅ Benchmark `crates/ramp-graph/benches/insert.rs` (`just bench`): a port of upstream `bench.py`.
 
+   **Scorecard** (2026-10-09, i5-1135G7 laptop, 1M nodes + 1M properties + 1M edges unless noted; every number below is reproduced by a bench or script in this repo):
+
+   | metric | ramp-graph | best other measured here | standing |
+   |---|---|---|---|
+   | transactional inserts, 1 thread | 828k nodes/s, 984k props/s, 343k edges/s | upstream LemonGraph 150k / 375k / 110k; LadybugDB bulk `COPY` 737k / 330k edges on 1 thread | ahead |
+   | bulk edges, 1 thread | 520k/s (`edge_batch`) | LadybugDB `COPY` 610k/s on 8 threads | ahead per thread; behind its 8 cores |
+   | ad-hoc queries, 1 thread (projection) | scans 3 ms, 2-hop 20 ms, 3-node chain 0.27 s | LadybugDB 23 / 33 / 880 ms | ahead on every row |
+   | ad-hoc queries, 8 threads | scans 1 ms, 2-hop 5 ms, 3-node chain 47 ms | LadybugDB 6 / 10 / 410 ms | ahead on every row |
+   | point lookups, 10k | 48 ms (LMDB), 52 ms (projection) | LadybugDB 79 ms | ahead |
+   | streaming `mquery`, full 3M-entry log | 0.15–0.57 s single-slot, 2.2 s 2-hop | upstream: Python, per-entry | ahead |
+   | historical view query | 49 ms for 150k | n/a elsewhere | — |
+   | deletes with cascade | 150k nodes/s | n/a measured | — |
+   | REST point lookups | 25k req/s at 35 µs p50 (1 conn), 74k req/s (32) | FalkorDB/Memgraph/Neo4j: 55–580 ms median in published runs | ahead |
+   | REST large results | 200k objects in 80 ms, 600k in 370 ms | n/a measured | — |
+   | REST writes | 5k durable commits/s (1 writer), 200k nodes/s batched | FalkorDB 22.8k nodes/s batched (published) | ahead |
+   | projection | 0.34 s to build, 171 MiB | LadybugDB keeps its columns on disk | — |
+   | on-disk size | 299 MiB (compaction changes nothing: the file is dense) | LadybugDB 100 MiB | behind: a full log plus five indexes against compressed columns |
+
+   The one row behind by design is on-disk size: the log keeps every version for historical views, and five indexes keep every lookup a seek. Everything else is ahead of what was measured here, thread for thread.
+
    **Results.** ramp-graph measured 2026-10-08 at `902115a` (map growth, MDB_APPEND, per-txn string cache), i5-1135G7 laptop, idle (load avg 0.09). Upstream numbers are from 2026-10-07 on the same machine, built from the pinned rev on CPython 3.14 (no PyPy available). Three interleaved rounds, best of each (spread ≤3%):
 
    | phase | upstream | ramp-graph | speedup |
