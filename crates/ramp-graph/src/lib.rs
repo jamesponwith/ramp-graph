@@ -248,10 +248,46 @@ struct Tables {
     kv: Table,
 }
 
-/// Entries kept in a write txn's string cache before it is cleared.
-const STR_CACHE: usize = 1 << 12;
+/// Entries kept in a write txn's string cache before it is cleared (≈64 MiB at most,
+/// freed with the txn).
+const STR_CACHE: usize = 1 << 20;
 /// Node IDs kept in a write txn's liveness cache before it is cleared.
 const LIVE_CACHE: usize = 1 << 20;
+
+/// A write txn's strings by bytes, without an allocation per string.
+///
+/// Bytes live in one arena, and a map keyed by their FNV hash (computed anyway for the
+/// string index) points at them. A hash that collides with a different cached string is
+/// not cached.
+#[derive(Debug, Default)]
+struct StrCache {
+    by_hash: HashMap<u64, (usize, usize, StrId), BuildHasherDefault<IdHasher>>,
+    arena: Vec<u8>,
+}
+
+impl StrCache {
+    fn get(&self, bytes: &[u8]) -> Option<StrId> {
+        let &(at, len, id) = self.by_hash.get(&fnv64(bytes))?;
+        (self.arena.get(at..at + len) == Some(bytes)).then_some(id)
+    }
+
+    fn insert(&mut self, bytes: &[u8], id: StrId) {
+        // ponytail: flat cap, cleared when full; an LRU if a hot set outgrows it
+        if self.by_hash.len() >= STR_CACHE {
+            self.clear();
+        }
+        let at = self.arena.len();
+        if let std::collections::hash_map::Entry::Vacant(v) = self.by_hash.entry(fnv64(bytes)) {
+            self.arena.extend_from_slice(bytes);
+            v.insert((at, bytes.len(), id));
+        }
+    }
+
+    fn clear(&mut self) {
+        self.by_hash.clear();
+        self.arena.clear();
+    }
+}
 
 /// Fibonacci hashing for log IDs: one multiply, and sequential IDs spread evenly.
 /// `SipHash` cost more than the log read it replaced on a bulk load.
@@ -454,7 +490,7 @@ impl Graph {
             inner: Inner::Ro(self.env.read_txn()?),
             state: State::default(),
             parent: None,
-            strs: HashMap::new(),
+            strs: StrCache::default(),
             old_live: HashSet::default(),
             new_live: Vec::new(),
             _ticket: Some(ticket),
@@ -479,7 +515,7 @@ impl Graph {
             inner: Inner::Rw(self.env.write_txn()?),
             state: State::default(),
             parent: None,
-            strs: HashMap::new(),
+            strs: StrCache::default(),
             old_live: HashSet::default(),
             new_live: Vec::new(),
             _ticket: Some(ticket),
@@ -544,7 +580,7 @@ pub struct Txn<'a> {
     state: State,
     parent: Option<&'a mut State>,
     /// Strings this write txn has already found in the string table, by bytes.
-    strs: HashMap<Vec<u8>, StrId>,
+    strs: StrCache,
     /// Nodes this write txn has already seen live; `end` removes what it ends. Nodes
     /// it created itself (`id >= state.begin`) are bits of `new_live`, the rest are in
     /// `old_live`. In a read txn `begin` is 0 and only `old_live` is used.
@@ -1127,18 +1163,19 @@ impl<'a> Txn<'a> {
     /// # Errors
     /// Fails on storage errors or corrupt data.
     fn known(&mut self, bytes: &[u8]) -> Result<Option<StrId>> {
-        if let Some(&id) = self.strs.get(bytes) {
+        if let Some(id) = self.strs.get(bytes) {
             return Ok(Some(id));
         }
         let id = self.string_id(bytes)?;
         if let Some(id) = id {
-            // ponytail: flat cap, cleared when full; an LRU if a hot set outgrows it
-            if self.strs.len() >= STR_CACHE {
-                self.strs.clear();
-            }
-            self.strs.insert(bytes.to_vec(), id);
+            self.remember(bytes, id);
         }
         Ok(id)
+    }
+
+    /// Adds a string this txn has seen, on disk or just interned, to its cache.
+    fn remember(&mut self, bytes: &[u8], id: StrId) {
+        self.strs.insert(bytes, id);
     }
 
     /// Interns `bytes`, returning its ID.
@@ -1169,6 +1206,7 @@ impl<'a> Txn<'a> {
         let mut k = fnv64(bytes).to_be_bytes().to_vec();
         k.extend_from_slice(&id.to_be_bytes());
         t.scalar_idx.put(w, &k, &[])?;
+        self.remember(bytes, id);
         Ok(id)
     }
 
@@ -1176,6 +1214,34 @@ impl<'a> Txn<'a> {
     /// Fails on storage errors or corrupt data.
     fn put_idx(&mut self, table: Table, key: &[u64]) -> Result<()> {
         Ok(table.put(self.rw()?, &varint::pack(key), &[])?)
+    }
+
+    /// Writes index keys given in ascending order. Keys past the table's last key go in
+    /// with `MDB_APPEND`, which skips the B-tree search and fills pages completely; the
+    /// rest are ordinary inserts.
+    ///
+    /// # Errors
+    /// Fails on storage errors.
+    fn put_sorted<'k>(
+        &mut self,
+        table: Table,
+        keys: impl Iterator<Item = &'k [u64]>,
+    ) -> Result<()> {
+        let mut last = table.last(self.ro())?.map(|(k, _)| k.to_vec());
+        let w = self.rw()?;
+        for k in keys {
+            let packed = varint::pack(k);
+            if last
+                .as_ref()
+                .is_none_or(|l| packed.as_slice() > l.as_slice())
+            {
+                table.put_with_flags(w, PutFlags::APPEND, &packed, &[])?;
+                last = None; // every later key is larger still
+            } else {
+                table.put(w, &packed, &[])?;
+            }
+        }
+        Ok(())
     }
 
     /// Appends `record`, first ending `supersedes` (and its dependents) if non-zero.
@@ -1370,6 +1436,16 @@ impl<'a> Txn<'a> {
         order.sort_by_key(|&i| keys.get(i).copied());
         let mut out: Vec<Option<Entry>> = vec![None; specs.len()];
         let mut fresh: Vec<usize> = Vec::new();
+        // A batch whose smallest key sorts after everything in the edge index cannot
+        // name an existing edge: skip the lookups (a bulk load into a new graph).
+        let all_new = match (
+            order.first().and_then(|&i| keys.get(i)),
+            self.g.t.edge_idx.last(self.ro())?,
+        ) {
+            (_, None) => true,
+            (Some(&k), Some((last, _))) => varint::pack(&<[u64; 4]>::from(k)).as_slice() > last,
+            (None, Some(_)) => false,
+        };
         let mut run_start = 0;
         while run_start < order.len() {
             let first = *order.get(run_start).ok_or_else(bad)?;
@@ -1379,8 +1455,12 @@ impl<'a> Txn<'a> {
                     .get(run_start..)
                     .unwrap_or_default()
                     .partition_point(|&i| keys.get(i) == Some(&key));
-            let fields: [u64; 4] = key.into();
-            let found = self.lookup(self.g.t.edge_idx, &varint::pack(&fields), None)?;
+            let found = if all_new {
+                None
+            } else {
+                let fields: [u64; 4] = key.into();
+                self.lookup(self.g.t.edge_idx, &varint::pack(&fields), None)?
+            };
             match found {
                 Some(e) => {
                     for &i in order.get(run_start..run_end).unwrap_or_default() {
@@ -1416,17 +1496,11 @@ impl<'a> Txn<'a> {
         }
         let t = self.g.t;
         ek.sort_unstable();
-        for k in &ek {
-            self.put_idx(t.edge_idx, k)?;
-        }
+        self.put_sorted(t.edge_idx, ek.iter().map(|k| &k[..]))?;
         sk.sort_unstable();
-        for k in &sk {
-            self.put_idx(t.src_idx, k)?;
-        }
+        self.put_sorted(t.src_idx, sk.iter().map(|k| &k[..]))?;
         tk.sort_unstable();
-        for k in &tk {
-            self.put_idx(t.tgt_idx, k)?;
-        }
+        self.put_sorted(t.tgt_idx, tk.iter().map(|k| &k[..]))?;
         out.into_iter()
             .collect::<Option<Vec<_>>>()
             .ok_or(GraphError::Corrupt("edge batch left a spec unresolved"))
@@ -1605,7 +1679,7 @@ impl<'a> Txn<'a> {
             inner: Inner::Rw(g.env.nested_write_txn(parent)?),
             state: self.state,
             parent: Some(&mut self.state),
-            strs: HashMap::new(),
+            strs: StrCache::default(),
             old_live: HashSet::default(),
             new_live: Vec::new(),
             _ticket: None,
