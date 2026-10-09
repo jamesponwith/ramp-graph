@@ -826,6 +826,9 @@ fn projection_answers_like_lmdb() {
         "n(edge_count>=3)",
         "n(neighbor_count=1)",
         "n(outbound_count=1)->e()->n(inbound_count>1)",
+        // Seeded mid-chain (at the typed edge): the left hop must start from the edge.
+        "n()-e(type='e2')-n()",
+        "n()<-e(type=['e0','loop'])-n(type='t1')",
     ];
     let t = g.read().unwrap();
     let plain: Vec<_> = patterns.iter().map(|p| q(&t, p, None)).collect();
@@ -840,44 +843,249 @@ fn projection_answers_like_lmdb() {
             "{p} tests nothing"
         );
     }
-    // The parallel runner yields the same chains, in some order.
+    // The parallel runner yields the same chains, in some order. (Sinks run on other
+    // threads, which cannot use this thread's txn, so `q_par` labels afterwards.)
     for (p, want) in patterns.iter().zip(&plain) {
-        let pat = Pattern::parse(p).unwrap();
-        // Sinks run on other threads, which cannot use this thread's txn: label afterwards.
-        let got = Mutex::new(Vec::new());
-        proj.query_par(&g, &[pat], 3, |_, _, c| {
-            got.lock().unwrap().push(c.to_vec());
-            true
-        })
-        .unwrap();
-        let mut got: Vec<String> = got
-            .into_inner()
-            .unwrap()
-            .iter()
-            .map(|c| c.iter().map(|e| label(&t, e)).collect::<Vec<_>>().join(" "))
-            .collect();
-        got.sort();
-        assert_eq!(&got, want, "{p} in parallel");
+        assert_eq!(&q_par(&g, &proj, &t, p), want, "{p} in parallel");
     }
     // Stopping from one thread stops the rest.
     let seen = std::sync::atomic::AtomicUsize::new(0);
     proj.query_par(&g, &[Pattern::parse("n()").unwrap()], 3, |_, _, _| {
-        seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2
+        seen.fetch_add(1, Ordering::Relaxed) < 2
     })
     .unwrap();
     assert!(seen.into_inner() < 39);
     // A historical view never uses the projection: fewer nodes existed at log position 20.
     assert!(q(&t, "n(type='t1')", Some(20)).len() < plain[2].len());
     drop(t);
-    // Any commit drops it; the next query goes back to LMDB and sees the change.
+    // A commit leaves the cached projection behind; a query until it is advanced
+    // reads LMDB and sees the change, and advancing replays only the new entry.
     let mut w = g.write().unwrap();
     w.delete(ids[0]).unwrap();
     w.commit().unwrap();
-    assert!(g.cached_projection().is_none());
+    let stale = g.cached_projection().unwrap();
     let t = g.read().unwrap();
+    assert!(stale.end() < t.next_id().unwrap());
     assert_eq!(q(&t, "n(value='0')", None), Vec::<String>::new());
-    assert_eq!(t.projection().unwrap().end(), t.next_id().unwrap());
+    let advanced = t.projection().unwrap();
+    assert_eq!(advanced.end(), t.next_id().unwrap());
+    assert_eq!(advanced.delta_len(), 1);
     assert_eq!(q(&t, "n(value='0')", None), Vec::<String>::new());
+}
+
+/// Runs `src` on LMDB only, as sorted labels.
+fn q_lmdb(t: &Txn<'_>, src: &str) -> Vec<String> {
+    let p = Pattern::parse(src).unwrap();
+    let mut out = Vec::new();
+    t.query_with(None, &[p], None, |_, c| {
+        out.push(c.iter().map(|e| label(t, e)).collect::<Vec<_>>().join(" "));
+        true
+    })
+    .unwrap();
+    out.sort();
+    out
+}
+
+/// splitmix64 values in `0..n`.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: usize) -> usize {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        usize::try_from(z ^ (z >> 31)).unwrap() % n.max(1)
+    }
+
+    fn pick(&mut self, v: &[LogId]) -> LogId {
+        v[self.below(v.len())]
+    }
+}
+
+/// Live IDs of the random workload.
+#[derive(Default)]
+struct Live {
+    nodes: Vec<LogId>,
+    edges: Vec<LogId>,
+    next: u64,
+}
+
+/// One random write: a node, an edge (sometimes a self-loop), a property set,
+/// overwritten, nested, or removed, or a delete of an edge or a node.
+fn random_write(t: &mut Txn<'_>, rng: &mut Rng, live: &mut Live, round: usize) {
+    let alive = |t: &Txn<'_>, id: &LogId| t.entry(*id).unwrap().is_some_and(|e| e.next == 0);
+    live.nodes.retain(|id| alive(t, id));
+    live.edges.retain(|id| alive(t, id));
+    live.next += 1;
+    let val = live.next.to_string();
+    let have_nodes = live.nodes.len() > 5;
+    match rng.below(10) {
+        2 | 3 if have_nodes => {
+            let a = rng.pick(&live.nodes);
+            let b = if rng.below(5) == 0 {
+                a
+            } else {
+                rng.pick(&live.nodes)
+            };
+            let ty = if a == b {
+                "loop".to_owned()
+            } else {
+                format!("e{}", rng.below(3))
+            };
+            live.edges
+                .push(t.edge(a, b, ty.as_bytes(), val.as_bytes()).unwrap().id);
+        }
+        4 | 5 if have_nodes => {
+            let n = rng.pick(&live.nodes);
+            t.set_value(n, "p", &json!(format!("v{}", rng.below(4))))
+                .unwrap();
+            if rng.below(3) == 0 {
+                t.set_value(n, "q", &json!("x")).unwrap();
+            }
+            if rng.below(4) == 0 {
+                let p = t.prop(n, b"p", None).unwrap().unwrap().id;
+                t.set_value(p, "meta", &json!(round)).unwrap();
+            }
+        }
+        6 if !live.edges.is_empty() => {
+            let e = rng.pick(&live.edges);
+            let w = if rng.below(2) == 0 { "y" } else { "z" };
+            t.set_value(e, "w", &json!(w)).unwrap();
+        }
+        7 if have_nodes => {
+            let key: &[u8] = if rng.below(2) == 0 { b"p" } else { b"q" };
+            t.unset(rng.pick(&live.nodes), key).unwrap();
+        }
+        8 if !live.edges.is_empty() => {
+            t.delete(rng.pick(&live.edges)).unwrap();
+        }
+        9 if have_nodes => {
+            t.delete(rng.pick(&live.nodes)).unwrap();
+        }
+        _ => {
+            let ty = format!("t{}", rng.below(3));
+            live.nodes
+                .push(t.node(ty.as_bytes(), val.as_bytes()).unwrap().id);
+        }
+    }
+}
+
+/// Every entry, its properties, and every node's adjacency in each direction, as the
+/// projection answers and as LMDB does.
+fn check_entries(r: &Txn<'_>, proj: &Projection, round: usize) {
+    let (cn, ce) = r.counts(None).unwrap();
+    assert_eq!(
+        proj.len(),
+        usize::try_from(cn + ce).unwrap(),
+        "round {round}"
+    );
+    for id in 1..r.next_id().unwrap() {
+        let live = r.entry(id).unwrap().filter(|e| e.next == 0);
+        let object = live.filter(|e| matches!(e.record, Record::Node { .. } | Record::Edge { .. }));
+        assert_eq!(proj.entry(id), object, "round {round}: entry {id}");
+        if live.is_some_and(|e| !matches!(e.record, Record::Deletion { .. })) {
+            let want: Vec<(StrId, StrId)> = r
+                .props(id, None)
+                .unwrap()
+                .filter_map(|p| match p.unwrap().record {
+                    Record::Prop { key, val, .. } => Some((key, val)),
+                    Record::Node { .. } | Record::Edge { .. } | Record::Deletion { .. } => None,
+                })
+                .collect();
+            assert_eq!(proj.props_of(id), want, "round {round}: props of {id}");
+        }
+        if object.is_some_and(|e| matches!(e.record, Record::Node { .. })) {
+            for dir in [Direction::In, Direction::Out, Direction::Both] {
+                let (mut out, mut rows) = (Vec::new(), Vec::new());
+                proj.node_edges(id, dir, None, &mut out, &mut rows).unwrap();
+                let got: Vec<LogId> = out.iter().map(|e| e.id).collect();
+                assert_eq!(
+                    got,
+                    ids(r.node_edges(id, dir, None, None)),
+                    "round {round}: {dir:?} {id}"
+                );
+            }
+        }
+    }
+}
+
+/// `p` through `query_par`, as sorted labels.
+fn q_par(g: &Graph, proj: &Projection, r: &Txn<'_>, p: &str) -> Vec<String> {
+    let got = Mutex::new(Vec::new());
+    proj.query_par(g, &[Pattern::parse(p).unwrap()], 3, |_, _, c| {
+        got.lock().unwrap().push(c.to_vec());
+        true
+    })
+    .unwrap();
+    let mut got: Vec<String> = got
+        .into_inner()
+        .unwrap()
+        .iter()
+        .map(|c| c.iter().map(|e| label(r, e)).collect::<Vec<_>>().join(" "))
+        .collect();
+    got.sort();
+    got
+}
+
+#[test]
+fn projection_advances_like_lmdb() {
+    // A random workload; after every commit the advanced projection must answer
+    // exactly as LMDB: entries, adjacency order, properties, queries, parallel runs.
+    let (_d, g) = graph();
+    let mut rng = Rng(7);
+    let mut live = Live::default();
+    let mut t = g.write().unwrap();
+    for i in 0..30 {
+        random_write(&mut t, &mut rng, &mut live, i);
+    }
+    t.commit().unwrap();
+    g.read().unwrap().projection().unwrap(); // the base
+    let patterns = [
+        "n()",
+        "e()",
+        "n(type='t1')",
+        "e(type='e2')",
+        "n(p='v1')",
+        "n(p=['v0','v3'])",
+        "n(q='x')",
+        "e(w='y')",
+        "n(type='t0')->e()->n()",
+        "n(type='t2')<-e()<-n()",
+        "n()-e(type=['e0','loop'])-n()",
+        "n(edge_count>=2)",
+        "n(neighbor_count=1)",
+        "n(p='v2')-n()-n()",
+        "e(src.p='v1')",
+    ];
+    for round in 0..150 {
+        let mut t = g.write().unwrap();
+        for _ in 0..=rng.below(3) {
+            random_write(&mut t, &mut rng, &mut live, round);
+        }
+        // A projection taken inside a write txn must not reach the cache.
+        let before = g.cached_projection().map(|p| p.end());
+        t.projection().unwrap();
+        assert_eq!(g.cached_projection().map(|p| p.end()), before);
+        t.commit().unwrap();
+
+        let r = g.read().unwrap();
+        let proj = r.projection().unwrap();
+        assert_eq!(proj.end(), r.next_id().unwrap(), "round {round}");
+        check_entries(&r, &proj, round);
+        for p in patterns {
+            assert_eq!(q(&r, p, None), q_lmdb(&r, p), "round {round}: {p}");
+            if round % 25 == 0 {
+                assert_eq!(
+                    q_par(&g, &proj, &r, p),
+                    q_lmdb(&r, p),
+                    "round {round}: {p} ×3"
+                );
+            }
+        }
+    }
+    let last = g.cached_projection().unwrap();
+    assert!(last.delta_len() > 150, "advanced, never rebuilt");
 }
 
 #[test]
@@ -910,12 +1118,21 @@ fn projection_rebuilds_within_a_duty_cycle() {
         &t.projection_if_due(4).unwrap().unwrap()
     ));
     drop(t);
+    // An ordinary commit is advanced over whatever the timing.
     let mut w = g.write().unwrap();
     w.node(b"t", b"b").unwrap();
     w.commit().unwrap();
-    // Pretend the last build was slow and recent: not due. Then old: due.
-    let t = g.read().unwrap();
     *g.built.lock().unwrap() = Some((Instant::now(), Duration::from_secs(60)));
+    let t = g.read().unwrap();
+    assert_eq!(t.projection_if_due(4).unwrap().unwrap().delta_len(), 1);
+    drop(t);
+    // A reset forces a full build, which the duty cycle governs: a slow recent build
+    // defers it, an old one allows it.
+    let mut w = g.write().unwrap();
+    w.reset().unwrap();
+    w.node(b"t", b"c").unwrap();
+    w.commit().unwrap();
+    let t = g.read().unwrap();
     assert!(t.projection_if_due(4).unwrap().is_none());
     *g.built.lock().unwrap() = Some((
         Instant::now()
@@ -961,16 +1178,12 @@ fn projection_props_of_matches_props() {
                 Record::Node { .. } | Record::Edge { .. } | Record::Deletion { .. } => None,
             })
             .collect();
-        assert_eq!(
-            proj.props_of(parent).collect::<Vec<_>>(),
-            want,
-            "parent {parent}"
-        );
+        assert_eq!(proj.props_of(parent), want, "parent {parent}");
     }
-    assert_eq!(proj.props_of(na).count(), 4);
-    assert_eq!(proj.props_of(nested).count(), 2);
-    assert_eq!(proj.props_of(nb).count() + proj.props_of(nc).count(), 0);
-    assert_eq!(proj.props_of(999).count(), 0);
+    assert_eq!(proj.props_of(na).len(), 4);
+    assert_eq!(proj.props_of(nested).len(), 2);
+    assert_eq!(proj.props_of(nb).len() + proj.props_of(nc).len(), 0);
+    assert_eq!(proj.props_of(999).len(), 0);
 }
 
 #[test]
