@@ -377,14 +377,18 @@ impl Graph {
     /// Fails if LMDB is out of reader slots.
     pub fn read(&self) -> Result<Txn<'_>> {
         let ticket = self.ticket()?;
-        Ok(Txn {
+        let mut txn = Txn {
             g: self,
             inner: Inner::Ro(self.env.read_txn()?),
             state: State::default(),
             parent: None,
             strs: HashMap::new(),
             _ticket: Some(ticket),
-        })
+        };
+        // The snapshot is fixed, so the end of the log is too: look it up once, not
+        // on every view normalisation.
+        txn.state.next_log = txn.next_id()?;
+        Ok(txn)
     }
 
     /// Starts a write transaction. Blocks while another write transaction is open, and,
