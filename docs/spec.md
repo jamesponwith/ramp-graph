@@ -263,6 +263,33 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
 
    In-process, one 100-node batch costs ≈440 µs (parse 30, apply 290, adapters 45, commit 17), so a request adds ≈200 µs of transport. Commits are fsynced and that is not the bottleneck on NVMe: upstream's `-s`/`-m` nosync flags stay unported. A REST node costs ~3× a bench node because each request also merges properties (read, merge, encode, set) and runs the adapters.
 
+   **Against LadybugDB** (2026-10-08, same laptop, LadybugDB 0.15.3 via `real_ladybug`, the community fork of Kùzu; `scripts/bench-ladybugdb.py` mirrors both benches). It is the nearest embedded peer: single process, one file, Cypher. Its model is schema-first and columnar, ours is schemaless and log-based with history, so the comparison is of workloads, not of a like for like engine.
+
+   | load, 1M nodes + 1M props + 1M edges | nodes | edges |
+   |---|---|---|
+   | ramp-graph, one txn, per-object API | 828k/s | 343k/s |
+   | LadybugDB `COPY` from Parquet (bulk, 8 cores, needs a schema and a file) | 1.0M/s | 610k/s |
+   | LadybugDB `CREATE`, 10k-row batches, one txn or auto-commit | 33k/s | 2.4k/s at 10k, 850/s at 20k, superlinear |
+
+   File: ours 299 MiB, theirs 100 MiB (columnar compression).
+
+   | query (ours single-threaded) | ramp-graph | LadybugDB, 1 thread | 8 threads |
+   |---|---|---|---|
+   | 10k point lookups | 0.048s | 0.079s (one statement; 1.2s as 10k calls) | 0.045s |
+   | `n(type="node3")` | 0.067s | 0.023s | 0.005s |
+   | `n(prop2="value2")` | 0.654s | 0.006s | 0.002s |
+   | `e(type="edge3")` | 0.070s | 0.091s | 0.031s |
+   | `n(type="node1")->e()->n()` | 0.317s | 0.028s | 0.011s |
+   | `n(type="node1")-e(type="edge2")-n()` | 0.482s | 0.173s | 0.106s |
+   | `n(type="node1")-n()-n()` | 2.04s (400k) | 0.73s (800k) | 0.29s (800k) |
+
+   Reading: transactional per-object writes are ours by 25× (nodes) to 150–400× (edges), and its bulk loader is only 1.2–1.8× ahead of our transactional path. Point lookups and the edge-type scan tie on one thread. Column scans are theirs by 3× (type) to 100× (property), and traversals by 3–10×. The 3-node chain is not like for like: Cypher and LGQL count different paths. Lookups issued one call at a time cost 120 µs each through its Python API.
+
+   What that points at, in order:
+   1. The property scan: a secondary index keyed by property key and value would make `n(key=val)` a range read. A layout change; the props phase pays one more index write.
+   2. Type scans and traversals: each candidate costs a log read and a decode, and chain expansion allocates per hop. Reusing buffers and avoiding the decode when only the ID is needed.
+   3. Parallel scans: LadybugDB's 8-thread column gets a further 3–5×. Read txns are already independent, so a scan could be split by key range across threads.
+
    **Not yet measured:**
    - a CPU profile of any phase (no `perf` on the bench machine yet); the remaining per-insert suspects are the parent-liveness read in `set`, the double property lookup in `set_merged`, and the small per-op key allocations
    - REST reads with a client that is not GIL-bound
