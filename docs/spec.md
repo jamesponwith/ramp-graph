@@ -291,6 +291,19 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
 
    `mquery` walks the log with one cursor and skips entries that cannot change a match: a property whose key no filter names, an edge when no slot is an edge and no filter reads a node's edges, and endpoints when no slot is a node. Before those rules a full pass cost 2–4 s whatever the pattern. The 2-hop is inherent: every new edge starts a chain that must be expanded.
 
+   **Queries while the graph is written** (`crates/ramp-graph/benches/mixed.rs`, 2026-10-09): 1M-node graph, one writer committing 10 nodes (each with a property and an edge) at a fixed rate, one reader running the query in a loop and taking a projection the way the server does (`projection_if_due(4)`, else the LMDB path). 8 s per rate, laptop under load avg ≈1.5.
+
+   | query | commits/s | queries | p50 | p99 | projected |
+   |---|---|---|---|---|---|
+   | `n(type="node3")` | 0 | 1912 | 3.5 ms | 5.5 ms | 100% |
+   | | 1 | 139 | 63 ms | 412 ms | 42% |
+   | | 5 / 20 / 100 | ≈100 | 65 ms | 410–450 ms | 3–4% |
+   | `n(type="node1")->e()->n()` | 0 | 344 | 22 ms | 34 ms | 100% |
+   | | 1 | 37 | 24 ms | 743 ms | 70% |
+   | | 5 / 20 / 100 | 13–14 | 570–590 ms | 790–840 ms | 14–23% |
+
+   From one commit a second, a scan runs at LMDB speed (18× slower at p50) and the query that triggers a rebuild pays it (≈0.4 s, the p99); the 2-hop falls 26× and loses 96% of its throughput. Commits are unaffected (p99 ≤ 15 ms). This is the case for maintaining the projection across commits instead of dropping it.
+
    **REST** (2026-10-08, same machine, `ramp-server` release build, a stdlib Python client over keep-alive connections, so the read numbers are client-bound):
 
    | load | result |
@@ -352,7 +365,7 @@ trailer := (index | alias) '(' tests ')' {',' …}   merges tests into the refer
    The 2-hop was the last row to fall. A chain materialises its far node; copying each edge's two endpoints into its projection row (`End`) made that read warm, and precomputing the fill order and hop types per pattern, passing fully-kept chains to the sink uncopied, and carrying edge rows through expansion took the executor from ≈250 ns to ≈125 ns per chain.
 
    What remains, in order:
-   1. Incremental maintenance of the projection after a commit, so a graph that is written and scanned constantly does not fall back to LMDB between duty-cycled rebuilds (see REST).
+   1. Incremental maintenance of the projection after a commit, so a graph that is written and scanned constantly does not fall back to LMDB between duty-cycled rebuilds. Sized by the mixed benchmark: from one commit a second, scans run 18× and 2-hops 26× slower at p50.
    2. A property index on disk, for `n(key=val)` without a projection.
 
    **Not yet measured:**
