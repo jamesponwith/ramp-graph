@@ -592,3 +592,132 @@ fn dates() {
     assert_eq!(civil(19_782), (2024, 2, 29));
     assert_eq!(unescape("a%20b+c%2"), "a b c%2");
 }
+
+/// A client-side policy, as a model behind its own API would answer: cheapest route
+/// first, a page of every relation the task cares about.
+fn decide(task: &Value, ask: &Value) -> Value {
+    let interest = task["relation_interest"].as_array().unwrap();
+    let decisions: Vec<Value> = ask["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            let route = c["cost"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_f64)
+                .fold(f64::INFINITY, f64::min);
+            let take: Vec<Value> = (0..interest.len())
+                .filter(|&r| interest[r].as_f64().unwrap() > 0.0)
+                .filter(|&r| c["peek"][r].as_u64() > c["fetched"][r].as_u64())
+                .map(|r| json!({"rel": r, "limit": 200}))
+                .collect();
+            json!({"priority": -route, "take": take})
+        })
+        .collect();
+    json!({"seq": ask["seq"], "decisions": decisions})
+}
+
+#[test]
+fn a_client_steers_an_expansion() {
+    let t = server();
+    let r = t.post(
+        "/expand",
+        json!({"scenario": "alert", "entities": 20_000, "seed": 1, "budget": 50_000}),
+    );
+    assert_eq!(r.status, 201, "{}", r.body);
+    let (id, graph, task) = (
+        r.body["id"].as_str().unwrap().to_owned(),
+        r.body["graph"].as_str().unwrap().to_owned(),
+        r.body["task"].clone(),
+    );
+    assert_eq!(task["goal"], "alert");
+    let mut asked = 0;
+    let report = loop {
+        let r = t.get(&format!("/expand/{id}?wait=10"));
+        assert_eq!(r.status, 200, "{}", r.body);
+        match r.body["state"].as_str().unwrap() {
+            "ask" => {
+                asked += 1;
+                if asked == 1 {
+                    // A stale or short answer is refused, and the batch stays open.
+                    let mut stale = decide(&task, &r.body);
+                    stale["seq"] = json!(0);
+                    assert_eq!(t.post(&format!("/expand/{id}"), stale).status, 409);
+                    let short = json!({"seq": r.body["seq"], "decisions": []});
+                    assert_eq!(t.post(&format!("/expand/{id}"), short).status, 400);
+                }
+                let a = t.post(&format!("/expand/{id}"), decide(&task, &r.body));
+                assert_eq!(a.status, 204, "{}", a.body);
+            }
+            "done" => break r.body["report"].clone(),
+            "running" => {}
+            other => panic!("state {other}"),
+        }
+    };
+    assert!(asked > 1);
+    assert!(report["steps"].as_u64().unwrap() > 0, "{report}");
+    assert!(
+        report["alert_at"].is_u64(),
+        "the standing query fired: {report}"
+    );
+
+    // The trace has a row per step, credited with the hit.
+    let raw = run(
+        &t.store,
+        &Req {
+            method: "GET".to_owned(),
+            path: format!("/expand/{id}/trace"),
+            query: String::new(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        },
+    );
+    assert_eq!(raw.status, 200);
+    let rows: Vec<Value> = raw
+        .body()
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_slice(l).unwrap())
+        .collect();
+    assert_eq!(
+        rows.len(),
+        usize::try_from(report["steps"].as_u64().unwrap()).unwrap()
+    );
+    assert!(rows.iter().any(|row| row["hits"].as_u64().unwrap() > 0));
+
+    // The graph is an ordinary one: the standing query runs over it.
+    let q = t.get(&format!(
+        "/graph/{graph}?q=n(type='person',watch='A')-n(type='account')-n(type='person',watch='B')"
+    ));
+    assert_eq!(q.status, 200, "{}", q.body);
+    assert!(q.body.as_array().unwrap().len() > 1, "{}", q.body);
+
+    assert_eq!(
+        t.call("DELETE", &format!("/expand/{id}"), None, &[]).status,
+        204
+    );
+    assert_eq!(t.get(&format!("/expand/{id}")).status, 404);
+}
+
+#[test]
+fn an_absent_client_stops_the_run() {
+    let t = server();
+    let r = t.post(
+        "/expand",
+        json!({"scenario": "path-5hop", "entities": 5_000, "timeout": 0}),
+    );
+    assert_eq!(r.status, 201, "{}", r.body);
+    let id = r.body["id"].as_str().unwrap();
+    let r = loop {
+        let r = t.get(&format!("/expand/{id}?wait=10"));
+        if r.body["state"] == "done" {
+            break r;
+        }
+    };
+    assert_eq!(r.body["report"]["cancelled"], true, "{}", r.body);
+    assert_eq!(r.body["report"]["fetched"], 0);
+    assert_eq!(t.post("/expand", json!({"scenario": "nope"})).status, 400);
+    assert_eq!(t.post("/expand", json!({"policy": "nope"})).status, 400);
+}

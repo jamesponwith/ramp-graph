@@ -188,10 +188,49 @@ source answers such semi-joins far cheaper than a scan. Path tasks name no targe
 they run as before. A reachability filter ("leads to seed B within k") is possible, but
 few sources could answer it.
 
+## Steering from outside: `/expand`
+
+Jev runs outside the process, so `ramp-server` exposes the `Policy` seam over HTTP. The
+client pulls work and needs no server of its own. The JSON is `ramp_expand::wire`.
+
+| request | does |
+|---|---|
+| `POST /expand` | starts a run: `{"scenario", "policy"?, "budget"?, "entities"?, "seed"?, "cap"?, "timeout"?}`. Returns `{"id", "graph", "task"}`: the task with domain and relation names, and a new graph of the collection the run writes into |
+| `GET /expand/<id>?wait=s` | long-polls (default 25 s): `{"state": "ask", "seq", "context", "candidates"}`, `{"state": "done", "report"}`, or `{"state": "running"}` |
+| `POST /expand/<id>` | `{"seq", "decisions": [{"priority", "take": [{"rel", "limit", "filter"?}]}]}`, one per candidate; 409 for a batch that is not open, 400 for the wrong count |
+| `GET /expand/<id>/trace` | the labelled decision trace, JSON lines, once done |
+| `DELETE /expand/<id>` | stops and forgets the run; its graph stays |
+
+- **`policy`** is `remote` by default: the client decides every batch, including the
+  re-decision after a probe. `guided`, `pushdown`, `bfs` and `rules` run in-process,
+  for baselines and for generating traces.
+- **A batch unanswered for `timeout` seconds (default 60) stops the run,** so a crashed
+  client does not hold a thread forever.
+- **The graph is ordinary.** While the run writes, the client can query it with LGQL,
+  run its own standing queries from a log position (`GET /graph/<uuid>?q=...&start=n`),
+  and probe what a candidate's neighbourhood looks like before deciding.
+- **The world is the synthetic one** with its planted scenarios. That is a gym: ground
+  truth is known, so traces are labelled. A real source behind the same endpoint is
+  what the "real dataset" item below needs.
+
+### The decision trace
+
+Every run records each step in `Report::trace`: the candidate as the policy saw it, the
+decision carried out, the budget spent before, and the edges the step added. A step's
+**hits** are how many of those edges ended up in a hit:
+- in a standing-query match, credited along the matched chain (consecutive matched
+  entities, the written edges between them);
+- or in ground truth the caller supplies (a scenario's planted signal).
+
+`wire::trace` writes it as JSON lines, one per step. The bench writes one file per
+scenario and policy with `RAMP_TRACE=dir`, and the server serves it per run. The label
+is direct: a step that fetched the way to a hit but not the hit itself gets none.
+Crediting the route as well is the first refinement once a model trains on it.
+
 ## Next
 
-1. **A learned policy.** Train Jev on logged expansions: the candidates, the decision,
-   and whether what was fetched ended up in a hit.
+1. **A learned policy.** Train Jev on the traces above.
 2. **Pipelined fetches.** Real sources have latency. Fetch the top-k candidates
    concurrently while writing and re-scoring the previous step.
-3. **Background projection rebuilds,** so a long expansion never pays one inline.
+3. **A real dataset,** to check that the cost model holds beyond the generator.
+4. **Background projection rebuilds,** so a long expansion never pays one inline.

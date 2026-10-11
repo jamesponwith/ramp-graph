@@ -234,3 +234,64 @@ fn pushdown_falls_back_without_source_support() {
     assert!(r.done_at.is_some(), "{r:?}");
     assert_eq!(r.filtered, 0);
 }
+
+#[test]
+fn trace_records_every_step_and_credits_hits() {
+    let (w, all) = world();
+    let s = scenario(&all, "alert");
+    let (r, _) = run(&w, s, Guided::default(), 100_000, Reads::Projection);
+    assert_eq!(r.trace.len(), usize::try_from(r.steps).unwrap());
+    let added: usize = r.trace.iter().map(|t| t.edges.len()).sum();
+    assert_eq!(u64::try_from(added).unwrap(), r.edges);
+    // The standing query fired, so some step's edges are credited with it, and the
+    // step that wrote the planted edge is credited by the truth too.
+    assert!(
+        !r.matched.is_empty(),
+        "alerts {} at {:?}",
+        r.alerts,
+        r.alert_at
+    );
+    let none = std::collections::HashSet::new();
+    assert!(r.trace.iter().any(|t| r.hits(t, &none) > 0));
+    let truth: std::collections::HashSet<_> = s
+        .signal
+        .iter()
+        .map(|&(a, b, rel)| (a.min(b), a.max(b), rel))
+        .collect();
+    let rows = wire::trace(&r, &truth);
+    let rows: Vec<serde_json::Value> = rows
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_slice(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), r.trace.len());
+    assert!(rows.iter().any(|row| row["hits"].as_u64().unwrap() > 0));
+}
+
+#[test]
+fn decisions_round_trip_through_json() {
+    let d = Decision {
+        priority: -1.5,
+        take: vec![
+            Take::all(2, 64),
+            Take {
+                rel: 3,
+                limit: 8,
+                filter: Some(Filter::Via {
+                    rel: 4,
+                    then: Box::new(Filter::Attr {
+                        key: "watch".to_owned(),
+                        value: "T".to_owned(),
+                    }),
+                }),
+            },
+        ],
+    };
+    let back = wire::parse_decision(&wire::decision(&d)).unwrap();
+    assert!((back.priority - d.priority).abs() < f64::EPSILON);
+    assert_eq!(back.take, d.take);
+    // A model may leave out what it does not want.
+    let skip = wire::parse_decision(&serde_json::json!({"priority": 0})).unwrap();
+    assert!(skip.take.is_empty());
+    wire::parse_decision(&serde_json::json!({"take": []})).unwrap_err();
+}

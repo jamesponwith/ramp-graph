@@ -540,6 +540,57 @@ impl<'r> Ctx<'r> {
             (["reset", u], _) if is_uuid(u) => Err(ApiError::not_allowed("PUT")),
             (["d3", u], "GET") if is_uuid(u) => self.d3(u),
             (["d3", u], _) if is_uuid(u) => Err(ApiError::not_allowed("GET")),
+            (["expand", rest @ ..], _) => self.expand(rest, m),
+            _ => Err(ApiError::new(
+                404,
+                format!("no handler for {}", self.req.path),
+            )),
+        }
+    }
+
+    /// `/expand/...`: runs a client steers (see `crate::expand`).
+    ///
+    /// # Errors
+    /// The HTTP error to send instead.
+    fn expand(&self, segs: &[&str], m: &str) -> Res<Reply> {
+        match (segs, m) {
+            ([], "POST") => {
+                let id = new_uuid();
+                let started =
+                    self.store
+                        .expansions
+                        .start(self.store, &id, &new_uuid(), &self.req.body)?;
+                let mut r = Reply::new(Out::One(started));
+                r.status = 201;
+                Ok(r.header("Location", format!("/expand/{id}")))
+            }
+            ([], _) => Err(ApiError::not_allowed("POST")),
+            ([id], "GET") if is_uuid(id) => {
+                let wait = self
+                    .param("wait")
+                    .map_or(Ok(25.0), str::parse::<f64>)
+                    .ok()
+                    .filter(|w| w.is_finite() && *w >= 0.0)
+                    .ok_or_else(|| ApiError::new(400, "Bad wait parameter"))?;
+                Ok(Reply::new(Out::One(self.store.expansions.poll(
+                    self.store,
+                    id,
+                    std::time::Duration::from_secs_f64(wait.min(60.0)),
+                )?)))
+            }
+            ([id], "POST") if is_uuid(id) => {
+                self.store.expansions.answer(id, &self.req.body)?;
+                Ok(Reply::new(Out::Empty))
+            }
+            ([id], "DELETE") if is_uuid(id) => {
+                self.store.expansions.stop(id)?;
+                Ok(Reply::new(Out::Empty))
+            }
+            ([id], _) if is_uuid(id) => Err(ApiError::not_allowed("GET, POST, DELETE")),
+            ([id, "trace"], "GET") if is_uuid(id) => Ok(Reply::new(Out::Raw(
+                self.store.expansions.trace(id)?,
+                "application/x-ndjson",
+            ))),
             _ => Err(ApiError::new(
                 404,
                 format!("no handler for {}", self.req.path),

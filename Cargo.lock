@@ -710,6 +710,7 @@ name = "ramp-expand"
 version = "0.1.0"
 dependencies = [
  "ramp-graph",
+ "serde_json",
  "tempfile",
 ]
 
@@ -731,6 +732,7 @@ name = "ramp-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "ramp-expand",
  "ramp-graph",
  "serde_json",
  "tempfile",

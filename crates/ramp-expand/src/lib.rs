@@ -32,9 +32,10 @@
 mod expand;
 pub mod policy;
 pub mod scenario;
+pub mod wire;
 pub mod world;
 
-pub use expand::{Expander, Reads, Report};
+pub use expand::{Expander, Reads, Report, Step};
 
 /// A world entity's ID in a [`Source`].
 pub type Id = u64;
@@ -69,7 +70,7 @@ pub enum Filter {
     /// The neighbour has property `key` equal to `value`.
     Attr {
         /// Property name.
-        key: &'static str,
+        key: String,
         /// Required value.
         value: String,
     },

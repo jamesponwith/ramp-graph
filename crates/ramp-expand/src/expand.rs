@@ -2,6 +2,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::hash::BuildHasher;
 use std::time::{Duration, Instant};
 
 use ramp_graph::lgql::Pattern;
@@ -63,6 +64,35 @@ pub struct Report {
     pub standing: Duration,
     /// Time in probes.
     pub probe: Duration,
+    /// Every expansion step, in order: the training data for a learned policy.
+    pub trace: Vec<Step>,
+    /// Edges, as `(min, max, rel)`, that are part of a standing-query match.
+    pub matched: HashSet<(Id, Id, Rel)>,
+}
+
+/// One expansion step: what the policy saw, what it chose, and what came of it.
+#[derive(Debug, Clone)]
+pub struct Step {
+    /// The expanded entity, as the policy saw it when choosing.
+    pub candidate: Candidate,
+    /// The decision that was carried out.
+    pub decision: Decision,
+    /// Edges fetched before this step.
+    pub before: u64,
+    /// Edges this step added to the graph, as `(min, max, rel)`.
+    pub edges: Vec<(Id, Id, Rel)>,
+}
+
+impl Report {
+    /// How many of `step`'s edges ended up in a hit: a standing-query match, or `truth`
+    /// (edges known to matter, such as a scenario's planted signal).
+    #[must_use]
+    pub fn hits<H: BuildHasher>(&self, step: &Step, truth: &HashSet<(Id, Id, Rel), H>) -> usize {
+        step.edges
+            .iter()
+            .filter(|e| self.matched.contains(e) || truth.contains(e))
+            .count()
+    }
 }
 
 /// What the expander knows about a discovered entity.
@@ -89,6 +119,25 @@ struct Known {
 impl Known {
     fn exhausted(&self) -> bool {
         self.peek.iter().zip(&self.fetched).all(|(p, f)| f >= p)
+    }
+
+    /// What the policy sees about it.
+    const fn candidate(&self, id: Id) -> Candidate {
+        Candidate {
+            id,
+            domain: self.dom,
+            peek: self.peek,
+            fetched: self.fetched,
+            hops: self.hops,
+            cost: self.cost,
+            known: self.degree,
+            known_by_domain: self.by_dom,
+            watched: self.watched,
+            is_watched: self.is_watched,
+            alerts: self.alerts,
+            probes: self.probes,
+            pushed: self.pushed,
+        }
     }
 }
 
@@ -332,22 +381,7 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
     }
 
     fn candidate(&self, id: Id) -> Option<Candidate> {
-        let k = self.known.get(&id)?;
-        Some(Candidate {
-            id,
-            domain: k.dom,
-            peek: k.peek,
-            fetched: k.fetched,
-            hops: k.hops,
-            cost: k.cost,
-            known: k.degree,
-            known_by_domain: k.by_dom,
-            watched: k.watched,
-            is_watched: k.is_watched,
-            alerts: k.alerts,
-            probes: k.probes,
-            pushed: k.pushed,
-        })
+        Some(self.known.get(&id)?.candidate(id))
     }
 
     /// Asks the policy about every entity in `ids` that still has edges to fetch.
@@ -482,6 +516,15 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
             return Ok(false);
         };
         let side = usize::from(me.hops[1] < me.hops[0]);
+        let mut trace = Step {
+            candidate: me.candidate(id),
+            decision: Decision {
+                priority: me.decision.priority,
+                take: take.clone(),
+            },
+            before: self.report.fetched,
+            edges: Vec::new(),
+        };
 
         // Fetch what the policy asked for, within the budget.
         let started = Instant::now();
@@ -538,7 +581,8 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
         self.ctx.steps += 1;
         self.report.steps += 1;
 
-        let changed = self.write(id, &me, &got)?;
+        let changed = self.write(id, &me, &got, &mut trace.edges)?;
+        self.report.trace.push(trace);
         let changed = self.watch(changed)?;
         if self.task.goal == Goal::Connect
             && self.report.connected_at.is_none()
@@ -556,7 +600,13 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
     ///
     /// # Errors
     /// Fails on storage errors.
-    fn write(&mut self, id: Id, me: &Known, got: &[(Id, Rel, f64)]) -> Result<Vec<Id>> {
+    fn write(
+        &mut self,
+        id: Id,
+        me: &Known,
+        got: &[(Id, Rel, f64)],
+        new: &mut Vec<(Id, Id, Rel)>,
+    ) -> Result<Vec<Id>> {
         let started = Instant::now();
         let mut t = self.graph.write()?;
         let first_new = t.next_id()?;
@@ -593,7 +643,9 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
             };
             if e.id >= first_new {
                 self.report.edges += 1;
-                self.written.insert((id.min(o), id.max(o), r));
+                let edge = (id.min(o), id.max(o), r);
+                self.written.insert(edge);
+                new.push(edge);
                 if let Some(k) = self.known.get_mut(&id) {
                     k.degree += 1;
                     if let Some(c) = k.by_dom.get_mut(usize::from(other.dom)) {
@@ -637,11 +689,13 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
         let started = Instant::now();
         let r = self.graph.read()?;
         let end = r.next_id()?;
-        let mut hits: Vec<LogId> = Vec::new();
+        // Each match's entities, in order, then `None`.
+        let mut hits: Vec<Option<LogId>> = Vec::new();
         let mut matches = 0_u64;
         r.mquery(&self.standing, self.queried, None, |_, _, chain| {
             matches += 1;
-            hits.extend(chain.iter().map(|e| e.id));
+            hits.extend(chain.iter().map(|e| Some(e.id)));
+            hits.push(None);
             matches < 1 << 14
         })?;
         drop(r);
@@ -652,7 +706,22 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
                 self.report.alert_at = Some(self.report.fetched);
             }
         }
-        for log in hits {
+        // The edges a match runs along: those written between consecutive entities.
+        let ids: Vec<Option<Id>> = hits
+            .iter()
+            .map(|h| h.and_then(|log| self.by_log.get(&log).copied()))
+            .collect();
+        for pair in ids.windows(2) {
+            if let [Some(a), Some(b)] = *pair {
+                for r in (0..MAX_REL).filter_map(|r| Rel::try_from(r).ok()) {
+                    let edge = (a.min(b), a.max(b), r);
+                    if self.written.contains(&edge) {
+                        self.report.matched.insert(edge);
+                    }
+                }
+            }
+        }
+        for log in hits.into_iter().flatten() {
             if let Some(&id) = self.by_log.get(&log) {
                 if let Some(k) = self.known.get_mut(&id) {
                     k.alerts += 1;

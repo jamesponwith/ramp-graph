@@ -2,6 +2,7 @@
 //! over upstream `LemonGraph`'s REST API.
 
 mod api;
+mod expand;
 mod input;
 mod store;
 
