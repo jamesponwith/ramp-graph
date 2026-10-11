@@ -196,7 +196,7 @@ fn pivot(world: &mut Builder, hubs: Hubs) -> Scenario {
         dom::PERSON,
     ]];
     task.target = Some(Filter::Attr {
-        key: "watch",
+        key: "watch".to_owned(),
         value: "T".to_owned(),
     });
     Scenario {
@@ -242,7 +242,7 @@ fn alert(world: &mut Builder, hubs: Hubs) -> Scenario {
     ];
     task.shape = vec![vec![dom::PERSON, dom::ACCOUNT, dom::PERSON]];
     task.target = Some(Filter::Attr {
-        key: "watch",
+        key: "watch".to_owned(),
         value: "B".to_owned(),
     });
     Scenario {

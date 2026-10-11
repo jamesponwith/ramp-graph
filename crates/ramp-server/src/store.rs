@@ -9,6 +9,7 @@ use ramp_graph::Graph;
 use serde_json::{Map, Value};
 
 use crate::api::ApiError;
+use crate::expand::Sessions;
 use crate::input::props_dict;
 
 /// What a listing or `/status` shows, plus what permission checks read.
@@ -39,6 +40,9 @@ pub(crate) struct Store {
     index: RwLock<BTreeMap<String, Status>>,
     /// Bytes of projections kept across all open graphs.
     projection_budget: usize,
+    /// Running and finished `/expand` runs.
+    // ponytail: finished runs stay until deleted; expire them if clients forget to.
+    pub(crate) expansions: Sessions,
 }
 
 /// Open graphs, closed least-recently-used first once there are more than `max`.
@@ -114,6 +118,7 @@ impl Store {
             }),
             index: RwLock::default(),
             projection_budget,
+            expansions: Sessions::default(),
         };
         let names: Vec<String> = std::fs::read_dir(&store.dir)
             .map_err(ApiError::io)?
