@@ -188,6 +188,61 @@ source answers such semi-joins far cheaper than a scan. Path tasks name no targe
 they run as before. A reachability filter ("leads to seed B within k") is possible, but
 few sources could answer it.
 
+## On a real graph: ICIJ Offshore Leaks
+
+`Guided` was built against our own generator, so the scenarios above share its
+assumptions. `benches/icij.rs` loads the ICIJ Offshore Leaks database: officers,
+entities, intermediaries, addresses and others, 2.0M nodes and 2.9M distinct edges. Its
+13 relationship types are grouped into six relations: `officer_of`, `intermediary_of`,
+`registered_address`, `same_as`, `similar` and `connected_to`. Its hubs are real: an
+address with 37k links, an officer with 36k, intermediaries with 35k and 15k.
+`Builder::empty` and `Builder::entity` load any graph into a `World` the same way.
+
+Nothing is planted, so the bench samples tasks from the data (seeded, 50 per kind,
+budget 200k):
+- **connect:** two officers 4–6 hops apart. A run stops when they are joined. Besides
+  the edges fetched, it scores the joining path: its cost (`ln(1 + degree)` summed over
+  the entities it crosses) against the cheapest path in the whole graph, and the widest
+  hub it crosses.
+- **alert:** from an officer with at least 50 co-officers, a co-officer from the
+  country rarest among them, as a standing query
+  (`n(officer, value=seed)-n(entity)-n(officer, country=X)`). The shape is
+  officer → entity → officer, and the target is `country = X`.
+
+`cargo bench -p ramp-expand --bench icij -- DIR 50`:
+
+| connect | solved | fetched (median) | p90 | joined by the cheapest path |
+|---|---|---|---|---|
+| bfs(depth=3) | 50/50 | 548 | 8,329 | 36/50 |
+| rules cap 100 | 22/50 | — | — | 21/22 |
+| rules cap 1k | 40/50 | 479 | — | 32/40 |
+| rules cap 10k | 47/50 | 548 | 8,329 | 35/47 |
+| **guided** | **50/50** | **101** | **2,196** | **46/50** |
+
+| alert | solved | fetched (median) | p90 |
+|---|---|---|---|
+| bfs(depth=2) | 50/50 | 115 | 470 |
+| rules cap 100 / 1k / 10k | 30 / 47 / 50 of 50 | 124 / 115 / 115 | — / 470 / 470 |
+| guided | 50/50 | 120 | 450 |
+| **guided+pushdown** | **50/50** | **4** | **4** |
+
+What holds and what does not:
+- **The cost model holds.** On connect tasks `Guided` is the only policy that solves
+  every task, with 5.4× fewer edges than BFS at the median and 3.8× fewer at p90. It
+  also finds the cheapest path more often (46/50 against 36/50). Degree caps fail
+  between a fifth and more than half of the tasks: real paths do run through hubs (the
+  cheapest path's widest hub has a median degree of 668).
+- **The synthetic world overstated BFS's failure.** Offshore officers mostly have a
+  handful of links, so BFS at depth 3 stays within budget here. Its cost shows in the
+  tail, not in failures.
+- **Without pushdown, alerts are a wash.** An officer's two-hop neighbourhood is small,
+  so nothing beats fetching it (115–120 edges). With the target pushed down, every alert
+  costs 4 edges.
+- **Widest hub is not what the cost model minimises.** A path through one wide hub can
+  beat one through several medium ones: `Guided`'s joining paths cross hubs as wide as
+  BFS's (median 651 against 668). Penalising the widest hub, not only the sum, is a knob
+  worth trying if analysts read paths that way.
+
 ## Concurrent fetches
 
 A real source answers in 50–200 ms, so a run that waits for each fetch before choosing
@@ -267,6 +322,5 @@ Crediting the route as well is the first refinement once a model trains on it.
 
 ## Next
 
-1. **A learned policy.** Train Jev on the traces above.
-2. **A real dataset,** to check that the cost model holds beyond the generator.
-3. **Background projection rebuilds,** so a long expansion never pays one inline.
+1. **A learned policy.** Train Jev on the traces above, from both worlds.
+2. **Background projection rebuilds,** so a long expansion never pays one inline.

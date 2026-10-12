@@ -1,6 +1,8 @@
-//! A synthetic multi-domain world to expand into.
+//! A world to expand into: synthetic ([`Builder::random`]) or loaded
+//! ([`Builder::empty`]).
 //!
-//! Seven domains joined by seven typed relations, with heavy-tailed degrees per domain:
+//! The synthetic one has seven domains joined by seven typed relations, with
+//! heavy-tailed degrees per domain:
 //! organisations and IP addresses have the heaviest tails (an employer of 100k people,
 //! a VPN exit shared by 100k accounts), the way real selectors do. The world is built
 //! once and held as CSR, grouped by relation per entity, so [`Source::peek`] is free
@@ -180,6 +182,8 @@ impl Range {
 /// Edges and planted structure, before the CSR is built.
 #[derive(Debug, Clone)]
 pub struct Builder {
+    names: &'static [&'static str],
+    relations: &'static [Relation],
     n: f64,
     domain: Vec<Dom>,
     ranges: Vec<Range>,
@@ -222,6 +226,8 @@ impl Builder {
             }
         }
         Self {
+            names: &DOMAINS,
+            relations: &RELATIONS,
             n: total,
             domain,
             ranges,
@@ -231,6 +237,31 @@ impl Builder {
             used: std::collections::HashSet::new(),
             rng,
         }
+    }
+
+    /// An empty world with its own domains and relations, for loading a real graph
+    /// with [`Builder::entity`] and [`Builder::link`].
+    #[must_use]
+    pub fn empty(domains: &'static [&'static str], relations: &'static [Relation]) -> Self {
+        Self {
+            names: domains,
+            relations,
+            n: 0.0,
+            domain: Vec::new(),
+            ranges: Vec::new(),
+            edges: Vec::new(),
+            planted: Vec::new(),
+            attrs: HashMap::new(),
+            used: std::collections::HashSet::new(),
+            rng: Rng::new(0),
+        }
+    }
+
+    /// A new entity of domain `d`.
+    pub fn entity(&mut self, d: Dom) -> Id {
+        let id = Id::try_from(self.domain.len()).unwrap_or(Id::MAX);
+        self.domain.push(d);
+        id
     }
 
     /// The heaviest entity of domain `d` (rank 0) or a lighter one.
@@ -360,6 +391,8 @@ impl Builder {
             }
         }
         World {
+            names: self.names,
+            relations: self.relations,
             domain: self.domain,
             counts,
             off,
@@ -375,6 +408,8 @@ impl Builder {
 /// The built world, a [`Source`].
 #[derive(Debug)]
 pub struct World {
+    names: &'static [&'static str],
+    relations: &'static [Relation],
     domain: Vec<Dom>,
     counts: Vec<Counts>,
     off: Vec<u32>,
@@ -473,11 +508,11 @@ impl World {
 
 impl Source for World {
     fn domains(&self) -> &[&'static str] {
-        &DOMAINS
+        self.names
     }
 
     fn relations(&self) -> &[Relation] {
-        &RELATIONS
+        self.relations
     }
 
     fn domain(&self, id: Id) -> Dom {

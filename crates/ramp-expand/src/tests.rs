@@ -342,3 +342,31 @@ fn concurrent_rounds_cut_round_trips_not_recall() {
     assert!(r.fetched <= 5_000, "{}", r.fetched);
     assert_eq!(r.fetched_by_domain.iter().sum::<u64>(), r.fetched);
 }
+
+#[test]
+fn a_loaded_world_serves_its_own_schema() {
+    const DOMAINS: [&str; 2] = ["officer", "entity"];
+    const RELATIONS: [Relation; 1] = [Relation {
+        name: "officer_of",
+        from: 0,
+        to: 1,
+    }];
+    let mut builder = Builder::empty(&DOMAINS, &RELATIONS);
+    let (officer, entity, other) = (builder.entity(0), builder.entity(1), builder.entity(0));
+    builder.link(officer, entity, 0);
+    builder.link(other, entity, 0);
+    builder.attr(other, "country", "PAN");
+    let w = builder.build();
+    assert_eq!(w.domains(), DOMAINS);
+    assert_eq!(w.relations().len(), 1);
+    assert_eq!((w.domain(officer), w.domain(entity)), (0, 1));
+    assert_eq!(w.peek(entity)[0], 2);
+    let mut out = Vec::new();
+    let filter = Filter::Attr {
+        key: "country".to_owned(),
+        value: "PAN".to_owned(),
+    };
+    w.fetch_where(entity, 0, &filter, u32::MAX, &mut out)
+        .unwrap();
+    assert_eq!(out, [other]);
+}

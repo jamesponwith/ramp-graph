@@ -344,6 +344,11 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
         self.written.contains(&(a.min(b), a.max(b), rel))
     }
 
+    /// Every edge written, as `(min, max, rel)`.
+    pub fn edges(&self) -> impl Iterator<Item = &(Id, Id, Rel)> {
+        self.written.iter()
+    }
+
     /// Whether `a` and `b` are joined in the graph.
     #[must_use]
     pub fn connected(&self, a: Id, b: Id) -> bool {
