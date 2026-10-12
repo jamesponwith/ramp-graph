@@ -28,6 +28,8 @@ pub enum Reads {
 pub struct Report {
     /// Expansion steps.
     pub steps: u64,
+    /// Rounds of concurrent fetches: the source round trips a run waits for.
+    pub rounds: u64,
     /// Edges fetched from the source.
     pub fetched: u64,
     /// Edges fetched, by the domain of the entity expanded: where the budget went.
@@ -144,6 +146,57 @@ impl Known {
 /// An entity to expand and what to take of it.
 type Next = (Id, Vec<Take>);
 
+/// What one expansion step's fetches returned.
+#[derive(Debug, Default)]
+struct Pulled {
+    /// Each neighbour with its relation and the cost of the hop to it.
+    got: Vec<(Id, Rel, f64)>,
+    /// The entity's edges per relation fetched, and filtered fetches made, after.
+    fetched: Counts,
+    pushed: [bool; MAX_REL],
+    calls: u64,
+    filtered: u64,
+}
+
+/// Fetches what `take` asks of `id` (`me`), each limit already within the budget.
+fn fetch<S: Source>(src: &S, id: Id, me: &Known, take: &[Take]) -> Pulled {
+    let mut out = Pulled {
+        fetched: me.fetched,
+        pushed: me.pushed,
+        ..Pulled::default()
+    };
+    let degree = f64::from(me.peek.iter().sum::<u32>()).ln_1p();
+    let mut buf = Vec::new();
+    for t in take {
+        let (Some(f), Some(p)) = (
+            out.fetched.get_mut(usize::from(t.rel)),
+            out.pushed.get_mut(usize::from(t.rel)),
+        ) else {
+            continue;
+        };
+        buf.clear();
+        out.calls += 1;
+        // A filtered fetch returns matches without paging the relation; a source that
+        // cannot filter is fetched from unfiltered instead.
+        let filtered = t
+            .filter
+            .as_ref()
+            .and_then(|filter| src.fetch_where(id, t.rel, filter, t.limit, &mut buf));
+        // Crossing a hub through a filter is as specific as what the filter returned.
+        let hop = if filtered.is_some() {
+            *p = true;
+            out.filtered += 1;
+            f64::from(u32::try_from(buf.len()).unwrap_or(u32::MAX)).ln_1p()
+        } else {
+            src.fetch(id, t.rel, *f, t.limit, &mut buf);
+            *f += u32::try_from(buf.len()).unwrap_or(u32::MAX);
+            degree
+        };
+        out.got.extend(buf.iter().map(|&o| (o, t.rel, hop)));
+    }
+    out
+}
+
 /// A frontier entry; stale once its entity's version moves on.
 #[derive(Debug, Clone, Copy)]
 struct Item {
@@ -184,6 +237,8 @@ pub struct Expander<'a, S, P> {
     policy: P,
     task: Task,
     reads: Reads,
+    /// Steps fetched concurrently per round.
+    parallel: usize,
     known: HashMap<Id, Known>,
     by_log: HashMap<LogId, Id>,
     heap: BinaryHeap<Item>,
@@ -236,6 +291,7 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
             },
             task,
             reads,
+            parallel: 1,
             known: HashMap::new(),
             by_log: HashMap::new(),
             heap: BinaryHeap::new(),
@@ -264,6 +320,16 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
         t.commit()?;
         ex.rescore(seeds);
         Ok(ex)
+    }
+
+    /// Fetches up to `k` (at least 1) of the best candidates concurrently per round,
+    /// for a source whose latency dominates. The rest of each round's picks are made
+    /// before the first one's results are known, so a round of `k` spends the budget a
+    /// little less well than `k` rounds of one.
+    #[must_use]
+    pub fn parallel(mut self, k: usize) -> Self {
+        self.parallel = k.max(1);
+        self
     }
 
     /// The run so far.
@@ -501,88 +567,75 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
         Ok(None)
     }
 
-    /// One expansion step. `false` once the budget is spent or the frontier is empty.
+    /// One round: up to [`Expander::parallel`] expansion steps, their fetches made
+    /// concurrently, then written and re-scored in order. `false` once the budget is
+    /// spent or the frontier is empty.
     ///
     /// # Errors
     /// Fails on storage errors.
     fn step(&mut self) -> Result<bool> {
-        if self.report.fetched >= self.task.budget {
-            return Ok(false);
-        }
-        let Some((id, take)) = self.pop()? else {
-            return Ok(false);
-        };
-        let Some(me) = self.known.get(&id).cloned() else {
-            return Ok(false);
-        };
-        let side = usize::from(me.hops[1] < me.hops[0]);
-        let mut trace = Step {
-            candidate: me.candidate(id),
-            decision: Decision {
-                priority: me.decision.priority,
-                take: take.clone(),
-            },
-            before: self.report.fetched,
-            edges: Vec::new(),
-        };
-
-        // Fetch what the policy asked for, within the budget.
-        let started = Instant::now();
-        // Each neighbour with its relation and the cost of the hop to it.
-        let mut got: Vec<(Id, Rel, f64)> = Vec::new();
-        let degree = f64::from(me.peek.iter().sum::<u32>()).ln_1p();
-        let mut buf = Vec::new();
-        let (mut fetched, mut pushed) = (me.fetched, me.pushed);
-        for t in take {
-            let left = u32::try_from(self.task.budget.saturating_sub(self.report.fetched))
-                .unwrap_or(u32::MAX);
-            let (Some(f), Some(p)) = (
-                fetched.get_mut(usize::from(t.rel)),
-                pushed.get_mut(usize::from(t.rel)),
-            ) else {
+        // Pop the best candidates, each with its share of the budget reserved, so
+        // concurrent fetches cannot overspend it.
+        let mut left = self.task.budget.saturating_sub(self.report.fetched);
+        // A round takes only candidates near its best: one far behind would likely
+        // not be chosen once the best's results are in.
+        let mut plans: Vec<(Id, Known, Vec<Take>)> = Vec::new();
+        let mut floor = f64::NEG_INFINITY;
+        while plans.len() < self.parallel && left > 0 {
+            let Some((id, mut take)) = self.pop()? else {
+                break;
+            };
+            let Some(me) = self.known.get(&id).cloned() else {
                 continue;
             };
-            buf.clear();
-            self.report.calls += 1;
-            // A filtered fetch returns matches without paging the relation; a source
-            // that cannot filter is fetched from unfiltered instead.
-            let filtered = t.filter.as_ref().and_then(|filter| {
-                self.src
-                    .fetch_where(id, t.rel, filter, t.limit.min(left), &mut buf)
-            });
-            // Crossing a hub through a filter is as specific as what the filter returned.
-            let hop = if filtered.is_some() {
-                *p = true;
-                self.report.filtered += 1;
-                f64::from(u32::try_from(buf.len()).unwrap_or(u32::MAX)).ln_1p()
-            } else {
-                degree
-            };
-            if filtered.is_none() {
-                self.src.fetch(id, t.rel, *f, t.limit.min(left), &mut buf);
-                *f += u32::try_from(buf.len()).unwrap_or(u32::MAX);
+            let priority = me.decision.priority;
+            if plans.is_empty() {
+                floor = priority - self.policy.spread();
+            } else if priority < floor {
+                self.heap.push(Item {
+                    priority,
+                    version: me.version,
+                    id,
+                });
+                break;
             }
-            self.report.fetched += u64::try_from(buf.len()).unwrap_or(u64::MAX);
-            got.extend(buf.iter().map(|&o| (o, t.rel, hop)));
+            for t in &mut take {
+                t.limit = t.limit.min(u32::try_from(left).unwrap_or(u32::MAX));
+                left -= u64::from(t.limit);
+            }
+            plans.push((id, me, take));
         }
-        self.report.fetch += started.elapsed();
-        if let Some(k) = self.known.get_mut(&id) {
-            k.fetched = fetched;
-            k.pushed = pushed;
+        if plans.is_empty() {
+            return Ok(false);
         }
-        let n = u64::try_from(got.len()).unwrap_or(u64::MAX);
-        if let Some(d) = self.report.fetched_by_domain.get_mut(usize::from(me.dom)) {
-            *d += n;
-        }
-        if let Some(s) = self.ctx.by_side.get_mut(side) {
-            *s += n;
-        }
-        self.ctx.fetched = self.report.fetched;
-        self.ctx.steps += 1;
-        self.report.steps += 1;
 
-        let changed = self.write(id, &me, &got, &mut trace.edges)?;
-        self.report.trace.push(trace);
+        let started = Instant::now();
+        let src = self.src;
+        let results: Vec<Pulled> = if let [(id, me, take)] = &*plans {
+            vec![fetch(src, *id, me, take)]
+        } else {
+            std::thread::scope(|scope| {
+                #[expect(
+                    clippy::needless_collect,
+                    reason = "spawn every fetch before joining any"
+                )]
+                let running: Vec<_> = plans
+                    .iter()
+                    .map(|(id, me, take)| scope.spawn(move || fetch(src, *id, me, take)))
+                    .collect();
+                running
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+                    .collect()
+            })
+        };
+        self.report.fetch += started.elapsed();
+        self.report.rounds += 1;
+
+        let mut changed = Vec::new();
+        for ((id, me, take), got) in plans.into_iter().zip(results) {
+            changed.extend(self.apply(id, &me, take, &got)?);
+        }
         let changed = self.watch(changed)?;
         if self.task.goal == Goal::Connect
             && self.report.connected_at.is_none()
@@ -593,6 +646,44 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
         }
         self.rescore(changed);
         Ok(true)
+    }
+
+    /// Accounts for and writes one expansion step's fetch. Returns the entities to
+    /// rescore.
+    ///
+    /// # Errors
+    /// Fails on storage errors.
+    fn apply(&mut self, id: Id, me: &Known, take: Vec<Take>, f: &Pulled) -> Result<Vec<Id>> {
+        let side = usize::from(me.hops[1] < me.hops[0]);
+        let mut trace = Step {
+            candidate: me.candidate(id),
+            decision: Decision {
+                priority: me.decision.priority,
+                take,
+            },
+            before: self.report.fetched,
+            edges: Vec::new(),
+        };
+        let n = u64::try_from(f.got.len()).unwrap_or(u64::MAX);
+        self.report.calls += f.calls;
+        self.report.filtered += f.filtered;
+        self.report.fetched += n;
+        if let Some(k) = self.known.get_mut(&id) {
+            k.fetched = f.fetched;
+            k.pushed = f.pushed;
+        }
+        if let Some(d) = self.report.fetched_by_domain.get_mut(usize::from(me.dom)) {
+            *d += n;
+        }
+        if let Some(s) = self.ctx.by_side.get_mut(side) {
+            *s += n;
+        }
+        self.ctx.fetched = self.report.fetched;
+        self.ctx.steps += 1;
+        self.report.steps += 1;
+        let changed = self.write(id, me, &f.got, &mut trace.edges)?;
+        self.report.trace.push(trace);
+        Ok(changed)
     }
 
     /// Writes the fetched edges of `id` in one txn and updates what is known. Returns

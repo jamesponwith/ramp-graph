@@ -153,6 +153,7 @@ pub fn parse_decision(v: &Value) -> Result<Decision, String> {
 pub fn report(r: &Report) -> Value {
     json!({
         "steps": r.steps,
+        "rounds": r.rounds,
         "fetched": r.fetched,
         "calls": r.calls,
         "filtered": r.filtered,

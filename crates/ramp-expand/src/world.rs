@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::{Counts, Dom, Filter, Id, MAX_REL, Rel, Relation, Source};
 
@@ -366,6 +367,7 @@ impl Builder {
             planted: self.planted,
             attrs: self.attrs,
             scanned: AtomicU64::new(0),
+            latency: Duration::ZERO,
         }
     }
 }
@@ -381,9 +383,27 @@ pub struct World {
     attrs: HashMap<u32, Vec<(&'static str, String)>>,
     /// Entities examined answering filtered fetches: the source-side work pushdown costs.
     scanned: AtomicU64,
+    /// How long each fetch takes, as a remote source's round trip would.
+    latency: Duration,
 }
 
 impl World {
+    /// Makes every fetch take `latency` (peeks stay free: selector services return
+    /// counts in bulk).
+    pub const fn set_latency(&mut self, latency: Duration) {
+        self.latency = latency;
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "simulates a remote source's round trip; not synchronisation"
+    )]
+    fn wait(&self) {
+        if !self.latency.is_zero() {
+            std::thread::sleep(self.latency);
+        }
+    }
+
     /// Entities examined answering filtered fetches so far.
     #[must_use]
     pub fn scanned(&self) -> u64 {
@@ -494,6 +514,7 @@ impl Source for World {
         limit: u32,
         out: &mut Vec<Id>,
     ) -> Option<()> {
+        self.wait();
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         out.extend(
             self.adjacent(id, rel)
@@ -506,6 +527,7 @@ impl Source for World {
     }
 
     fn fetch(&self, id: Id, rel: Rel, offset: u32, limit: u32, out: &mut Vec<Id>) {
+        self.wait();
         let Ok(i) = usize::try_from(id) else { return };
         let slot = i * MAX_REL + usize::from(rel);
         let (Some(&lo), Some(&hi)) = (self.off.get(slot), self.off.get(slot + 1)) else {

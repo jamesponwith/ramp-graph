@@ -67,11 +67,16 @@ impl Session {
 struct Remote {
     session: Arc<Session>,
     timeout: Duration,
+    spread: f64,
 }
 
 impl Policy for Remote {
     fn name(&self) -> String {
         "remote".to_owned()
+    }
+
+    fn spread(&self) -> f64 {
+        self.spread
     }
 
     fn decide(
@@ -155,9 +160,11 @@ impl Sessions {
     }
 
     /// `POST /expand`: `{"scenario", "policy"?, "budget"?, "entities"?, "seed"?, "cap"?,
-    /// "timeout"?}`. `policy` is `remote` (the default: the client decides), `guided`,
-    /// `pushdown`, `bfs` or `rules` (with `cap`); `timeout` is how long a remote batch
-    /// may go unanswered, in seconds, before the run stops.
+    /// "timeout"?, "parallel"?, "spread"?}`. `policy` is `remote` (the default: the
+    /// client decides), `guided`, `pushdown`, `bfs` or `rules` (with `cap`); `timeout`
+    /// is how long a remote batch may go unanswered, in seconds, before the run stops.
+    /// `parallel` candidates are fetched per round (1); with a remote policy, a round
+    /// takes those within `spread` of its best priority (unbounded).
     ///
     /// # Errors
     /// The HTTP error to send instead.
@@ -175,6 +182,14 @@ impl Sessions {
         let budget = uint(&req, "budget", 100_000)?;
         let timeout = Duration::from_secs(uint(&req, "timeout", 60)?);
         let cap = u32::try_from(uint(&req, "cap", 1000)?).unwrap_or(u32::MAX);
+        let parallel = usize::try_from(uint(&req, "parallel", 1)?.min(256)).unwrap_or(1);
+        let spread = match req.get("spread") {
+            None => f64::INFINITY,
+            Some(v) => v
+                .as_f64()
+                .filter(|s| *s >= 0.0)
+                .ok_or_else(|| ApiError::new(400, "spread must be a non-negative number"))?,
+        };
         let name = req
             .get("scenario")
             .and_then(Value::as_str)
@@ -200,6 +215,7 @@ impl Sessions {
             "remote" => Box::new(Remote {
                 session: Arc::clone(&session),
                 timeout,
+                spread,
             }),
             "guided" => Box::new(Guided::default()),
             "pushdown" => Box::new(Guided { pushdown: true }),
@@ -215,7 +231,7 @@ impl Sessions {
         let out = json!({"id": id, "graph": graph, "task": wire::task(&task, &world)});
         let run = Arc::clone(&session);
         std::thread::spawn(move || {
-            let done = expand(&world, &g, policy, task, &s, &run);
+            let done = expand(&world, &g, policy, task, parallel, &s, &run);
             let mut shared = run.lock();
             shared.done = Some(done);
             shared.ask = None;
@@ -344,12 +360,13 @@ fn expand(
     g: &Graph,
     policy: Box<dyn Policy + Send>,
     task: Task,
+    parallel: usize,
     s: &Scenario,
     session: &Session,
 ) -> (Value, Vec<u8>) {
     let mut recovered = 0;
     let run = Expander::new(world, g, policy, task, Reads::Projection).and_then(|ex| {
-        ex.run(|ex| {
+        ex.parallel(parallel).run(|ex| {
             recovered = s
                 .signal
                 .iter()
