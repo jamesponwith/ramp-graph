@@ -160,7 +160,7 @@ fn main() -> Result<()> {
     let dir = tempfile::tempdir().map_err(|e| GraphError::Io(e.to_string()))?;
     let mut base = n;
     for src in ["n(type=\"node3\")", "n(type=\"node1\")->e()->n()"] {
-        let g = Graph::open(dir.path().join(format!("mixed{}.db", src.len())))?;
+        let g = Graph::open_shared(dir.path().join(format!("mixed{}.db", src.len())))?;
         load(&g, n)?;
         let query = Pattern::parse(src).map_err(|e| GraphError::Value(e.to_string()))?;
         println!(
@@ -168,19 +168,27 @@ fn main() -> Result<()> {
             RUN.as_secs()
         );
         println!(
-            "{:>12} {:>8} {:>9} {:>9} {:>9} {:>10} {:>12}",
-            "commits/s", "queries", "p50 ms", "p90 ms", "p99 ms", "projected", "commit p99"
+            "{:>12} {:>8} {:>9} {:>9} {:>9} {:>9} {:>10} {:>12}",
+            "commits/s",
+            "queries",
+            "p50 ms",
+            "p90 ms",
+            "p99 ms",
+            "max ms",
+            "projected",
+            "commit p99"
         );
         for rate in [0, 1, 5, 20, 100] {
             let s = run(&g, &query, rate, base)?;
             base += s.commits * BATCH;
             let share = s.projected * 100 / s.latencies.len().max(1);
             println!(
-                "{rate:>12} {:>8} {:>9.2} {:>9.2} {:>9.2} {:>9}% {:>9.2} ms",
+                "{rate:>12} {:>8} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9}% {:>9.2} ms",
                 s.latencies.len(),
                 pct(&s.latencies, 50),
                 pct(&s.latencies, 90),
                 pct(&s.latencies, 99),
+                pct(&s.latencies, 100),
                 share,
                 s.commit_p99
             );
