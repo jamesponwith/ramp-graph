@@ -24,3 +24,7 @@ workspace = true
 [[bench]]
 name = "expand"
 harness = false
+
+[[bench]]
+name = "icij"
+harness = false
