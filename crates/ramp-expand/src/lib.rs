@@ -84,8 +84,9 @@ pub enum Filter {
     },
 }
 
-/// The world being expanded into: an external API, a corpus, a feed.
-pub trait Source {
+/// The world being expanded into: an external API, a corpus, a feed. `Sync`, since
+/// [`Expander::parallel`] fetches from several threads.
+pub trait Source: Sync {
     /// Domain names, by [`Dom`].
     fn domains(&self) -> &[&'static str];
     /// Relations, by [`Rel`].
@@ -271,6 +272,13 @@ pub struct Decision {
 pub trait Policy {
     /// A label for reports.
     fn name(&self) -> String;
+
+    /// How far below a round's best priority a candidate may be and still be fetched
+    /// in that round ([`Expander::parallel`]): a gap in this policy's priority scale.
+    /// Unbounded by default.
+    fn spread(&self) -> f64 {
+        f64::INFINITY
+    }
     /// One decision per candidate, in order, appended to `out`.
     fn decide(
         &mut self,
@@ -284,6 +292,10 @@ pub trait Policy {
 impl<P: Policy + ?Sized> Policy for &mut P {
     fn name(&self) -> String {
         (**self).name()
+    }
+
+    fn spread(&self) -> f64 {
+        (**self).spread()
     }
 
     fn decide(
@@ -300,6 +312,10 @@ impl<P: Policy + ?Sized> Policy for &mut P {
 impl<P: Policy + ?Sized> Policy for Box<P> {
     fn name(&self) -> String {
         (**self).name()
+    }
+
+    fn spread(&self) -> f64 {
+        (**self).spread()
     }
 
     fn decide(

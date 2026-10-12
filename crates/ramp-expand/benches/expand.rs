@@ -28,13 +28,28 @@ fn run(
     budget: u64,
     reads: Reads,
 ) -> Result<(Report, usize)> {
+    run_k(world, s, policy, budget, reads, 1)
+}
+
+/// [`run`], fetching `k` candidates concurrently per round.
+///
+/// # Errors
+/// Storage errors.
+fn run_k(
+    world: &World,
+    s: &Scenario,
+    policy: Box<dyn Policy>,
+    budget: u64,
+    reads: Reads,
+    k: usize,
+) -> Result<(Report, usize)> {
     let dir = tempfile::tempdir().map_err(|e| GraphError::Io(e.to_string()))?;
     let g = Graph::open(dir.path().join("g.db"))?;
     let mut task = s.task.clone();
     task.budget = budget;
     let mut recovered = 0;
     let name = policy.name();
-    let ex = Expander::new(world, &g, policy, task, reads)?;
+    let ex = Expander::new(world, &g, policy, task, reads)?.parallel(k);
     let report = ex.run(|ex| {
         recovered = s
             .signal
@@ -82,7 +97,7 @@ fn main() -> Result<()> {
     let started = Instant::now();
     let mut builder = Builder::random(n, 42);
     let scenarios = scenario::plant(&mut builder);
-    let world = builder.build();
+    let mut world = builder.build();
     println!(
         "world: {} entities, {} edges, built in {:.1}s; biggest org {} edges, biggest ip {}",
         world.len(),
@@ -98,6 +113,8 @@ fn main() -> Result<()> {
     if let Some(s) = scenarios.iter().find(|s| s.name == "explore") {
         read_path(&world, s, budget)?;
     }
+    world.set_latency(LATENCY);
+    latency(&world, &scenarios, budget)?;
     Ok(())
 }
 
@@ -191,6 +208,56 @@ fn table(world: &World, s: &Scenario, budget: u64) -> Result<()> {
         );
     }
     println!();
+    Ok(())
+}
+
+/// A remote source's round trip, scaled down so the section runs in seconds.
+const LATENCY: Duration = Duration::from_millis(2);
+
+/// Each scenario's best policy against a source with [`LATENCY`] per fetch, fetching
+/// 1, 4 and 16 candidates per round.
+///
+/// # Errors
+/// Storage errors.
+#[expect(clippy::print_stdout, reason = "benchmark report")]
+fn latency(world: &World, scenarios: &[Scenario], budget: u64) -> Result<()> {
+    println!(
+        "\n== latency — {} ms per fetch, k candidates fetched concurrently per round",
+        ms(LATENCY)
+    );
+    println!(
+        "   {:<12} {:<16} {:>4} {:>9} {:>7} {:>8} {:>8} {:>9} {:>8}",
+        "scenario", "policy", "k", "found at", "signal", "steps", "rounds", "wall ms", "speedup"
+    );
+    for s in scenarios.iter().filter(|s| !s.signal.is_empty()) {
+        let pushdown = s.task.target.is_some();
+        let mut base = None;
+        for k in [1, 4, 16] {
+            let (r, got) = run_k(
+                world,
+                s,
+                Box::new(Guided { pushdown }),
+                budget,
+                Reads::Projection,
+                k,
+            )?;
+            let wall = ms(r.wall);
+            let base = *base.get_or_insert(wall);
+            println!(
+                "   {:<12} {:<16} {:>4} {:>9} {:>5}/{} {:>8} {:>8} {:>9.0} {:>7.1}×",
+                s.name,
+                Guided { pushdown }.name(),
+                k,
+                cost(r.done_at),
+                got,
+                s.signal.len(),
+                r.steps,
+                r.rounds,
+                wall,
+                base / wall,
+            );
+        }
+    }
     Ok(())
 }
 

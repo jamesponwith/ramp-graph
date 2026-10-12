@@ -624,7 +624,7 @@ fn a_client_steers_an_expansion() {
     let t = server();
     let r = t.post(
         "/expand",
-        json!({"scenario": "alert", "entities": 20_000, "seed": 1, "budget": 50_000}),
+        json!({"scenario": "alert", "entities": 20_000, "seed": 1, "budget": 50_000, "parallel": 4}),
     );
     assert_eq!(r.status, 201, "{}", r.body);
     let (id, graph, task) = (

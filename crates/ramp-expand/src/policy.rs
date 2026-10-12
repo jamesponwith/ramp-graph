@@ -102,6 +102,9 @@ pub struct Guided {
     pub pushdown: bool,
 }
 
+/// See [`Guided::spread`].
+const SPREAD: f64 = 1.0;
+
 fn interest(task: &Task, r: usize) -> f64 {
     task.relation_interest.get(r).copied().unwrap_or(0.0)
 }
@@ -176,6 +179,12 @@ impl Policy for Guided {
         } else {
             "guided".to_owned()
         }
+    }
+
+    /// Priorities are negated route costs in nats: a round takes candidates whose
+    /// route is at most `SPREAD` nats (≈2.7×) dearer than its best.
+    fn spread(&self) -> f64 {
+        SPREAD
     }
 
     fn decide(

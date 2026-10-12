@@ -23,12 +23,26 @@ fn run<P: Policy>(
     budget: u64,
     reads: Reads,
 ) -> (Report, (u64, u64)) {
+    run_k(w, s, policy, budget, reads, 1)
+}
+
+/// [`run`], fetching `k` candidates per round.
+fn run_k<P: Policy>(
+    w: &World,
+    s: &Scenario,
+    policy: P,
+    budget: u64,
+    reads: Reads,
+    k: usize,
+) -> (Report, (u64, u64)) {
     let dir = tempfile::tempdir().unwrap();
     let g = Graph::open(dir.path().join("g.db")).unwrap();
     let mut task = s.task.clone();
     task.budget = budget;
     let signal = s.signal.clone();
-    let ex = Expander::new(w, &g, policy, task, reads).unwrap();
+    let ex = Expander::new(w, &g, policy, task, reads)
+        .unwrap()
+        .parallel(k);
     let report = ex
         .run(|ex| !signal.is_empty() && signal.iter().all(|&(a, b, r)| ex.has_edge(a, b, r)))
         .unwrap();
@@ -294,4 +308,37 @@ fn decisions_round_trip_through_json() {
     let skip = wire::parse_decision(&serde_json::json!({"priority": 0})).unwrap();
     assert!(skip.take.is_empty());
     wire::parse_decision(&serde_json::json!({"take": []})).unwrap_err();
+}
+
+#[test]
+fn concurrent_rounds_cut_round_trips_not_recall() {
+    let (w, all) = world();
+    for name in ["path-7hop", "pivot-busy"] {
+        let s = scenario(&all, name);
+        let policy = Guided {
+            pushdown: s.task.target.is_some(),
+        };
+        let (one, _) = run_k(&w, s, policy, 100_000, Reads::Projection, 1);
+        let (many, _) = run_k(&w, s, policy, 100_000, Reads::Projection, 16);
+        assert!(many.done_at.is_some(), "{name}: k=16 recovers the signal");
+        assert_eq!(one.rounds, one.steps);
+        assert!(
+            many.rounds * 2 < one.rounds,
+            "{name}: {} vs {} rounds",
+            many.rounds,
+            one.rounds
+        );
+        // Speculative picks stay near the best, so the budget is spent about as well.
+        assert!(
+            many.fetched * 2 < one.fetched * 3,
+            "{name}: {} vs {} fetched",
+            many.fetched,
+            one.fetched
+        );
+    }
+    // Reserving each round's budget up front keeps concurrent fetches within it.
+    let s = scenario(&all, "path-7hop");
+    let (r, _) = run_k(&w, s, Bfs { depth: 9 }, 5_000, Reads::Projection, 16);
+    assert!(r.fetched <= 5_000, "{}", r.fetched);
+    assert_eq!(r.fetched_by_domain.iter().sum::<u64>(), r.fetched);
 }

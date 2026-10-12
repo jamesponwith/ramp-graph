@@ -188,6 +188,44 @@ source answers such semi-joins far cheaper than a scan. Path tasks name no targe
 they run as before. A reachability filter ("leads to seed B within k") is possible, but
 few sources could answer it.
 
+## Concurrent fetches
+
+A real source answers in 50–200 ms, so a run that waits for each fetch before choosing
+the next pays one round trip per step: path-7hop's 624 steps would be minutes.
+`Expander::parallel(k)` makes each round pop up to `k` candidates and fetch them
+concurrently. Then it writes and re-scores them in order, and runs the standing queries
+once.
+- **Budget:** each pick's limits are reserved from the remaining budget when it is
+  popped, so concurrent fetches cannot overspend it.
+- **Speculation:** a round's extra picks are made before the first one's results are
+  known. An extra far behind the best would probably not have been chosen once those
+  results came in. So a round only takes candidates within the policy's
+  `Policy::spread` of its best priority. For `Guided` that is 1 nat, a route at most
+  ≈2.7× dearer. Without the bound, pivot-busy at `k = 16` spent 11,097 edges instead of
+  42: the extra picks were chunks of the VPN hubs that the leading filtered fetch was
+  there to avoid.
+
+`World::set_latency` makes each fetch sleep, standing in for the round trip; peeks stay
+free, since selector services return counts in bulk. At 2 ms per fetch:
+
+| scenario | policy | k | fetched | rounds | wall | speedup |
+|---|---|---|---|---|---|---|
+| path-5hop | guided | 1 / 4 / 16 | 69 / 84 / 67 | 16 / 6 / 3 | 74 / 37 / 20 ms | 1 / 2.0 / **3.8×** |
+| path-7hop | guided | 1 / 4 / 16 | 4,593 / 4,618 / 4,728 | 624 / 157 / 42 | 2,908 / 1,113 / 369 ms | 1 / 2.6 / **7.9×** |
+| pivot-busy | guided+pushdown | 1 / 4 / 16 | 42 / 43 / 43 | 13 / 6 / 6 | ≈100 ms | 1.0× |
+| alert | guided+pushdown | 1 / 4 / 16 | 2 / 32 / 32 | 2 / 2 / 2 | 4–5 ms | 1.0× |
+
+- **Path tasks gain the most,** because their search is broad: 7.9× fewer round trips
+  for 3% more edges.
+- **The targeted tasks do not speed up.** They finish in a handful of rounds, and their
+  time goes to the source evaluating filters (3M entities scanned on pivot-busy), not
+  to waiting. At `k ≥ 4`, alert fetches 30 extra edges: siblings that ride along in the
+  second round.
+
+A step's own relation calls still run one after another; issuing them concurrently too
+is the next cut, where a step takes several relations. `/expand` takes `parallel`, and
+`spread` for a remote policy, whose priority scale only the client knows.
+
 ## Steering from outside: `/expand`
 
 Jev runs outside the process, so `ramp-server` exposes the `Policy` seam over HTTP. The
@@ -195,7 +233,7 @@ client pulls work and needs no server of its own. The JSON is `ramp_expand::wire
 
 | request | does |
 |---|---|
-| `POST /expand` | starts a run: `{"scenario", "policy"?, "budget"?, "entities"?, "seed"?, "cap"?, "timeout"?}`. Returns `{"id", "graph", "task"}`: the task with domain and relation names, and a new graph of the collection the run writes into |
+| `POST /expand` | starts a run: `{"scenario", "policy"?, "budget"?, "entities"?, "seed"?, "cap"?, "timeout"?, "parallel"?, "spread"?}`. Returns `{"id", "graph", "task"}`: the task with domain and relation names, and a new graph of the collection the run writes into |
 | `GET /expand/<id>?wait=s` | long-polls (default 25 s): `{"state": "ask", "seq", "context", "candidates"}`, `{"state": "done", "report"}`, or `{"state": "running"}` |
 | `POST /expand/<id>` | `{"seq", "decisions": [{"priority", "take": [{"rel", "limit", "filter"?}]}]}`, one per candidate; 409 for a batch that is not open, 400 for the wrong count |
 | `GET /expand/<id>/trace` | the labelled decision trace, JSON lines, once done |
@@ -230,7 +268,5 @@ Crediting the route as well is the first refinement once a model trains on it.
 ## Next
 
 1. **A learned policy.** Train Jev on the traces above.
-2. **Pipelined fetches.** Real sources have latency. Fetch the top-k candidates
-   concurrently while writing and re-scoring the previous step.
-3. **A real dataset,** to check that the cost model holds beyond the generator.
-4. **Background projection rebuilds,** so a long expansion never pays one inline.
+2. **A real dataset,** to check that the cost model holds beyond the generator.
+3. **Background projection rebuilds,** so a long expansion never pays one inline.
