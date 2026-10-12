@@ -1389,3 +1389,42 @@ fn streaming() {
     );
     assert_eq!(mq(&t, &["n()"], 999), Vec::<String>::new());
 }
+
+#[test]
+fn a_shared_graph_rebuilds_its_projection_in_the_background() {
+    let dir = tempfile::tempdir().unwrap();
+    let g = Graph::open_shared(dir.path().join("g.db")).unwrap();
+    let mut w = g.write().unwrap();
+    w.node(b"t", b"seed").unwrap();
+    w.commit().unwrap();
+    g.read().unwrap().projection().unwrap();
+    // Grow the delta past what a base of one tolerates.
+    let mut w = g.write().unwrap();
+    for x in 0..10_000_u32 {
+        w.node(b"t", x.to_string().as_bytes()).unwrap();
+    }
+    w.commit().unwrap();
+    let t = g.read().unwrap();
+    // The first query advances over the commit; the next sees the grown delta and
+    // starts the rebuild, but is served the advanced projection meanwhile.
+    t.projection_if_due(0).unwrap().unwrap();
+    let stale = t.projection_if_due(0).unwrap().unwrap();
+    assert!(stale.delta_len() > 0, "advanced, not rebuilt inline");
+    assert_eq!(stale.end(), t.next_id().unwrap());
+    drop(t);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let fresh = loop {
+        let p = g.cached_projection().unwrap();
+        if p.delta_len() == 0 {
+            break p;
+        }
+        assert!(Instant::now() < deadline, "no rebuild");
+        std::thread::park_timeout(Duration::from_millis(5));
+    };
+    assert_eq!(fresh.len(), 10_001);
+    // A commit after the swap is advanced over the fresh base.
+    let mut w = g.write().unwrap();
+    w.node(b"t", b"late").unwrap();
+    w.commit().unwrap();
+    assert_eq!(g.read().unwrap().projection().unwrap().delta_len(), 1);
+}

@@ -323,4 +323,6 @@ Crediting the route as well is the first refinement once a model trains on it.
 ## Next
 
 1. **A learned policy.** Train Jev on the traces above, from both worlds.
-2. **Background projection rebuilds,** so a long expansion never pays one inline.
+
+Projection rebuilds no longer stall a long expansion: a graph the server opens
+rebuilds in the background (see `docs/spec.md`).

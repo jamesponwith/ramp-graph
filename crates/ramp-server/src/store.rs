@@ -161,7 +161,7 @@ impl Store {
         if let Some(g) = open.get(uuid) {
             return Ok(g);
         }
-        let g = Arc::new(Graph::open(self.path(uuid))?);
+        let g = Graph::open_shared(self.path(uuid))?;
         open.insert(uuid, &g);
         drop(open);
         Ok(g)

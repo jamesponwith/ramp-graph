@@ -34,8 +34,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Bound;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use heed::types::Bytes;
@@ -382,6 +382,11 @@ pub struct Graph {
     /// Resets committed in this process. A reset reuses log IDs, so a projection from
     /// before one cannot be advanced.
     epoch: AtomicU64,
+    /// Itself, when opened by [`Graph::open_shared`]: lets a projection whose delta has
+    /// grown be rebuilt on a background thread instead of by the query that notices.
+    me: Weak<Self>,
+    /// A background rebuild is running.
+    rebuilding: AtomicBool,
 }
 
 /// Whether a rebuild at `now` keeps builds to at most one per `duty + 1` build-times:
@@ -438,7 +443,70 @@ impl Graph {
             projection: Mutex::default(),
             built: Mutex::default(),
             epoch: AtomicU64::new(0),
+            me: Weak::new(),
+            rebuilding: AtomicBool::new(false),
         })
+    }
+
+    /// [`open`](Self::open), shared: when a cached projection's delta grows past a
+    /// fraction of its base, queries keep advancing it while a fresh one is built on a
+    /// background thread and swapped in, instead of one query paying for the build.
+    ///
+    /// # Errors
+    /// As [`open`](Self::open).
+    pub fn open_shared(path: impl AsRef<Path>) -> Result<Arc<Self>> {
+        let g = Self::open(path)?;
+        Ok(Arc::new_cyclic(|me| Self {
+            me: Weak::clone(me),
+            ..g
+        }))
+    }
+
+    /// Starts a projection rebuild on a background thread unless one is running;
+    /// whether one now is. Only a graph from [`open_shared`](Self::open_shared) can.
+    fn rebuild_behind(&self) -> bool {
+        let Some(g) = self.me.upgrade() else {
+            return false;
+        };
+        if self.rebuilding.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        let spawned = std::thread::Builder::new()
+            .name("projection".into())
+            .spawn(move || {
+                // ponytail: a failed build is dropped; the next due query starts another
+                let _failed = g.rebuild();
+                g.rebuilding.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            self.rebuilding.store(false, Ordering::Release);
+        }
+        spawned.is_ok()
+    }
+
+    /// Builds a projection of the current view and caches it, unless a reset made it
+    /// useless meanwhile. Queries advance it over what was committed during the build.
+    ///
+    /// # Errors
+    /// Fails on storage errors.
+    fn rebuild(&self) -> Result<()> {
+        // Read before the snapshot: a reset in between leaves it stale, never mislabelled.
+        let epoch = self.epoch();
+        let started = Instant::now();
+        let t = self.read()?;
+        let fresh = Arc::new(Projection::build(&t, epoch)?);
+        drop(t);
+        let mut slot = self
+            .projection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.epoch() == epoch {
+            *slot = Some(fresh);
+        }
+        drop(slot);
+        *self.built.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((Instant::now(), started.elapsed()));
+        Ok(())
     }
 
     /// Registers a txn about to start, waiting out any resize.
@@ -714,7 +782,8 @@ impl<'a> Txn<'a> {
     /// A read-optimised [`Projection`] of this txn's view. A cached one for an earlier
     /// view is advanced over the log entries since (cheap: proportional to them); one
     /// is built from scratch when there is none, a reset intervened, or its delta has
-    /// grown past a fraction of its base. [`query`](Self::query) calls on this view use
+    /// grown past a fraction of its base (in the background, for a graph from
+    /// [`Graph::open_shared`], while this one is advanced as usual). [`query`](Self::query) calls on this view use
     /// it. Only read txns update the cache: a write txn's view includes writes that may
     /// never commit.
     ///
@@ -751,7 +820,8 @@ impl<'a> Txn<'a> {
                 .unwrap_or_else(PoisonError::into_inner);
             if let Some(p) = slot
                 .as_mut()
-                .filter(|p| p.epoch() == epoch && p.end() <= end && !(due && p.wants_rebuild()))
+                .filter(|p| p.epoch() == epoch && p.end() <= end)
+                .filter(|p| !(due && p.wants_rebuild()) || self.g.rebuild_behind())
             {
                 if p.end() == end {
                     return Ok(Some(Arc::clone(p)));
