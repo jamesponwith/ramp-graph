@@ -1428,3 +1428,50 @@ fn a_shared_graph_rebuilds_its_projection_in_the_background() {
     w.commit().unwrap();
     assert_eq!(g.read().unwrap().projection().unwrap().delta_len(), 1);
 }
+
+#[test]
+fn property_equality_seeds_from_the_value_index() {
+    let (_d, g) = graph();
+    let mut t = g.write().unwrap();
+    let an = t.node(b"t", b"a").unwrap().id;
+    let bn = t.node(b"t", b"b").unwrap().id;
+    let cn = t.node(b"u", b"c").unwrap().id;
+    t.set_value(an, "p", &json!("x")).unwrap();
+    t.set_value(bn, "p", &json!("x")).unwrap();
+    t.set_value(cn, "p", &json!("y")).unwrap();
+    let edge = t.edge(an, cn, b"e", b"").unwrap().id;
+    t.set_value(edge, "p", &json!("x")).unwrap();
+    t.set_value(an, "q", &json!("z")).unwrap();
+    let pp = t.prop(an, b"q", None).unwrap().unwrap().id;
+    t.set_value(pp, "p", &json!("x")).unwrap(); // on a property: never a seed
+    t.commit().unwrap();
+    let first = g.read().unwrap().next_id().unwrap();
+    let mut t = g.write().unwrap();
+    t.set_value(bn, "p", &json!("y")).unwrap(); // supersedes x
+    t.delete(an).unwrap(); // ends a, its edge, and their properties
+    t.commit().unwrap();
+
+    let t = g.read().unwrap();
+    let check = |t: &Txn<'_>| {
+        assert_eq!(q(t, "n(p='x')", Some(first)), ["t:a", "t:b"]);
+        assert_eq!(q(t, "n(p='x', type='t')", Some(first)), ["t:a", "t:b"]);
+        assert_eq!(q(t, "e(p='x')", Some(first)), ["[e:]"]);
+        assert_eq!(q(t, "n(p='y')", Some(first)), ["u:c"]);
+        assert_eq!(q(t, "n(p='x')", None), Vec::<String>::new());
+        assert_eq!(q(t, "n(p=['x','y'])", None), ["t:b", "u:c"]);
+        assert_eq!(q(t, "n(p='y', type='u')", None), ["u:c"]);
+        assert_eq!(q(t, "n(p='y')-n()", None), Vec::<String>::new());
+        assert_eq!(q(t, "n(p='y')", Some(first)).len(), 1);
+        assert_eq!(q(t, "e(p='x')", None), Vec::<String>::new());
+        assert_eq!(q(t, "n(p='nope')", None), Vec::<String>::new());
+    };
+    check(&t);
+    drop(t);
+
+    // A file from before the index is filled from its log on open.
+    let mut w = g.env.write_txn().unwrap();
+    g.t.val_idx.clear(&mut w).unwrap();
+    g.t.fill_val_idx(&mut w).unwrap();
+    w.commit().unwrap();
+    check(&g.read().unwrap());
+}

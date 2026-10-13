@@ -165,6 +165,26 @@ fn eq_strings(f: &Filter) -> Option<&[Value]> {
     }
 }
 
+/// The first property equality on string literals in `slot`, to seed from objects
+/// holding one: `(filter index, key, values)`, with values no object holds left out.
+fn by_prop(slot: &Slot, keys: &Keys) -> Option<(usize, StrId, Vec<StrId>)> {
+    slot.filters.iter().enumerate().find_map(|(fi, f)| {
+        let ([k], Some(literals)) = (f.path.as_slice(), eq_strings(f)) else {
+            return None;
+        };
+        if NATIVE_STR.contains(&k.as_str()) || matches!(f.test, Test::NotIn(_)) {
+            return None;
+        }
+        let key = keys.keys.get(k).copied().flatten()?;
+        let vals: Vec<StrId> = literals
+            .iter()
+            .filter_map(Value::as_str)
+            .filter_map(|l| keys.literals.get(k)?.get(l).copied().flatten())
+            .collect();
+        Some((fi, key, vals))
+    })
+}
+
 /// What stays fixed while one chain is expanded.
 #[derive(Debug, Clone, Copy)]
 struct Walk<'w> {
@@ -538,11 +558,17 @@ impl Txn<'_> {
         if let Some(pj) = proj {
             return self.projection_seeds(pj, slot, keys, strs("type"), strs("value"), part);
         }
+        let slot_kind = slot.kind;
         let table = match slot.kind {
             Kind::Node => self.g.t.node_idx,
             Kind::Edge => self.g.t.edge_idx,
         };
-        let it: Seeds<'s> = match (slot.kind, strs("type"), strs("value")) {
+        let (types, values) = (strs("type"), strs("value"));
+        let held = match (slot.kind, &types, &values) {
+            (Kind::Node, Some(_), Some(_)) => None,
+            _ => by_prop(slot, keys),
+        };
+        let it: Seeds<'s> = match (slot.kind, types, values) {
             (Kind::Node, Some(ts), Some(vs)) => {
                 let mut out = Vec::new();
                 for t in &ts {
@@ -551,6 +577,31 @@ impl Txn<'_> {
                     }
                 }
                 Box::new(out.into_iter())
+            }
+            // A property equality usually narrows more than a type: seed from its holders.
+            // One live value per (parent, key), so a parent appears once.
+            _ if let Some((fi, key, vals)) = held => {
+                let mut its = Vec::new();
+                for v in vals {
+                    its.push(self.props_valued(key, v, view)?);
+                }
+                let holders = its.into_iter().flatten().filter_map(move |p| {
+                    let parent = match p {
+                        Ok(Entry {
+                            record: Record::Prop { parent, .. },
+                            ..
+                        }) => parent,
+                        Ok(_) => {
+                            return Some(Err(GraphError::Corrupt("val_idx holds a non-property")));
+                        }
+                        Err(e) => return Some(Err(e)),
+                    };
+                    // A live property's parent is live: ending one ends its properties.
+                    self.entry(parent)
+                        .transpose()
+                        .filter(|e| e.as_ref().map_or(true, |e| kind(e) == Some(slot_kind)))
+                });
+                return Ok((share(Box::new(holders)), Some(fi)));
             }
             (_, Some(ts), _) => {
                 let its = ts
@@ -614,22 +665,7 @@ impl Txn<'_> {
                 )
             }
             (_, None, _) => {
-                let by_prop = slot.filters.iter().enumerate().find_map(|(fi, f)| {
-                    let ([k], Some(literals)) = (f.path.as_slice(), eq_strings(f)) else {
-                        return None;
-                    };
-                    if NATIVE_STR.contains(&k.as_str()) || matches!(f.test, Test::NotIn(_)) {
-                        return None;
-                    }
-                    let key = keys.keys.get(k).copied().flatten()?;
-                    let vals: Vec<StrId> = literals
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .filter_map(|l| keys.literals.get(k)?.get(l).copied().flatten())
-                        .collect();
-                    Some((fi, key, vals))
-                });
-                match by_prop {
+                match by_prop(slot, keys) {
                     // One live value per (parent, key), so a parent appears once.
                     Some((fi, key, vals)) => (
                         Box::new(

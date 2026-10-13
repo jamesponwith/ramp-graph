@@ -237,6 +237,8 @@ struct Tables {
     edge_idx: Table,
     /// `[parent, key, id]`.
     prop_idx: Table,
+    /// `[key, val, id]`: properties by value, to find what holds one.
+    val_idx: Table,
     /// `[src, ty, edge]`.
     src_idx: Table,
     /// `[tgt, ty, edge]`.
@@ -316,6 +318,10 @@ impl Tables {
     /// Fails on storage errors.
     fn create(env: &Env) -> Result<Self> {
         let mut w = env.write_txn()?;
+        // A file from before `val_idx` existed gets it filled from the log.
+        let backfill = env
+            .open_database::<Bytes, Bytes>(&w, Some("val_idx"))?
+            .is_none();
         let mut table = |name| env.create_database::<Bytes, Bytes>(&mut w, Some(name));
         let t = Self {
             log: table("log")?,
@@ -324,16 +330,41 @@ impl Tables {
             node_idx: table("node_idx")?,
             edge_idx: table("edge_idx")?,
             prop_idx: table("prop_idx")?,
+            val_idx: table("val_idx")?,
             src_idx: table("srcnode_idx")?,
             tgt_idx: table("tgtnode_idx")?,
             txnlog: table("txnlog")?,
             kv: table("kv")?,
         };
+        if backfill {
+            t.fill_val_idx(&mut w)?;
+        }
         w.commit()?;
         Ok(t)
     }
 
-    const fn all(&self) -> [Table; 10] {
+    /// Fills an empty `val_idx` from every property in the log.
+    ///
+    /// # Errors
+    /// Fails on storage errors or corrupt data.
+    fn fill_val_idx(&self, w: &mut RwTxn<'_>) -> Result<()> {
+        let mut keys = Vec::new();
+        for kv in self.log.iter(w)? {
+            let (k, v) = kv?;
+            let id = varint::last(k)?;
+            if let Record::Prop { key, val, .. } = Entry::decode(id, v)?.record {
+                keys.push([key, val, id]);
+            }
+        }
+        keys.sort_unstable();
+        for k in keys {
+            self.val_idx
+                .put_with_flags(w, PutFlags::APPEND, &varint::pack(&k), &[])?;
+        }
+        Ok(())
+    }
+
+    const fn all(&self) -> [Table; 11] {
         [
             self.log,
             self.scalar,
@@ -341,6 +372,7 @@ impl Tables {
             self.node_idx,
             self.edge_idx,
             self.prop_idx,
+            self.val_idx,
             self.src_idx,
             self.tgt_idx,
             self.txnlog,
@@ -428,7 +460,7 @@ impl Graph {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let len = std::fs::metadata(path.as_ref()).map_or(0, |m| m.len());
         let mut opts = EnvOpenOptions::new();
-        opts.map_size(map_size(len)).max_dbs(10);
+        opts.map_size(map_size(len)).max_dbs(11);
         // SAFETY: NO_SUB_DIR only selects the single-file layout.
         unsafe { opts.flags(EnvFlags::NO_SUB_DIR) };
         // SAFETY: the file is only modified through LMDB, whose lock file arbitrates between
@@ -667,7 +699,7 @@ impl Graph {
     fn pack_into(&self, path: &Path) -> Result<()> {
         let src = self.read()?;
         let mut opts = EnvOpenOptions::new();
-        opts.map_size(map_size(self.size()?)).max_dbs(10);
+        opts.map_size(map_size(self.size()?)).max_dbs(11);
         // SAFETY: NO_SUB_DIR selects the single-file layout; NO_LOCK skips the lock file,
         // which is sound because this env is private to this call until it is dropped.
         unsafe { opts.flags(EnvFlags::NO_SUB_DIR | EnvFlags::NO_LOCK) };
@@ -1052,6 +1084,19 @@ impl<'a> Txn<'a> {
     /// Fails on storage errors.
     pub fn props(&self, parent: LogId, before: Option<LogId>) -> Result<impl Entries + '_> {
         self.scan(self.g.t.prop_idx, varint::pack(&[parent]), before)
+    }
+
+    /// Live properties `key = val` (interned IDs) in view `before`, by key, value, then ID.
+    ///
+    /// # Errors
+    /// Fails on storage errors.
+    pub(crate) fn props_valued(
+        &self,
+        key: StrId,
+        val: StrId,
+        before: Option<LogId>,
+    ) -> Result<impl Entries + '_> {
+        self.scan(self.g.t.val_idx, varint::pack(&[key, val]), before)
     }
 
     /// All nodes, or those of type `ty`.
@@ -1701,6 +1746,7 @@ impl<'a> Txn<'a> {
         let (key, val) = (self.intern_known(key, k0)?, self.intern_known(val, v0)?);
         let e = self.append(Record::Prop { parent, key, val }, cur.map_or(0, |c| c.id))?;
         self.put_idx(self.g.t.prop_idx, &[parent, key, e.id])?;
+        self.put_idx(self.g.t.val_idx, &[key, val, e.id])?;
         Ok(e)
     }
 
@@ -1805,18 +1851,7 @@ impl<'a> Txn<'a> {
     pub fn reset(&mut self) -> Result<()> {
         let t = self.g.t;
         let w = self.rw()?;
-        for table in [
-            t.log,
-            t.scalar,
-            t.scalar_idx,
-            t.node_idx,
-            t.edge_idx,
-            t.prop_idx,
-            t.src_idx,
-            t.tgt_idx,
-            t.txnlog,
-            t.kv,
-        ] {
+        for table in t.all() {
             table.clear(w)?;
         }
         self.state = State {
