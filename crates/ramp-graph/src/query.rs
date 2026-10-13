@@ -564,10 +564,12 @@ impl Txn<'_> {
             Kind::Edge => self.g.t.edge_idx,
         };
         let (types, values) = (strs("type"), strs("value"));
+        let indexed = self.indexed_keys()?;
         let held = match (slot.kind, &types, &values) {
             (Kind::Node, Some(_), Some(_)) => None,
             _ => by_prop(slot, keys),
-        };
+        }
+        .filter(|(_, key, _)| indexed.contains(key));
         let it: Seeds<'s> = match (slot.kind, types, values) {
             (Kind::Node, Some(ts), Some(vs)) => {
                 let mut out = Vec::new();
@@ -578,7 +580,8 @@ impl Txn<'_> {
                 }
                 Box::new(out.into_iter())
             }
-            // A property equality usually narrows more than a type: seed from its holders.
+            // A property equality on an indexed key usually narrows more than a type: seed
+            // from its holders.
             // One live value per (parent, key), so a parent appears once.
             _ if let Some((fi, key, vals)) = held => {
                 let mut its = Vec::new();

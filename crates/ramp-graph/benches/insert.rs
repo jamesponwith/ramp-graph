@@ -1,7 +1,8 @@
 //! Port of upstream `bench.py`: in one write txn, insert 1M nodes, then a property on
 //! each, then 1M unique random edges. Prints per-phase rates and the file size.
 //!
-//! `cargo bench -p ramp-graph --bench insert [-- N]` (N defaults to 1,000,000).
+//! `cargo bench -p ramp-graph --bench insert [-- N] [indexed]` (N defaults to 1,000,000;
+//! `indexed` declares the property keys with `Txn::index_values` first).
 
 use std::collections::BTreeSet;
 use std::time::Instant;
@@ -42,6 +43,11 @@ fn main() -> Result<()> {
     let dir = tempfile::tempdir().map_err(|e| ramp_graph::GraphError::Io(e.to_string()))?;
     let g = Graph::open(dir.path().join("bench.db"))?;
     let mut t = g.write()?;
+    if std::env::args().any(|a| a == "indexed") {
+        for k in 0..5 {
+            t.index_values(format!("prop{k}").as_bytes())?;
+        }
+    }
 
     let start = Instant::now();
     let mut nodes = Vec::new();

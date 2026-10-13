@@ -1036,6 +1036,7 @@ fn projection_advances_like_lmdb() {
     let mut rng = Rng(7);
     let mut live = Live::default();
     let mut t = g.write().unwrap();
+    t.index_values(b"p").unwrap(); // LMDB seeds p from the value index, q and w by scan
     for i in 0..30 {
         random_write(&mut t, &mut rng, &mut live, i);
     }
@@ -1433,6 +1434,7 @@ fn a_shared_graph_rebuilds_its_projection_in_the_background() {
 fn property_equality_seeds_from_the_value_index() {
     let (_d, g) = graph();
     let mut t = g.write().unwrap();
+    t.index_values(b"q").unwrap(); // before any value of q
     let an = t.node(b"t", b"a").unwrap().id;
     let bn = t.node(b"t", b"b").unwrap().id;
     let cn = t.node(b"u", b"c").unwrap().id;
@@ -1451,6 +1453,27 @@ fn property_equality_seeds_from_the_value_index() {
     t.delete(an).unwrap(); // ends a, its edge, and their properties
     t.commit().unwrap();
 
+    // Nothing is indexed for p until it is declared; queries still answer by scanning.
+    let held = |g: &Graph| {
+        let r = g.env.read_txn().unwrap();
+        g.t.val_idx.len(&r).unwrap()
+    };
+    assert_eq!(held(&g), 1, "only q");
+    let t = g.read().unwrap();
+    assert_eq!(q(&t, "n(p='y')", None), ["t:b", "u:c"]);
+    assert_eq!(
+        q(&t, "n(q='z')", None),
+        Vec::<String>::new(),
+        "ended with a"
+    );
+    drop(t);
+    let mut w = g.write().unwrap();
+    assert!(w.nested().unwrap().index_values(b"p").is_err());
+    w.index_values(b"p").unwrap(); // fills from the log: every p ever set
+    w.index_values(b"p").unwrap(); // once
+    w.commit().unwrap();
+    assert_eq!(held(&g), 1 + 6);
+
     let t = g.read().unwrap();
     let check = |t: &Txn<'_>| {
         assert_eq!(q(t, "n(p='x')", Some(first)), ["t:a", "t:b"]);
@@ -1468,10 +1491,10 @@ fn property_equality_seeds_from_the_value_index() {
     check(&t);
     drop(t);
 
-    // A file from before the index is filled from its log on open.
-    let mut w = g.env.write_txn().unwrap();
-    g.t.val_idx.clear(&mut w).unwrap();
-    g.t.fill_val_idx(&mut w).unwrap();
+    // Later writes of a declared key are indexed as they happen.
+    let mut w = g.write().unwrap();
+    w.set_value(cn, "p", &json!("x")).unwrap();
     w.commit().unwrap();
-    check(&g.read().unwrap());
+    assert_eq!(held(&g), 1 + 6 + 1);
+    assert_eq!(q(&g.read().unwrap(), "n(p='x')", None), ["u:c"]);
 }
