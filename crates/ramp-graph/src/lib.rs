@@ -237,6 +237,9 @@ struct Tables {
     edge_idx: Table,
     /// `[parent, key, id]`.
     prop_idx: Table,
+    /// `[key, val, id]`: properties by value, for keys declared with
+    /// [`Txn::index_values`] (listed in kv domain [`INDEXED`]).
+    val_idx: Table,
     /// `[src, ty, edge]`.
     src_idx: Table,
     /// `[tgt, ty, edge]`.
@@ -246,6 +249,9 @@ struct Tables {
     /// `[domain] ++ key` → value.
     kv: Table,
 }
+
+/// kv domain listing the property keys indexed by value: `[key]` → ''.
+const INDEXED: &[u8] = b"lg.indexed";
 
 /// Entries kept in a write txn's string cache before it is cleared (≈64 MiB at most,
 /// freed with the txn).
@@ -324,6 +330,7 @@ impl Tables {
             node_idx: table("node_idx")?,
             edge_idx: table("edge_idx")?,
             prop_idx: table("prop_idx")?,
+            val_idx: table("val_idx")?,
             src_idx: table("srcnode_idx")?,
             tgt_idx: table("tgtnode_idx")?,
             txnlog: table("txnlog")?,
@@ -333,7 +340,7 @@ impl Tables {
         Ok(t)
     }
 
-    const fn all(&self) -> [Table; 10] {
+    const fn all(&self) -> [Table; 11] {
         [
             self.log,
             self.scalar,
@@ -341,6 +348,7 @@ impl Tables {
             self.node_idx,
             self.edge_idx,
             self.prop_idx,
+            self.val_idx,
             self.src_idx,
             self.tgt_idx,
             self.txnlog,
@@ -428,7 +436,7 @@ impl Graph {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let len = std::fs::metadata(path.as_ref()).map_or(0, |m| m.len());
         let mut opts = EnvOpenOptions::new();
-        opts.map_size(map_size(len)).max_dbs(10);
+        opts.map_size(map_size(len)).max_dbs(11);
         // SAFETY: NO_SUB_DIR only selects the single-file layout.
         unsafe { opts.flags(EnvFlags::NO_SUB_DIR) };
         // SAFETY: the file is only modified through LMDB, whose lock file arbitrates between
@@ -594,6 +602,7 @@ impl Graph {
             strs: StrCache::default(),
             old_live: HashSet::default(),
             new_live: Vec::new(),
+            indexed: None,
             _ticket: Some(ticket),
         };
         // The snapshot is fixed, so the end of the log is too: look it up once, not
@@ -619,6 +628,7 @@ impl Graph {
             strs: StrCache::default(),
             old_live: HashSet::default(),
             new_live: Vec::new(),
+            indexed: None,
             _ticket: Some(ticket),
         };
         txn.state.begin = txn.next_id()?;
@@ -667,7 +677,7 @@ impl Graph {
     fn pack_into(&self, path: &Path) -> Result<()> {
         let src = self.read()?;
         let mut opts = EnvOpenOptions::new();
-        opts.map_size(map_size(self.size()?)).max_dbs(10);
+        opts.map_size(map_size(self.size()?)).max_dbs(11);
         // SAFETY: NO_SUB_DIR selects the single-file layout; NO_LOCK skips the lock file,
         // which is sound because this env is private to this call until it is dropped.
         unsafe { opts.flags(EnvFlags::NO_SUB_DIR | EnvFlags::NO_LOCK) };
@@ -726,6 +736,8 @@ pub struct Txn<'a> {
     /// `old_live`. In a read txn `begin` is 0 and only `old_live` is used.
     old_live: HashSet<LogId, BuildHasherDefault<IdHasher>>,
     new_live: Vec<u64>,
+    /// Keys indexed by value, loaded on this txn's first property write.
+    indexed: Option<Vec<StrId>>,
     /// Held until the LMDB txn has ended (fields drop in order); nested txns ride on
     /// their parent's.
     _ticket: Option<Ticket<'a>>,
@@ -1052,6 +1064,19 @@ impl<'a> Txn<'a> {
     /// Fails on storage errors.
     pub fn props(&self, parent: LogId, before: Option<LogId>) -> Result<impl Entries + '_> {
         self.scan(self.g.t.prop_idx, varint::pack(&[parent]), before)
+    }
+
+    /// Live properties `key = val` (interned IDs) in view `before`, by key, value, then ID.
+    ///
+    /// # Errors
+    /// Fails on storage errors.
+    pub(crate) fn props_valued(
+        &self,
+        key: StrId,
+        val: StrId,
+        before: Option<LogId>,
+    ) -> Result<impl Entries + '_> {
+        self.scan(self.g.t.val_idx, varint::pack(&[key, val]), before)
     }
 
     /// All nodes, or those of type `ty`.
@@ -1701,7 +1726,65 @@ impl<'a> Txn<'a> {
         let (key, val) = (self.intern_known(key, k0)?, self.intern_known(val, v0)?);
         let e = self.append(Record::Prop { parent, key, val }, cur.map_or(0, |c| c.id))?;
         self.put_idx(self.g.t.prop_idx, &[parent, key, e.id])?;
+        if self.indexed()?.contains(&key) {
+            self.put_idx(self.g.t.val_idx, &[key, val, e.id])?;
+        }
         Ok(e)
+    }
+
+    /// Indexes property `key` by value from now on, filling the index from the log, so
+    /// `n(key='val')` finds the holders without a projection or a scan. Each later write
+    /// of `key` adds an index entry; other keys pay nothing. A [`reset`](Self::reset)
+    /// forgets the declaration.
+    ///
+    /// # Errors
+    /// [`GraphError::ReadOnly`] in a read txn; [`GraphError::Value`] in a nested one.
+    pub fn index_values(&mut self, key: &[u8]) -> Result<()> {
+        if self.parent.is_some() {
+            return Err(GraphError::Value(
+                "index_values needs a top-level txn".into(),
+            ));
+        }
+        let key = self.intern(key)?;
+        if self.indexed_keys()?.contains(&key) {
+            return Ok(());
+        }
+        self.kv_put(INDEXED, &varint::pack(&[key]), b"")?;
+        // ponytail: scans the whole log once per declaration; fine while declarations are rare
+        let mut rows = Vec::new();
+        for e in self.log(1, None)? {
+            let e = e?;
+            if let Record::Prop { key: k, val, .. } = e.record
+                && k == key
+            {
+                rows.push([key, val, e.id]);
+            }
+        }
+        rows.sort_unstable();
+        self.put_sorted(self.g.t.val_idx, rows.iter().map(|r| &r[..]))?;
+        self.indexed = None;
+        Ok(())
+    }
+
+    /// Keys declared with [`index_values`](Self::index_values).
+    ///
+    /// # Errors
+    /// Fails on storage errors or corrupt data.
+    pub(crate) fn indexed_keys(&self) -> Result<Vec<StrId>> {
+        self.kv_iter(INDEXED, b"")?
+            .map(|kv| varint::last(kv?.0))
+            .collect()
+    }
+
+    /// [`indexed_keys`](Self::indexed_keys), cached for this txn.
+    ///
+    /// # Errors
+    /// Fails on storage errors or corrupt data.
+    fn indexed(&mut self) -> Result<&[StrId]> {
+        if self.indexed.is_none() {
+            self.indexed = Some(self.indexed_keys()?);
+        }
+        Ok(self.indexed.as_deref().unwrap_or_default())
     }
 
     /// Removes property `key` of `parent`. Returns whether it existed.
@@ -1805,18 +1888,7 @@ impl<'a> Txn<'a> {
     pub fn reset(&mut self) -> Result<()> {
         let t = self.g.t;
         let w = self.rw()?;
-        for table in [
-            t.log,
-            t.scalar,
-            t.scalar_idx,
-            t.node_idx,
-            t.edge_idx,
-            t.prop_idx,
-            t.src_idx,
-            t.tgt_idx,
-            t.txnlog,
-            t.kv,
-        ] {
+        for table in t.all() {
             table.clear(w)?;
         }
         self.state = State {
@@ -1828,6 +1900,7 @@ impl<'a> Txn<'a> {
         self.strs.clear();
         self.old_live.clear();
         self.new_live.clear();
+        self.indexed = None;
         Ok(())
     }
 
@@ -1851,6 +1924,7 @@ impl<'a> Txn<'a> {
             strs: StrCache::default(),
             old_live: HashSet::default(),
             new_live: Vec::new(),
+            indexed: None,
             _ticket: None,
         })
     }

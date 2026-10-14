@@ -85,6 +85,14 @@ fn main() -> Result<()> {
         )?;
     }
     t.commit()?;
+    let start = Instant::now();
+    let mut t = g.write()?;
+    t.index_values(b"prop2")?;
+    t.commit()?;
+    println!(
+        "index prop2      {:>8.3}s  (from the log)",
+        start.elapsed().as_secs_f64()
+    );
 
     let t = g.read()?;
     bench(&t, n)?;
