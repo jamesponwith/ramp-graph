@@ -315,10 +315,17 @@ decision carried out, the budget spent before, and the edges the step added. A s
   entities, the written edges between them);
 - or in ground truth the caller supplies (a scenario's planted signal).
 
-`wire::trace` writes it as JSON lines, one per step. The bench writes one file per
-scenario and policy with `RAMP_TRACE=dir`, and the server serves it per run. The label
-is direct: a step that fetched the way to a hit but not the hit itself gets none.
-Crediting the route as well is the first refinement once a model trains on it.
+A step is also on the **route** (`Report::route`) when its candidate leads to a hit:
+the endpoints of every hit edge and, back through the steps that discovered them, each
+entity whose fetch found the next. So a step that fetched the way to a hit, but not the
+hit itself, is labelled too.
+
+`wire::trace` writes it as JSON lines, one per step, with `hits` and `route`. Both
+benches write one file per run with `RAMP_TRACE=dir` (`benches/icij.rs` labels a
+connect run by the joining path it found, an alert run by the standing query's match),
+and the server serves it per run. On five ICIJ tasks of each kind, the route adds
+steps that only found the way: 5 of Guided's 103 connect steps beyond the 25 with
+hits, 3 of pushdown's 13 alert steps beyond the 10.
 
 ## Next
 

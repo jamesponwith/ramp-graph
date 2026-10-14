@@ -95,6 +95,42 @@ impl Report {
             .filter(|e| self.matched.contains(e) || truth.contains(e))
             .count()
     }
+
+    /// Entities on the route to a hit: the endpoints of every hit edge and, back
+    /// through the steps that discovered them, each entity whose fetch found the next.
+    /// A step whose candidate is in it led to a hit even if it fetched none itself.
+    #[must_use]
+    pub fn route<H: BuildHasher>(&self, truth: &HashSet<(Id, Id, Rel), H>) -> HashSet<Id> {
+        // The entity whose step first brought each other entity into the graph.
+        let mut found_by: HashMap<Id, Id> = HashMap::new();
+        for s in &self.trace {
+            let me = s.candidate.id;
+            for &(a, b, _) in &s.edges {
+                let other = if a == me { b } else { a };
+                if other != me {
+                    found_by.entry(other).or_insert(me);
+                }
+            }
+        }
+        let mut route = HashSet::new();
+        let hit = self
+            .trace
+            .iter()
+            .flat_map(|s| &s.edges)
+            .filter(|e| self.matched.contains(e) || truth.contains(e));
+        for &(a, b, _) in hit {
+            for mut at in [a, b] {
+                // Stops at a seed, or where an earlier hit's route already joined.
+                while route.insert(at) {
+                    match found_by.get(&at) {
+                        Some(&up) => at = up,
+                        None => break,
+                    }
+                }
+            }
+        }
+        route
+    }
 }
 
 /// What the expander knows about a discovered entity.

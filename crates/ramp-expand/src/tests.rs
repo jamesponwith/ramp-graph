@@ -280,6 +280,59 @@ fn trace_records_every_step_and_credits_hits() {
         .collect();
     assert_eq!(rows.len(), r.trace.len());
     assert!(rows.iter().any(|row| row["hits"].as_u64().unwrap() > 0));
+    // Every step with a hit is on the route (here the seed's step holds the hit).
+    let route = r.route(&truth);
+    for (row, t) in rows.iter().zip(&r.trace) {
+        assert_eq!(row["route"], route.contains(&t.candidate.id));
+        if r.hits(t, &truth) > 0 {
+            assert!(row["route"].as_bool().unwrap());
+        }
+    }
+}
+
+#[test]
+fn the_route_credits_steps_that_found_the_way() {
+    // 1 (seed) finds 2, 2 finds 3, 3 fetches the hit (3, 4); 1 also finds 5, a dead end.
+    let (w, all) = world();
+    let (r, _) = run(
+        &w,
+        scenario(&all, "alert"),
+        Guided::default(),
+        100_000,
+        Reads::Projection,
+    );
+    let template = r.trace.first().map(|t| t.candidate.clone());
+    let step = |id: Id, edges: &[(Id, Id)]| Step {
+        candidate: Candidate {
+            id,
+            ..template.clone().unwrap()
+        },
+        decision: Decision::default(),
+        before: 0,
+        edges: edges
+            .iter()
+            .map(|&(a, b)| (a.min(b), a.max(b), 0))
+            .collect(),
+    };
+    let r = Report {
+        trace: vec![
+            step(1, &[(1, 2), (1, 5)]),
+            step(5, &[(5, 6)]),
+            step(2, &[(2, 3)]),
+            step(3, &[(3, 4), (3, 1)]),
+        ],
+        ..Report::default()
+    };
+    let truth: std::collections::HashSet<_> = std::iter::once((3, 4, 0)).collect();
+    let route = r.route(&truth);
+    assert_eq!(route, [1, 2, 3, 4].into_iter().collect());
+    let credited: Vec<(Id, usize)> = r
+        .trace
+        .iter()
+        .filter(|t| route.contains(&t.candidate.id))
+        .map(|t| (t.candidate.id, r.hits(t, &truth)))
+        .collect();
+    assert_eq!(credited, [(1, 0), (2, 0), (3, 1)]);
 }
 
 #[test]

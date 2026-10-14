@@ -170,25 +170,35 @@ pub fn report(r: &Report) -> Value {
     })
 }
 
-/// One trace row: the step's candidate and decision, the edges it added, and how many
-/// of them ended up in a hit (see [`Report::hits`]).
+/// One trace row.
+///
+/// The step's candidate and decision, the edges it added, how many of them ended up in
+/// a hit (see [`Report::hits`]), and whether its candidate is on the `route` to one
+/// (see [`Report::route`]).
 #[must_use]
-pub fn step<H: BuildHasher>(r: &Report, s: &Step, truth: &HashSet<(Id, Id, Rel), H>) -> Value {
+pub fn step<H: BuildHasher, R: BuildHasher>(
+    r: &Report,
+    s: &Step,
+    truth: &HashSet<(Id, Id, Rel), H>,
+    route: &HashSet<Id, R>,
+) -> Value {
     json!({
         "before": s.before,
         "candidate": candidate(&s.candidate),
         "decision": decision(&s.decision),
         "edges": s.edges.len(),
         "hits": r.hits(s, truth),
+        "route": route.contains(&s.candidate.id),
     })
 }
 
 /// The whole trace as JSON lines.
 #[must_use]
 pub fn trace<H: BuildHasher>(r: &Report, truth: &HashSet<(Id, Id, Rel), H>) -> Vec<u8> {
+    let route = r.route(truth);
     let mut out = Vec::new();
     for s in &r.trace {
-        out.extend(step(r, s, truth).to_string().into_bytes());
+        out.extend(step(r, s, truth, &route).to_string().into_bytes());
         out.push(b'\n');
     }
     out
