@@ -329,7 +329,7 @@ hits, 3 of pushdown's 13 alert steps beyond the 10.
 
 ## Next
 
-1. **A learned policy.** Train Jev on the traces above, from both worlds.
+1. **A learned policy.** Train Jev on the traces above, from both worlds: the plan is in [`jev.md`](jev.md).
 
 Projection rebuilds no longer stall a long expansion: a graph the server opens
 rebuilds in the background (see `docs/spec.md`).
