@@ -13,9 +13,13 @@
 //!   in the whole graph, and the widest hub it crosses.
 //! - **alert:** from an officer, a co-officer (sharing an entity) from the country
 //!   rarest among them, as a standing query. Scored by edges fetched until it fires.
+//!
+//! With `RAMP_TRACE=dir`, each run's decision trace goes to
+//! `<kind>.<task>.<policy>.jsonl`, labelled by the joining path (connect) or the
+//! standing query's match (alert).
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
@@ -23,6 +27,7 @@ use ramp_expand::policy::{Bfs, Guided, Rules};
 use ramp_expand::world::{Builder, World};
 use ramp_expand::{
     Dom, Expander, Filter, Goal, Id, MAX_DOM, MAX_REL, Policy, Reads, Rel, Relation, Source, Task,
+    wire,
 };
 use ramp_graph::{Graph, GraphError, Result};
 
@@ -218,8 +223,14 @@ fn hops(w: &World, from: Id, depth: u8) -> HashMap<Id, u8> {
 }
 
 /// The path from `a` to `b` minimising the sum of `ln(1 + degree)` over the entities
-/// it passes through, over `adj` (all of `w` if `None`): its cost and its widest hub.
-fn cheapest(w: &World, adj: Option<&HashMap<Id, Vec<Id>>>, a: Id, b: Id) -> Option<(f64, u32)> {
+/// it passes through, over `adj` (all of `w` if `None`): its cost, its widest hub, and
+/// its entities from `b` back to `a`.
+fn cheapest(
+    w: &World,
+    adj: Option<&HashMap<Id, Vec<Id>>>,
+    a: Id,
+    b: Id,
+) -> Option<(f64, u32, Vec<Id>)> {
     let weight = |x: Id| f64::from(w.degree(x)).ln_1p();
     let mut best: HashMap<Id, (f64, Id)> = HashMap::from([(a, (0.0, a))]);
     let mut heap = BinaryHeap::from([(Reverse(Ord64(0.0)), a)]);
@@ -227,12 +238,15 @@ fn cheapest(w: &World, adj: Option<&HashMap<Id, Vec<Id>>>, a: Id, b: Id) -> Opti
     while let Some((Reverse(Ord64(c)), x)) = heap.pop() {
         if x == b {
             let mut widest = 0;
+            let mut path = vec![b];
             let mut at = best.get(&b)?.1;
             while at != a {
                 widest = widest.max(w.degree(at));
+                path.push(at);
                 at = best.get(&at)?.1;
             }
-            return Some((c, widest));
+            path.push(a);
+            return Some((c, widest, path));
         }
         if best.get(&x).is_some_and(|&(k, _)| k < c) {
             continue;
@@ -306,10 +320,10 @@ fn connect_tasks(w: &World, n: usize, rng: &mut Rng, budget: u64) -> Vec<(Task, 
         let Some(&b) = far.get(rng.below(far.len())) else {
             continue;
         };
-        if let Some(best) = cheapest(w, None, a, b) {
+        if let Some((cost, hub, _)) = cheapest(w, None, a, b) {
             out.push((
                 task(vec![a, b], Goal::Connect, [1.0; MAX_REL], budget),
-                best,
+                (cost, hub),
             ));
         }
     }
@@ -404,14 +418,16 @@ fn percentile(v: &[f64], pct: usize) -> f64 {
 /// path's cost and widest hub.
 type Outcome = (Option<u64>, Option<(f64, u32)>);
 
-/// Runs `task` with policy `policy`.
+/// Runs `task` with policy `policy`, writing its trace as `<label>.jsonl` under
+/// `RAMP_TRACE` if set.
 ///
 /// # Errors
 /// Storage errors.
-fn run(world: &World, task: &Task, policy: Box<dyn Policy>) -> Result<Outcome> {
+fn run(world: &World, task: &Task, policy: Box<dyn Policy>, label: &str) -> Result<Outcome> {
     let dir = tempfile::tempdir().map_err(io)?;
     let graph = Graph::open(dir.path().join("g.db"))?;
     let mut path = None;
+    let mut truth = HashSet::new();
     let ex = Expander::new(world, &graph, policy, task.clone(), Reads::Projection)?;
     let report = ex.run(|ex| {
         let [from, to] = task.seeds[..] else {
@@ -425,9 +441,36 @@ fn run(world: &World, task: &Task, policy: Box<dyn Policy>) -> Result<Outcome> {
             adj.entry(x).or_default().push(y);
             adj.entry(y).or_default().push(x);
         }
-        path = cheapest(world, Some(&adj), from, to);
+        path = cheapest(world, Some(&adj), from, to).map(|(cost, hub, on)| {
+            let pairs: HashSet<(Id, Id)> = on
+                .windows(2)
+                .filter_map(|p| match *p {
+                    [x, y] => Some((x.min(y), x.max(y))),
+                    _ => None,
+                })
+                .collect();
+            truth = ex
+                .edges()
+                .filter(|&&(x, y, _)| pairs.contains(&(x, y)))
+                .copied()
+                .collect();
+            (cost, hub)
+        });
         true
     })?;
+    if let Some(out) = std::env::var_os("RAMP_TRACE") {
+        let file: String = format!("{label}.jsonl")
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "-.".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        std::fs::write(Path::new(&out).join(file), wire::trace(&report, &truth)).map_err(io)?;
+    }
     let done = if task.goal == Goal::Alert {
         report.alert_at
     } else {
@@ -467,8 +510,9 @@ fn connect(world: &World, tasks: &[(Task, (f64, u32))]) -> Result<()> {
     for (i, policy) in policies(3, false).iter().enumerate() {
         let (mut solved, mut fetched, mut ratio, mut widest) =
             (0_usize, Vec::new(), Vec::new(), Vec::new());
-        for (task, (best, _)) in tasks {
-            let (done, path) = run(world, task, nth(i, 3, false)?)?;
+        for (t, (task, (best, _))) in tasks.iter().enumerate() {
+            let label = format!("connect.{t}.{}", policy.name());
+            let (done, path) = run(world, task, nth(i, 3, false)?, &label)?;
             fetched.push(done.map_or(f64::INFINITY, float));
             if let (Some(_), Some((cost, hub))) = (done, path) {
                 solved += 1;
@@ -507,8 +551,9 @@ fn alert(world: &World, tasks: &[Task]) -> Result<()> {
     );
     for (i, policy) in policies(2, true).iter().enumerate() {
         let (mut solved, mut fetched) = (0_usize, Vec::new());
-        for task in tasks {
-            let (done, _) = run(world, task, nth(i, 2, true)?)?;
+        for (t, task) in tasks.iter().enumerate() {
+            let label = format!("alert.{t}.{}", policy.name());
+            let (done, _) = run(world, task, nth(i, 2, true)?, &label)?;
             solved += usize::from(done.is_some());
             fetched.push(done.map_or(f64::INFINITY, float));
         }
