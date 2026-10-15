@@ -431,6 +431,22 @@ const fn task(
     }
 }
 
+/// The connect task between officers `a` and `b`, with the cost and widest hub of the
+/// cheapest path between them; `None` if there is none.
+#[must_use]
+pub fn connect_task(w: &World, a: Id, b: Id, budget: u64) -> Option<(Task, (f64, u32))> {
+    let (cost, hub, _) = cheapest(w, |x, out| neighbours(w, x, out), a, b)?;
+    let prompt = format!(
+        "How is the officer {} connected to the officer {}? Find the most specific link, \
+         through companies, people and addresses particular to them rather than mass \
+         registration agents or shared addresses.",
+        name(w, a),
+        name(w, b)
+    );
+    let t = task(prompt, vec![a, b], Goal::Connect, [1.0; MAX_REL], budget);
+    Some((t, (cost, hub)))
+}
+
 /// Connect tasks: officer pairs 4 to 6 hops apart, with their cheapest path.
 pub fn connect_tasks(w: &World, n: usize, rng: &mut Rng, budget: u64) -> Vec<(Task, (f64, u32))> {
     let officers = officers(w);
@@ -448,86 +464,107 @@ pub fn connect_tasks(w: &World, n: usize, rng: &mut Rng, budget: u64) -> Vec<(Ta
         let Some(&b) = far.get(rng.below(far.len())) else {
             continue;
         };
-        if let Some((cost, hub, _)) = cheapest(w, |x, out| neighbours(w, x, out), a, b) {
-            out.push((
-                task(
-                    format!(
-                        "How is the officer {} connected to the officer {}? Find the most \
-                         specific link, through companies, people and addresses particular \
-                         to them rather than mass registration agents or shared addresses.",
-                        name(w, a),
-                        name(w, b)
-                    ),
-                    vec![a, b],
-                    Goal::Connect,
-                    [1.0; MAX_REL],
-                    budget,
-                ),
-                (cost, hub),
-            ));
-        }
+        out.extend(connect_task(w, a, b, budget));
     }
     out
 }
 
-/// Alert tasks: from an officer with at least 50 co-officers, one from the country
-/// rarest among them (and not the seed's own).
-pub fn alert_tasks(w: &World, n: usize, rng: &mut Rng, budget: u64) -> Vec<Task> {
-    let officers = officers(w);
+/// The alert task from officer `s`: a co-officer (sharing an entity) from the country
+/// rarest among them, not `s`'s own. `None` if `s` has fewer than 50 co-officers with
+/// a country.
+#[must_use]
+pub fn alert_task(w: &World, s: Id, budget: u64) -> Option<Task> {
     let country = |x: Id| {
         let mut a = Vec::new();
         w.attrs(x, &mut a);
         a.into_iter().find(|(k, _)| *k == "country").map(|(_, v)| v)
     };
-    let (mut out, mut entities, mut co) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut entities, mut co) = (Vec::new(), Vec::new());
+    w.fetch(s, OFFICER_OF, 0, u32::MAX, &mut entities);
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for &e in &entities {
+        co.clear();
+        w.fetch(e, OFFICER_OF, 0, u32::MAX, &mut co);
+        for &o in co.iter().filter(|&&o| o != s) {
+            if let Some(c) = country(o) {
+                *counts.entry(c).or_default() += 1;
+            }
+        }
+    }
+    if counts.values().sum::<u32>() < 50 {
+        return None;
+    }
+    let own = country(s);
+    let (rare, _) = counts
+        .into_iter()
+        .filter(|(c, _)| Some(c) != own.as_ref())
+        .min_by(|x, y| x.1.cmp(&y.1).then_with(|| x.0.cmp(&y.0)))?;
+    let mut interest = [0.2; MAX_REL];
+    if let Some(i) = interest.get_mut(usize::from(OFFICER_OF)) {
+        *i = 1.0;
+    }
+    let prompt = format!(
+        "Alert when the officer {} shares a company with an officer from {rare}.",
+        name(w, s)
+    );
+    let mut t = task(prompt, vec![s], Goal::Alert, interest, budget);
+    t.standing = vec![format!(
+        "n(type='officer', value='{s}')-n(type='entity')-n(type='officer', country='{}')",
+        rare.replace('\'', "\\'")
+    )];
+    t.shape = vec![vec![OFFICER, ENTITY, OFFICER]];
+    t.target = Some(Filter::Attr {
+        key: "country".to_owned(),
+        value: rare,
+    });
+    Some(t)
+}
+
+/// Alert tasks ([`alert_task`]) from randomly chosen officers.
+pub fn alert_tasks(w: &World, n: usize, rng: &mut Rng, budget: u64) -> Vec<Task> {
+    let officers = officers(w);
+    let mut out = Vec::new();
     let mut tries = 0;
     while out.len() < n && tries < 1_000_000 {
         tries += 1;
         let Some(&s) = officers.get(rng.below(officers.len())) else {
             break;
         };
-        entities.clear();
-        w.fetch(s, OFFICER_OF, 0, u32::MAX, &mut entities);
-        let mut counts: HashMap<String, u32> = HashMap::new();
-        for &e in &entities {
-            co.clear();
-            w.fetch(e, OFFICER_OF, 0, u32::MAX, &mut co);
-            for &o in co.iter().filter(|&&o| o != s) {
-                if let Some(c) = country(o) {
-                    *counts.entry(c).or_default() += 1;
-                }
-            }
-        }
-        if counts.values().sum::<u32>() < 50 {
-            continue;
-        }
-        let own = country(s);
-        let Some((rare, _)) = counts
-            .into_iter()
-            .filter(|(c, _)| Some(c) != own.as_ref())
-            .min_by(|x, y| x.1.cmp(&y.1).then_with(|| x.0.cmp(&y.0)))
-        else {
-            continue;
-        };
-        let mut interest = [0.2; MAX_REL];
-        if let Some(i) = interest.get_mut(usize::from(OFFICER_OF)) {
-            *i = 1.0;
-        }
-        let prompt = format!(
-            "Alert when the officer {} shares a company with an officer from {rare}.",
-            name(w, s)
-        );
-        let mut t = task(prompt, vec![s], Goal::Alert, interest, budget);
-        t.standing = vec![format!(
-            "n(type='officer', value='{s}')-n(type='entity')-n(type='officer', country='{}')",
-            rare.replace('\'', "\\'")
-        )];
-        t.shape = vec![vec![OFFICER, ENTITY, OFFICER]];
-        t.target = Some(Filter::Attr {
-            key: "country".to_owned(),
-            value: rare,
-        });
-        out.push(t);
+        out.extend(alert_task(w, s, budget));
     }
     out
+}
+
+/// A path's cost and widest hub (as in [`cheapest`]), and its edges as `(min, max,
+/// rel)`.
+pub type Joined = (f64, u32, HashSet<(Id, Id, Rel)>);
+
+/// The cheapest path between `from` and `to` over the edges written so far (degrees
+/// in `w`).
+pub fn joining<'e>(
+    w: &World,
+    written: impl Iterator<Item = &'e (Id, Id, Rel)>,
+    from: Id,
+    to: Id,
+) -> Option<Joined> {
+    let written: Vec<(Id, Id, Rel)> = written.copied().collect();
+    let mut adj: HashMap<Id, Vec<Id>> = HashMap::new();
+    for &(x, y, _) in &written {
+        adj.entry(x).or_default().push(y);
+        adj.entry(y).or_default().push(x);
+    }
+    let known = |x: Id, out: &mut Vec<Id>| out.extend(adj.get(&x).into_iter().flatten());
+    let (cost, hub, on) = cheapest(w, known, from, to)?;
+    let pairs: HashSet<(Id, Id)> = on
+        .windows(2)
+        .filter_map(|p| match *p {
+            [x, y] => Some((x.min(y), x.max(y))),
+            _ => None,
+        })
+        .collect();
+    let edges = written
+        .into_iter()
+        .filter(|&(x, y, _)| pairs.contains(&(x, y)))
+        .collect();
+    Some((cost, hub, edges))
 }

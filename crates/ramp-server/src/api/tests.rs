@@ -721,3 +721,76 @@ fn an_absent_client_stops_the_run() {
     assert_eq!(t.post("/expand", json!({"scenario": "nope"})).status, 400);
     assert_eq!(t.post("/expand", json!({"policy": "nope"})).status, 400);
 }
+
+#[test]
+fn a_client_steers_an_icij_expansion() {
+    let mut t = server();
+    assert_eq!(
+        t.post("/expand", json!({"world": "icij", "seeds": [1, 2]}))
+            .status,
+        400,
+        "no ICIJ data"
+    );
+    let csvs = tempfile::tempdir().unwrap();
+    let data = csvs.path().to_owned();
+    for (name, body) in [
+        ("nodes-entities.csv", "node_id,name\n10,ACME LTD.\n"),
+        (
+            "nodes-officers.csv",
+            "node_id,name,country_codes\n20,KIM SOO IN,KOR\n21,Tian Yuan,CHN\n",
+        ),
+        ("nodes-intermediaries.csv", "node_id,name\n"),
+        ("nodes-addresses.csv", "node_id,address\n"),
+        ("nodes-others.csv", "node_id,name\n"),
+        (
+            "relationships.csv",
+            "node_id_start,node_id_end,rel_type,link\n20,10,officer_of,director of\n21,10,officer_of,shareholder of\n",
+        ),
+    ] {
+        std::fs::write(data.join(name), body).unwrap();
+    }
+    t.store.expansions.icij_dir = Some(data);
+    let bad = t.post(
+        "/expand",
+        json!({"world": "icij", "goal": "alert", "seeds": [1]}),
+    );
+    assert_eq!(bad.status, 400, "{}", bad.body);
+    let r = t.post("/expand", json!({"world": "icij", "seeds": [1, 2]}));
+    assert_eq!(r.status, 201, "{}", r.body);
+    let (id, task) = (
+        r.body["id"].as_str().unwrap().to_owned(),
+        r.body["task"].clone(),
+    );
+    assert!(
+        task["prompt"].as_str().unwrap().contains("KIM SOO IN"),
+        "{task}"
+    );
+    let mut texts = Vec::new();
+    let report = loop {
+        let r = t.get(&format!("/expand/{id}?wait=10"));
+        match r.body["state"].as_str().unwrap() {
+            "ask" => {
+                texts.extend(
+                    r.body["candidates"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|c| c["text"].clone()),
+                );
+                let a = t.post(&format!("/expand/{id}"), decide(&task, &r.body));
+                assert_eq!(a.status, 204, "{}", a.body);
+            }
+            "done" => break r.body["report"].clone(),
+            "running" => {}
+            other => panic!("state {other}"),
+        }
+    };
+    assert!(
+        texts.iter().any(|t| t
+            .as_str()
+            .is_some_and(|t| t.starts_with("officer name: KIM"))),
+        "{texts:?}"
+    );
+    assert!(report["connected_at"].is_u64(), "{report}");
+    assert_eq!(report["path"]["best"], report["path"]["cost"], "{report}");
+}

@@ -16,15 +16,16 @@
 //! standing query's match (alert). With `RAMP_BATCHES=dir`, every policy call goes to
 //! the same name, each candidate labelled by an oracle that sees the whole graph:
 //! [`near_cheapest`] for connect, [`shared_with_target`] for alert. Every candidate's
-//! text goes to `entities.jsonl` there.
+//! text goes to `entities.jsonl` there, and every task (prompt and seeds, under its
+//! `<kind>.<task>` run name) to `tasks.jsonl`.
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
 use ramp_expand::icij::{
-    DOMAINS, alert_tasks, cheapest, connect_tasks, load, near_cheapest, shared_with_target,
+    DOMAINS, alert_tasks, connect_tasks, joining, load, near_cheapest, shared_with_target,
 };
 use ramp_expand::policy::{Bfs, Guided, Rules};
 use ramp_expand::world::{Rng, World};
@@ -94,25 +95,8 @@ fn run(
         if !ex.connected(from, to) {
             return false;
         }
-        let mut adj: HashMap<Id, Vec<Id>> = HashMap::new();
-        for &(x, y, _) in ex.edges() {
-            adj.entry(x).or_default().push(y);
-            adj.entry(y).or_default().push(x);
-        }
-        let known = |x: Id, out: &mut Vec<Id>| out.extend(adj.get(&x).into_iter().flatten());
-        path = cheapest(world, known, from, to).map(|(cost, hub, on)| {
-            let pairs: HashSet<(Id, Id)> = on
-                .windows(2)
-                .filter_map(|p| match *p {
-                    [x, y] => Some((x.min(y), x.max(y))),
-                    _ => None,
-                })
-                .collect();
-            truth = ex
-                .edges()
-                .filter(|&&(x, y, _)| pairs.contains(&(x, y)))
-                .copied()
-                .collect();
+        path = joining(world, ex.edges(), from, to).map(|(cost, hub, edges)| {
+            truth = edges;
             (cost, hub)
         });
         true
@@ -287,13 +271,24 @@ fn main() -> Result<()> {
     );
     println!("budget: {budget} fetched edges per run, {n} tasks per kind\n");
     let mut rng = Rng::new(7);
+    let connects = connect_tasks(&world, n, &mut rng, budget);
+    let alerts = alert_tasks(&world, n, &mut rng, budget);
+    if let Some(out) = std::env::var_os("RAMP_BATCHES") {
+        let all = (connects.iter().map(|(t, _)| ("connect", t)))
+            .zip(0..)
+            .chain(alerts.iter().map(|t| ("alert", t)).zip(0..));
+        let mut rows = Vec::new();
+        for ((kind, task), i) in all {
+            let row =
+                serde_json::json!({"run": format!("{kind}.{i}"), "task": wire::task(task, &world)});
+            rows.extend(row.to_string().into_bytes());
+            rows.push(b'\n');
+        }
+        std::fs::write(Path::new(&out).join("tasks.jsonl"), rows).map_err(io)?;
+    }
     let mut seen = HashSet::new();
-    connect(
-        &world,
-        &connect_tasks(&world, n, &mut rng, budget),
-        &mut seen,
-    )?;
-    alert(&world, &alert_tasks(&world, n, &mut rng, budget), &mut seen)?;
+    connect(&world, &connects, &mut seen)?;
+    alert(&world, &alerts, &mut seen)?;
     if let Some(out) = std::env::var_os("RAMP_BATCHES") {
         let mut ids: Vec<Id> = seen.into_iter().collect();
         ids.sort_unstable();

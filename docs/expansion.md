@@ -291,8 +291,8 @@ client pulls work and needs no server of its own. The JSON is `ramp_expand::wire
 
 | request | does |
 |---|---|
-| `POST /expand` | starts a run: `{"scenario", "policy"?, "budget"?, "entities"?, "seed"?, "cap"?, "timeout"?, "parallel"?, "spread"?}`. Returns `{"id", "graph", "task"}`: the task with domain and relation names, and a new graph of the collection the run writes into |
-| `GET /expand/<id>?wait=s` | long-polls (default 25 s): `{"state": "ask", "seq", "context", "candidates"}`, `{"state": "done", "report"}`, or `{"state": "running"}` |
+| `POST /expand` | starts a run: `{"world"?, "policy"?, "budget"?, "cap"?, "timeout"?, "parallel"?, "spread"?}` plus, for the synthetic world (the default), `{"scenario", "entities"?, "seed"?}`, or for `"world": "icij"`, `{"goal": "connect", "seeds": [a, b]}` or `{"goal": "alert", "seeds": [s]}`. Returns `{"id", "graph", "task"}`: the task with its prompt and domain and relation names, and a new graph of the collection the run writes into |
+| `GET /expand/<id>?wait=s` | long-polls (default 25 s): `{"state": "ask", "seq", "context", "candidates"}` (each with its `text`, if any), `{"state": "done", "report"}`, or `{"state": "running"}` |
 | `POST /expand/<id>` | `{"seq", "decisions": [{"priority", "take": [{"rel", "limit", "filter"?}]}]}`, one per candidate; 409 for a batch that is not open, 400 for the wrong count |
 | `GET /expand/<id>/trace` | the labelled decision trace, JSON lines, once done |
 | `DELETE /expand/<id>` | stops and forgets the run; its graph stays |
@@ -305,9 +305,13 @@ client pulls work and needs no server of its own. The JSON is `ramp_expand::wire
 - **The graph is ordinary.** While the run writes, the client can query it with LGQL,
   run its own standing queries from a log position (`GET /graph/<uuid>?q=...&start=n`),
   and probe what a candidate's neighbourhood looks like before deciding.
-- **The world is the synthetic one** with its planted scenarios. That is a gym: ground
-  truth is known, so traces are labelled. A real source behind the same endpoint is
-  what the "real dataset" item below needs.
+- **Two worlds.** The synthetic one, with its planted scenarios, is a gym: ground truth
+  is known, so traces are labelled. ICIJ is real: a server started with `-x dir` (the
+  CSVs) loads it on the first ICIJ run (≈11 s, then shared by every run). Its seeds are
+  entity IDs as `ramp_expand::icij` numbers them, the same as the bench's
+  `tasks.jsonl`. A connect run stops when the seeds are joined; its report adds the
+  joining path (`{"cost", "widest", "best"}`) and its trace is labelled by it. An alert
+  run stops when its standing query fires.
 
 ### The decision trace
 
@@ -355,8 +359,11 @@ officer name: HANTEC INVESTMENT HOLDINGS LIMITED; countries: Hong Kong; sourceID
 Panama Papers; links: shareholder of, registered address
 ```
 
-Its tasks carry prompts with the seeds' names ("How is the officer KIM SOO IN
-connected to the officer ...? Find the most specific link ..."), as do the scenarios.
+The 200-task dataset has 334k distinct entities, with a median of 245 characters of
+text (p90 519): about 24M input tokens for one pass of Jev over all of them. Its tasks,
+in `tasks.jsonl`, carry prompts with the seeds' names ("How is the officer Paul Qiu connected to
+the officer FAITH WIN DEVELOPMENT LIMITED? Find the most specific link ..."), as do the
+scenarios.
 
 `benches/icij.rs -- DIR 200` (200 tasks per kind, every policy, 820 MB of JSON lines):
 
