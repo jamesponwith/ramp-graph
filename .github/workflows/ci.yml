@@ -42,7 +42,7 @@ jobs:
         working-directory: jev
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0
       - run: uvx ruff format --check src tests
       - run: uvx ruff check src tests
       - run: uv run --locked pytest -q
