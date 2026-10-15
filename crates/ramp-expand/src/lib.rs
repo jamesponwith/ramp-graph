@@ -35,7 +35,7 @@ pub mod scenario;
 pub mod wire;
 pub mod world;
 
-pub use expand::{Expander, Reads, Report, Step};
+pub use expand::{Batch, Expander, Reads, Report, Step};
 
 /// A world entity's ID in a [`Source`].
 pub type Id = u64;

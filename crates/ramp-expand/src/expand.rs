@@ -70,6 +70,20 @@ pub struct Report {
     pub trace: Vec<Step>,
     /// Edges, as `(min, max, rel)`, that are part of a standing-query match.
     pub matched: HashSet<(Id, Id, Rel)>,
+    /// Every policy call, if [`Expander::log_batches`] is on: what a ranker learns
+    /// from, since a step records only the candidate that was expanded.
+    pub batches: Vec<Batch>,
+}
+
+/// One policy call: every candidate it chose between, and its decisions, in order.
+#[derive(Debug, Clone)]
+pub struct Batch {
+    /// What had been spent (its `relations` left empty).
+    pub context: Context<'static>,
+    /// The candidates, as the policy saw them.
+    pub candidates: Vec<Candidate>,
+    /// One decision per candidate.
+    pub decisions: Vec<Decision>,
 }
 
 /// One expansion step: what the policy saw, what it chose, and what came of it.
@@ -275,6 +289,8 @@ pub struct Expander<'a, S, P> {
     reads: Reads,
     /// Steps fetched concurrently per round.
     parallel: usize,
+    /// Whether to keep every policy call in [`Report::batches`].
+    log_batches: bool,
     known: HashMap<Id, Known>,
     by_log: HashMap<LogId, Id>,
     heap: BinaryHeap<Item>,
@@ -304,7 +320,7 @@ fn find(uf: &[usize], x: usize) -> usize {
 }
 
 impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
-    /// Writes the task's seeds into `graph` and scores them.
+    /// Writes the task's seeds into `graph`; [`run`](Self::run) scores them.
     ///
     /// # Errors
     /// Fails on storage errors or a standing query that does not parse.
@@ -328,6 +344,7 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
             task,
             reads,
             parallel: 1,
+            log_batches: false,
             known: HashMap::new(),
             by_log: HashMap::new(),
             heap: BinaryHeap::new(),
@@ -354,7 +371,6 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
             }
         }
         t.commit()?;
-        ex.rescore(seeds);
         Ok(ex)
     }
 
@@ -365,6 +381,13 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
     #[must_use]
     pub fn parallel(mut self, k: usize) -> Self {
         self.parallel = k.max(1);
+        self
+    }
+
+    /// Keeps every policy call in [`Report::batches`].
+    #[must_use]
+    pub const fn log_batches(mut self) -> Self {
+        self.log_batches = true;
         self
     }
 
@@ -400,6 +423,7 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
     /// # Errors
     /// Fails on storage errors.
     pub fn run(mut self, mut stop: impl FnMut(&Self) -> bool) -> Result<Report> {
+        self.rescore(self.task.seeds.clone());
         while self.step()? {
             if stop(&self) {
                 self.report.done_at = Some(self.report.fetched);
@@ -503,11 +527,7 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
         if batch.is_empty() {
             return;
         }
-        let started = Instant::now();
-        let mut out = Vec::with_capacity(batch.len());
-        self.policy.decide(&self.task, &self.ctx, &batch, &mut out);
-        self.report.policy += started.elapsed();
-        self.report.decisions += u64::try_from(batch.len()).unwrap_or(u64::MAX);
+        let out = self.decide(&batch);
         for (c, d) in batch.iter().zip(out) {
             if let Some(k) = self.known.get_mut(&c.id) {
                 k.version += 1;
@@ -524,6 +544,26 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
                 }
             }
         }
+    }
+
+    /// Asks the policy about `batch`, logging the call if asked to.
+    fn decide(&mut self, batch: &[Candidate]) -> Vec<Decision> {
+        let started = Instant::now();
+        let mut out = Vec::with_capacity(batch.len());
+        self.policy.decide(&self.task, &self.ctx, batch, &mut out);
+        self.report.policy += started.elapsed();
+        self.report.decisions += u64::try_from(batch.len()).unwrap_or(u64::MAX);
+        if self.log_batches {
+            self.report.batches.push(Batch {
+                context: Context {
+                    relations: &[],
+                    ..self.ctx
+                },
+                candidates: batch.to_vec(),
+                decisions: out.clone(),
+            });
+        }
+        out
     }
 
     /// Runs the probes rooted at `id`, returning their total matches.
@@ -573,13 +613,10 @@ impl<'a, S: Source, P: Policy> Expander<'a, S, P> {
                     continue;
                 };
                 c.probes = Some(hits);
-                let started = Instant::now();
-                let mut out = Vec::with_capacity(1);
-                self.policy
-                    .decide(&self.task, &self.ctx, std::slice::from_ref(&c), &mut out);
-                self.report.policy += started.elapsed();
-                self.report.decisions += 1;
-                let d = out.pop().unwrap_or_default();
+                let d = self
+                    .decide(std::slice::from_ref(&c))
+                    .pop()
+                    .unwrap_or_default();
                 let next = self.heap.peek().map_or(f64::NEG_INFINITY, |i| i.priority);
                 if let Some(k) = self.known.get_mut(&item.id) {
                     k.probes = Some(hits);

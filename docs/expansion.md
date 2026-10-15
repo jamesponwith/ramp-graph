@@ -327,6 +327,35 @@ and the server serves it per run. On five ICIJ tasks of each kind, the route add
 steps that only found the way: 5 of Guided's 103 connect steps beyond the 25 with
 hits, 3 of pushdown's 13 alert steps beyond the 10.
 
+### Decision batches
+
+A step records only the candidate that was expanded; a ranker learns from what it was
+chosen over. With `Expander::log_batches`, `Report::batches` keeps every policy call:
+the context, every candidate offered, and the decisions. `wire::batches` writes one
+JSON line per call, each candidate with an oracle `label` from the caller. Both benches
+write them with `RAMP_BATCHES=dir`, labelled by an oracle that sees the whole graph:
+- **synthetic:** an endpoint of a planted signal edge;
+- **ICIJ connect:** a seed, or on a path between the seeds costing at most 1.1× the
+  cheapest (two bounded Dijkstras);
+- **ICIJ alert:** the seed, an entity it shares with an officer from the target
+  country, or such an officer.
+
+`benches/icij.rs -- DIR 200` (200 tasks per kind, every policy, 820 MB of JSON lines):
+
+| kind | policy | batches | candidates | positive |
+|---|---|---|---|---|
+| connect | bfs | 80,923 | 1,167,264 | 2.8% |
+| connect | rules (3 caps) | 59,112 | 794,779 | 1.1% |
+| connect | guided | 30,318 | 228,310 | 2.4% |
+| alert | bfs | 1,143 | 41,241 | 3.9% |
+| alert | rules (3 caps) | 3,156 | 80,857 | 4.8% |
+| alert | guided | 1,397 | 42,521 | 3.8% |
+| alert | guided+pushdown | 717 | 2,370 | 95.4% |
+
+The synthetic scenarios give 2.1M candidates from five tasks, of which 293 are positive
+(a planted signal is a handful of entities in a 2M-entity world). They are a check,
+not a training set: the ranker trains on ICIJ.
+
 ## Next
 
 1. **A learned policy.** Train Jev on the traces above, from both worlds: the plan is in [`jev.md`](jev.md).

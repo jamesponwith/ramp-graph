@@ -423,3 +423,48 @@ fn a_loaded_world_serves_its_own_schema() {
         .unwrap();
     assert_eq!(out, [other]);
 }
+
+#[test]
+fn logged_batches_hold_every_decision_and_label_candidates() {
+    let (w, all) = world();
+    let s = scenario(&all, "alert");
+    let dir = tempfile::tempdir().unwrap();
+    let g = Graph::open(dir.path().join("g.db")).unwrap();
+    let mut task = s.task.clone();
+    task.budget = 100_000;
+    let r = Expander::new(&w, &g, Guided::default(), task, Reads::Projection)
+        .unwrap()
+        .log_batches()
+        .run(|_| false)
+        .unwrap();
+    let offered: usize = r.batches.iter().map(|b| b.candidates.len()).sum();
+    assert_eq!(u64::try_from(offered).unwrap(), r.decisions);
+    assert!(
+        r.batches
+            .iter()
+            .all(|b| b.candidates.len() == b.decisions.len())
+    );
+    let ids: std::collections::HashSet<Id> = r
+        .batches
+        .iter()
+        .flat_map(|b| b.candidates.iter().map(|c| c.id))
+        .collect();
+    assert!(r.trace.iter().all(|t| ids.contains(&t.candidate.id)));
+
+    let seed = s.task.seeds[0];
+    let lines = wire::batches(&r, |c| c.id == seed);
+    let rows: Vec<serde_json::Value> = lines
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_slice(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), r.batches.len());
+    let labels = |v: &serde_json::Value| v["label"].as_bool().unwrap();
+    let first = rows[0]["candidates"].as_array().unwrap();
+    assert!(first.iter().any(labels));
+    assert_eq!(rows[0]["decisions"].as_array().unwrap().len(), first.len());
+
+    // Off by default.
+    let (r, _) = run(&w, s, Guided::default(), 10_000, Reads::Projection);
+    assert!(r.batches.is_empty());
+}
