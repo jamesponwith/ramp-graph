@@ -1,0 +1,16 @@
+[project]
+name = "jev"
+version = "0.1.0"
+description = "A learned expansion policy around Jev (docs/jev.md)"
+requires-python = ">=3.12"
+dependencies = ["catboost>=1.2.10", "numpy>=2.5.4"]
+
+[build-system]
+requires = ["uv_build>=0.12.20,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["pytest>=9.1.1"]
+
+[tool.ruff]
+line-length = 100

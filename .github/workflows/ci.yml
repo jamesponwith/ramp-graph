@@ -34,3 +34,15 @@ jobs:
       - run: just ci
         env:
           NEXTEST_PROFILE: ci
+
+  jev:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: jev
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+      - run: uvx ruff format --check src tests
+      - run: uvx ruff check src tests
+      - run: uv run --locked pytest -q
