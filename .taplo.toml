@@ -1,4 +1,4 @@
-exclude = ["reference/**", "target/**"]
+exclude = ["reference/**", "target/**", "**/.venv/**"]
 
 [formatting]
 column_width = 100
