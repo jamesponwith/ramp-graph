@@ -3,7 +3,9 @@
 //! `cargo bench -p ramp-expand --bench expand [-- N [BUDGET]]` (N = 2,000,000 world
 //! entities, BUDGET = 400,000 fetched edges per run). With `RAMP_TRACE=dir`, each run's
 //! decision trace is written to `dir/<scenario>.<policy>.jsonl`, labelled with the
-//! scenario's planted signal: training data for a learned policy.
+//! scenario's planted signal: training data for a learned policy. With
+//! `RAMP_BATCHES=dir`, every policy call goes to the same name, each candidate labelled
+//! by whether it is an endpoint of a planted signal edge.
 
 use std::time::{Duration, Instant};
 
@@ -49,7 +51,11 @@ fn run_k(
     task.budget = budget;
     let mut recovered = 0;
     let name = policy.name();
-    let ex = Expander::new(world, &g, policy, task, reads)?.parallel(k);
+    let mut ex = Expander::new(world, &g, policy, task, reads)?.parallel(k);
+    let batches = std::env::var_os("RAMP_BATCHES");
+    if batches.is_some() {
+        ex = ex.log_batches();
+    }
     let report = ex.run(|ex| {
         recovered = s
             .signal
@@ -58,25 +64,34 @@ fn run_k(
             .count();
         !s.signal.is_empty() && recovered == s.signal.len()
     })?;
+    let file: String = format!("{}.{name}.jsonl", s.name)
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-.".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
     if let Some(dir) = std::env::var_os("RAMP_TRACE") {
         let truth: std::collections::HashSet<_> = s
             .signal
             .iter()
             .map(|&(a, b, r)| (a.min(b), a.max(b), r))
             .collect();
-        let file: String = format!("{}.{name}.jsonl", s.name)
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || "-.".contains(c) {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
         std::fs::write(
-            std::path::Path::new(&dir).join(file),
+            std::path::Path::new(&dir).join(&file),
             wire::trace(&report, &truth),
+        )
+        .map_err(|e| GraphError::Io(e.to_string()))?;
+    }
+    if let Some(dir) = batches {
+        let on =
+            |c: &ramp_expand::Candidate| s.signal.iter().any(|&(a, b, _)| c.id == a || c.id == b);
+        std::fs::write(
+            std::path::Path::new(&dir).join(&file),
+            wire::batches(&report, on),
         )
         .map_err(|e| GraphError::Io(e.to_string()))?;
     }

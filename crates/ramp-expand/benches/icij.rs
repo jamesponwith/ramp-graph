@@ -16,7 +16,12 @@
 //!
 //! With `RAMP_TRACE=dir`, each run's decision trace goes to
 //! `<kind>.<task>.<policy>.jsonl`, labelled by the joining path (connect) or the
-//! standing query's match (alert).
+//! standing query's match (alert). With `RAMP_BATCHES=dir`, every policy call goes to
+//! the same name, each candidate labelled by an oracle that sees the whole graph:
+//! - **connect:** a seed, or on a path between the seeds costing at most
+//!   `1 + EPS` times the cheapest.
+//! - **alert:** the seed, an entity it shares with an officer from the target country,
+//!   or such an officer.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -270,6 +275,79 @@ fn cheapest(
     None
 }
 
+/// How much dearer than the cheapest a path may be and still label its entities.
+const EPS: f64 = 0.1;
+
+/// The cost of the cheapest path from `from` to everything it reaches for at most
+/// `bound`, counted as in [`cheapest`]: the entities passed through, not the ends.
+fn within(w: &World, from: Id, bound: f64) -> HashMap<Id, f64> {
+    let mut best: HashMap<Id, f64> = HashMap::from([(from, 0.0)]);
+    let mut heap = BinaryHeap::from([(Reverse(Ord64(0.0)), from)]);
+    let mut buf = Vec::new();
+    while let Some((Reverse(Ord64(c)), x)) = heap.pop() {
+        if best.get(&x).is_some_and(|&k| k < c) {
+            continue;
+        }
+        let k = c + if x == from {
+            0.0
+        } else {
+            f64::from(w.degree(x)).ln_1p()
+        };
+        if k > bound {
+            continue;
+        }
+        neighbours(w, x, &mut buf);
+        for &y in &buf {
+            if best.get(&y).is_none_or(|&old| k < old) {
+                best.insert(y, k);
+                heap.push((Reverse(Ord64(k)), y));
+            }
+        }
+    }
+    best
+}
+
+/// The connect oracle: the seeds, and every entity on a path between them costing at
+/// most `1 + EPS` times the cheapest, `best`.
+fn near_cheapest(w: &World, a: Id, b: Id, best: f64) -> HashSet<Id> {
+    let bound = best.mul_add(1.0 + EPS, 1e-9);
+    let (from_a, from_b) = (within(w, a, bound), within(w, b, bound));
+    let mut out: HashSet<Id> = from_a
+        .iter()
+        .filter(|&(&x, &ca)| {
+            from_b
+                .get(&x)
+                .is_some_and(|&cb| ca + cb + f64::from(w.degree(x)).ln_1p() <= bound)
+        })
+        .map(|(&x, _)| x)
+        .collect();
+    out.extend([a, b]);
+    out
+}
+
+/// The alert oracle: the seed, each entity it shares with an officer from the target
+/// country, and those officers.
+fn shared_with_target(w: &World, task: &Task) -> HashSet<Id> {
+    let (Some(&s), Some(Filter::Attr { key, value })) = (task.seeds.first(), &task.target) else {
+        return HashSet::new();
+    };
+    let mut out = HashSet::from([s]);
+    let (mut entities, mut co, mut attrs) = (Vec::new(), Vec::new(), Vec::new());
+    w.fetch(s, OFFICER_OF, 0, u32::MAX, &mut entities);
+    for &e in &entities {
+        co.clear();
+        w.fetch(e, OFFICER_OF, 0, u32::MAX, &mut co);
+        for &o in co.iter().filter(|&&o| o != s) {
+            attrs.clear();
+            w.attrs(o, &mut attrs);
+            if attrs.iter().any(|(k, v)| k == key && v == value) {
+                out.extend([e, o]);
+            }
+        }
+    }
+    out
+}
+
 /// An `f64` ordered by `total_cmp`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Ord64(f64);
@@ -419,16 +497,26 @@ fn percentile(v: &[f64], pct: usize) -> f64 {
 type Outcome = (Option<u64>, Option<(f64, u32)>);
 
 /// Runs `task` with policy `policy`, writing its trace as `<label>.jsonl` under
-/// `RAMP_TRACE` if set.
+/// `RAMP_TRACE` if set, and its policy calls labelled by `oracle` under `RAMP_BATCHES`.
 ///
 /// # Errors
 /// Storage errors.
-fn run(world: &World, task: &Task, policy: Box<dyn Policy>, label: &str) -> Result<Outcome> {
+fn run(
+    world: &World,
+    task: &Task,
+    policy: Box<dyn Policy>,
+    label: &str,
+    oracle: &HashSet<Id>,
+) -> Result<Outcome> {
     let dir = tempfile::tempdir().map_err(io)?;
     let graph = Graph::open(dir.path().join("g.db"))?;
     let mut path = None;
     let mut truth = HashSet::new();
-    let ex = Expander::new(world, &graph, policy, task.clone(), Reads::Projection)?;
+    let mut ex = Expander::new(world, &graph, policy, task.clone(), Reads::Projection)?;
+    let batches = std::env::var_os("RAMP_BATCHES");
+    if batches.is_some() {
+        ex = ex.log_batches();
+    }
     let report = ex.run(|ex| {
         let [from, to] = task.seeds[..] else {
             return false;
@@ -458,18 +546,22 @@ fn run(world: &World, task: &Task, policy: Box<dyn Policy>, label: &str) -> Resu
         });
         true
     })?;
+    let file: String = format!("{label}.jsonl")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-.".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
     if let Some(out) = std::env::var_os("RAMP_TRACE") {
-        let file: String = format!("{label}.jsonl")
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || "-.".contains(c) {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        std::fs::write(Path::new(&out).join(file), wire::trace(&report, &truth)).map_err(io)?;
+        std::fs::write(Path::new(&out).join(&file), wire::trace(&report, &truth)).map_err(io)?;
+    }
+    if let Some(out) = batches {
+        let rows = wire::batches(&report, |c| oracle.contains(&c.id));
+        std::fs::write(Path::new(&out).join(&file), rows).map_err(io)?;
     }
     let done = if task.goal == Goal::Alert {
         report.alert_at
@@ -507,12 +599,21 @@ fn connect(world: &World, tasks: &[(Task, (f64, u32))]) -> Result<()> {
         "   {:<24} {:>7} {:>9} {:>9} {:>13} {:>13} {:>12}",
         "policy", "solved", "fetched", "p90", "cheapest", "mean cost/best", "widest hub"
     );
+    let oracles: Vec<HashSet<Id>> = tasks
+        .iter()
+        .map(|(task, (best, _))| match task.seeds[..] {
+            [a, b] if std::env::var_os("RAMP_BATCHES").is_some() => {
+                near_cheapest(world, a, b, *best)
+            }
+            _ => HashSet::new(),
+        })
+        .collect();
     for (i, policy) in policies(3, false).iter().enumerate() {
         let (mut solved, mut fetched, mut ratio, mut widest) =
             (0_usize, Vec::new(), Vec::new(), Vec::new());
-        for (t, (task, (best, _))) in tasks.iter().enumerate() {
+        for ((t, (task, (best, _))), oracle) in tasks.iter().enumerate().zip(&oracles) {
             let label = format!("connect.{t}.{}", policy.name());
-            let (done, path) = run(world, task, nth(i, 3, false)?, &label)?;
+            let (done, path) = run(world, task, nth(i, 3, false)?, &label, oracle)?;
             fetched.push(done.map_or(f64::INFINITY, float));
             if let (Some(_), Some((cost, hub))) = (done, path) {
                 solved += 1;
@@ -549,11 +650,15 @@ fn alert(world: &World, tasks: &[Task]) -> Result<()> {
         "   {:<24} {:>7} {:>9} {:>9}",
         "policy", "solved", "fetched", "p90"
     );
+    let oracles: Vec<HashSet<Id>> = tasks
+        .iter()
+        .map(|task| shared_with_target(world, task))
+        .collect();
     for (i, policy) in policies(2, true).iter().enumerate() {
         let (mut solved, mut fetched) = (0_usize, Vec::new());
-        for (t, task) in tasks.iter().enumerate() {
+        for ((t, task), oracle) in tasks.iter().enumerate().zip(&oracles) {
             let label = format!("alert.{t}.{}", policy.name());
-            let (done, _) = run(world, task, nth(i, 2, true)?, &label)?;
+            let (done, _) = run(world, task, nth(i, 2, true)?, &label, oracle)?;
             solved += usize::from(done.is_some());
             fetched.push(done.map_or(f64::INFINITY, float));
         }

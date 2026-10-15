@@ -203,3 +203,33 @@ pub fn trace<H: BuildHasher>(r: &Report, truth: &HashSet<(Id, Id, Rel), H>) -> V
     }
     out
 }
+
+/// Every logged policy call ([`Report::batches`]) as JSON lines: `{"context",
+/// "candidates", "decisions"}`, each candidate with an oracle `label` (whether a
+/// policy that knew the answer would expand it).
+#[must_use]
+pub fn batches(r: &Report, label: impl Fn(&Candidate) -> bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    for b in &r.batches {
+        let candidates: Vec<Value> = b
+            .candidates
+            .iter()
+            .map(|c| {
+                let mut v = candidate(c);
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("label".to_owned(), label(c).into());
+                }
+                v
+            })
+            .collect();
+        let decisions: Vec<Value> = b.decisions.iter().map(decision).collect();
+        let row = json!({
+            "context": context(&b.context),
+            "candidates": candidates,
+            "decisions": decisions,
+        });
+        out.extend(row.to_string().into_bytes());
+        out.push(b'\n');
+    }
+    out
+}
