@@ -49,8 +49,11 @@ conditioned on the task's intent (the prompt) and on live evidence from the grap
 - **`Source`** is the world: an API, a corpus, a feed. `peek` returns per-relation edge
   counts without fetching, which most selector services can give. `fetch` pages one
   relation at a time. `fetch_where` returns only neighbours matching a `Filter`
-  (below), if the source can filter (`can_filter`; the default is no).
+  (below), if the source can filter (`can_filter`; the default is no). `text` is what
+  an entity says about itself in words (names, jurisdictions, relationship labels), for
+  a policy that reads; it is not written to the graph, so it costs writes nothing.
 - **`Task`** is the intent, and it is what a model is conditioned on:
+  - the `prompt`, the request in words;
   - interest per relation and per domain ("a financial link": accounts, logins and
     emails matter; employers don't);
   - the goal (connect two seeds, alert, explore);
@@ -191,7 +194,7 @@ few sources could answer it.
 ## On a real graph: ICIJ Offshore Leaks
 
 `Guided` was built against our own generator, so the scenarios above share its
-assumptions. `benches/icij.rs` loads the ICIJ Offshore Leaks database: officers,
+assumptions. `ramp_expand::icij` loads the ICIJ Offshore Leaks database: officers,
 entities, intermediaries, addresses and others, 2.0M nodes and 2.9M distinct edges. Its
 13 relationship types are grouped into six relations: `officer_of`, `intermediary_of`,
 `registered_address`, `same_as`, `similar` and `connected_to`. Its hubs are real: an
@@ -339,6 +342,21 @@ write them with `RAMP_BATCHES=dir`, labelled by an oracle that sees the whole gr
   cheapest (two bounded Dijkstras);
 - **ICIJ alert:** the seed, an entity it shares with an officer from the target
   country, or such an officer.
+
+The ICIJ bench also writes `entities.jsonl`: every candidate's `Source::text`, once,
+from its non-empty CSV columns and up to six relationship labels each way:
+
+```
+entity name: HANTEC JAPAN INVESTMENT LIMITED; ...; former_name: MACRO JESS LTD.;
+jurisdiction: BVI; ...; address: COSMOS NOMINEES LIMITED ...; status: Active;
+service_provider: Mossack Fonseca; countries: Hong Kong; sourceID: Panama Papers;
+linked by: intermediary of, shareholder of, beneficiary of
+officer name: HANTEC INVESTMENT HOLDINGS LIMITED; countries: Hong Kong; sourceID:
+Panama Papers; links: shareholder of, registered address
+```
+
+Its tasks carry prompts with the seeds' names ("How is the officer KIM SOO IN
+connected to the officer ...? Find the most specific link ..."), as do the scenarios.
 
 `benches/icij.rs -- DIR 200` (200 tasks per kind, every policy, 820 MB of JSON lines):
 

@@ -30,6 +30,7 @@
 //! switches probes to LMDB to measure what that saves.
 
 mod expand;
+pub mod icij;
 pub mod policy;
 pub mod scenario;
 pub mod wire;
@@ -95,6 +96,16 @@ pub trait Source: Sync {
     fn domain(&self, id: Id) -> Dom;
     /// Properties to record on `id` when it is first written.
     fn attrs(&self, id: Id, out: &mut Vec<(&'static str, String)>);
+    /// What `id` says about itself in words (names, jurisdictions, labels), for a
+    /// policy that reads: not written to the graph. Empty by default.
+    #[expect(
+        clippy::unnecessary_literal_bound,
+        reason = "a source's text borrows from it"
+    )]
+    fn text(&self, id: Id) -> &str {
+        let _: Id = id;
+        ""
+    }
     /// How many edges of each relation `id` has, without fetching them.
     fn peek(&self, id: Id) -> Counts;
     /// Appends up to `limit` neighbours of `id` by `rel`, from position `offset`.
@@ -135,6 +146,8 @@ pub enum Goal {
 /// The intent behind an expansion, compiled from a prompt or an analyst's request.
 #[derive(Debug, Clone)]
 pub struct Task {
+    /// The request in words, for a policy that reads (empty if there is none).
+    pub prompt: String,
     /// Where expansion starts. For [`Goal::Connect`], `seeds[0]` is side 0 and
     /// `seeds[1]` side 1; any others join side 0.
     pub seeds: Vec<Id>,

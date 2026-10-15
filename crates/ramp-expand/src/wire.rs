@@ -23,6 +23,7 @@ pub fn task(task: &Task, src: &impl Source) -> Value {
         .map(|r| json!({"name": r.name, "from": r.from, "to": r.to}))
         .collect();
     json!({
+        "prompt": task.prompt,
         "seeds": task.seeds,
         "goal": match task.goal {
             Goal::Connect => "connect",
@@ -228,6 +229,19 @@ pub fn batches(r: &Report, label: impl Fn(&Candidate) -> bool) -> Vec<u8> {
             "candidates": candidates,
             "decisions": decisions,
         });
+        out.extend(row.to_string().into_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+/// `{"id", "domain", "text"}` per entity of `ids`, as JSON lines: what a reading policy
+/// needs about each, once rather than in every batch.
+#[must_use]
+pub fn entities(src: &impl Source, ids: &[Id]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &id in ids {
+        let row = json!({"id": id, "domain": src.domain(id), "text": src.text(id)});
         out.extend(row.to_string().into_bytes());
         out.push(b'\n');
     }
