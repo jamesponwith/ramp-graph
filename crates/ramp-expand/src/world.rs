@@ -129,6 +129,12 @@ impl Rng {
         z ^ (z >> 31)
     }
 
+    /// A uniform index below `n` (0 if `n` is 0).
+    pub fn below(&mut self, n: usize) -> usize {
+        let n = u64::try_from(n.max(1)).unwrap_or(u64::MAX);
+        usize::try_from(self.next_u64() % n).unwrap_or(0)
+    }
+
     /// A uniform float in `[0, 1)`.
     pub fn unit(&mut self) -> f64 {
         // 53 random bits make an exact double in [0, 1).
@@ -190,6 +196,7 @@ pub struct Builder {
     edges: Vec<(u32, u32, Rel)>,
     planted: Vec<(Id, Id, Rel)>,
     attrs: HashMap<u32, Vec<(&'static str, String)>>,
+    text: HashMap<u32, Box<str>>,
     /// Picks entities for planted structure, so scenarios never collide.
     used: std::collections::HashSet<u32>,
     rng: Rng,
@@ -234,6 +241,7 @@ impl Builder {
             edges,
             planted: Vec::new(),
             attrs: HashMap::new(),
+            text: HashMap::new(),
             used: std::collections::HashSet::new(),
             rng,
         }
@@ -252,6 +260,7 @@ impl Builder {
             edges: Vec::new(),
             planted: Vec::new(),
             attrs: HashMap::new(),
+            text: HashMap::new(),
             used: std::collections::HashSet::new(),
             rng: Rng::new(0),
         }
@@ -336,6 +345,13 @@ impl Builder {
         }
     }
 
+    /// Sets what entity `id` says about itself ([`Source::text`]).
+    pub fn text(&mut self, id: Id, text: String) {
+        if let Ok(id) = u32::try_from(id) {
+            self.text.insert(id, text.into_boxed_str());
+        }
+    }
+
     /// Sets `key = val` on a random share `p` of domain `d` (decoys).
     pub fn sprinkle(&mut self, d: Dom, p: f64, key: &'static str, val: &str) {
         let Some(r) = self.ranges.get(usize::from(d)) else {
@@ -399,6 +415,7 @@ impl Builder {
             adj,
             planted: self.planted,
             attrs: self.attrs,
+            text: self.text,
             scanned: AtomicU64::new(0),
             latency: Duration::ZERO,
         }
@@ -416,6 +433,7 @@ pub struct World {
     adj: Vec<u32>,
     planted: Vec<(Id, Id, Rel)>,
     attrs: HashMap<u32, Vec<(&'static str, String)>>,
+    text: HashMap<u32, Box<str>>,
     /// Entities examined answering filtered fetches: the source-side work pushdown costs.
     scanned: AtomicU64,
     /// How long each fetch takes, as a remote source's round trip would.
@@ -527,6 +545,13 @@ impl Source for World {
         if let Some(a) = u32::try_from(id).ok().and_then(|i| self.attrs.get(&i)) {
             out.extend(a.iter().cloned());
         }
+    }
+
+    fn text(&self, id: Id) -> &str {
+        u32::try_from(id)
+            .ok()
+            .and_then(|i| self.text.get(&i))
+            .map_or("", |t| t)
     }
 
     fn peek(&self, id: Id) -> Counts {

@@ -468,3 +468,44 @@ fn logged_batches_hold_every_decision_and_label_candidates() {
     let (r, _) = run(&w, s, Guided::default(), 10_000, Reads::Projection);
     assert!(r.batches.is_empty());
 }
+
+#[test]
+fn icij_entities_carry_their_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = [
+        (
+            "nodes-entities.csv",
+            "node_id,name,jurisdiction_description,note\n1,\"ACME, LTD.\",Samoa,boilerplate\n",
+        ),
+        (
+            "nodes-officers.csv",
+            "node_id,name,countries,country_codes\n2,KIM SOO IN,South Korea,KOR\n3,Tian Yuan,China,CHN\n",
+        ),
+        ("nodes-intermediaries.csv", "node_id,name\n"),
+        ("nodes-addresses.csv", "node_id,address\n"),
+        ("nodes-others.csv", "node_id,name\n"),
+        (
+            "relationships.csv",
+            "node_id_start,node_id_end,rel_type,link\n2,1,officer_of,Nominee Director of\n3,1,officer_of,shareholder of\n",
+        ),
+    ];
+    for (name, body) in files {
+        std::fs::write(dir.path().join(name), body).unwrap();
+    }
+    let w = icij::load(dir.path()).unwrap();
+    assert_eq!(
+        w.text(0),
+        "entity name: ACME, LTD.; jurisdiction_description: Samoa; linked by: nominee director of, shareholder of"
+    );
+    assert_eq!(
+        w.text(1),
+        "officer name: KIM SOO IN; countries: South Korea; links: nominee director of"
+    );
+    assert_eq!(w.peek(0)[usize::from(icij::OFFICER_OF)], 2);
+    let mut attrs = Vec::new();
+    w.attrs(2, &mut attrs);
+    assert_eq!(attrs, [("country", "CHN".to_owned())]);
+    let rows = wire::entities(&w, &[1]);
+    let row: serde_json::Value = serde_json::from_slice(rows.trim_ascii()).unwrap();
+    assert_eq!(row["domain"], 1);
+}

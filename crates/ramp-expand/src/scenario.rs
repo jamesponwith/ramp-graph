@@ -25,10 +25,19 @@ pub struct Scenario {
 /// "How are these two people linked financially?": accounts, logins, emails matter;
 /// employers do not.
 const MONEY: [f64; MAX_REL] = [0.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0];
+const FOLLOW_MONEY: &str = "How are these two people linked financially? Accounts, logins and \
+                            emails matter; who they work for does not.";
 const MONEY_DOMAINS: [f64; MAX_DOM] = [1.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0, 0.0];
 
-const fn task(seeds: Vec<Id>, goal: Goal, rels: [f64; MAX_REL], doms: [f64; MAX_DOM]) -> Task {
+fn task(
+    prompt: &str,
+    seeds: Vec<Id>,
+    goal: Goal,
+    rels: [f64; MAX_REL],
+    doms: [f64; MAX_DOM],
+) -> Task {
     Task {
+        prompt: prompt.to_owned(),
         seeds,
         goal,
         relation_interest: rels,
@@ -109,7 +118,13 @@ fn path5(world: &mut Builder, hubs: Hubs) -> Scenario {
     Scenario {
         name: "path-5hop",
         about: "link two people via account-ip-account-email; both at the top employer",
-        task: task(vec![left, right], Goal::Connect, MONEY, MONEY_DOMAINS),
+        task: task(
+            FOLLOW_MONEY,
+            vec![left, right],
+            Goal::Connect,
+            MONEY,
+            MONEY_DOMAINS,
+        ),
         signal,
         depth: 3,
     }
@@ -151,7 +166,13 @@ fn path7(world: &mut Builder, hubs: Hubs) -> Scenario {
     Scenario {
         name: "path-7hop",
         about: "seven hops, email-account-device(~500)-account-ip-account",
-        task: task(vec![left, right], Goal::Connect, MONEY, MONEY_DOMAINS),
+        task: task(
+            FOLLOW_MONEY,
+            vec![left, right],
+            Goal::Connect,
+            MONEY,
+            MONEY_DOMAINS,
+        ),
         signal,
         depth: 4,
     }
@@ -178,6 +199,8 @@ fn pivot(world: &mut Builder, hubs: Hubs) -> Scenario {
         world.link(decoy, hub, rel::LOGIN_FROM);
     }
     let mut task = task(
+        "Who on watchlist T does this watchlist-S person reach through an account and a \
+         shared login?",
         vec![seed],
         Goal::Alert,
         [0.0, 0.2, 0.2, 1.0, 1.0, 0.2, 0.2, 0.0],
@@ -231,6 +254,7 @@ fn alert(world: &mut Builder, hubs: Hubs) -> Scenario {
     }
     world.plant(partner, shared, rel::OWNS);
     let mut task = task(
+        "Alert when this watchlist-A person shares an account with anyone on watchlist B.",
         vec![watched],
         Goal::Alert,
         [0.0, 0.2, 0.2, 1.0, 0.1, 0.2, 0.2, 0.0],
@@ -259,6 +283,7 @@ fn alert(world: &mut Builder, hubs: Hubs) -> Scenario {
 fn explore(world: &mut Builder) -> Scenario {
     let seed = world.around(dom::PERSON, 20.0);
     let mut task = task(
+        "Map who this person is connected to.",
         vec![seed],
         Goal::Explore,
         [0.3, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0],
