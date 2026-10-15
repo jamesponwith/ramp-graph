@@ -25,7 +25,8 @@ const MAX_BODY: usize = 1 << 30;
 /// Time allowed to receive a request body.
 const BODY_TIMEOUT: Duration = Duration::from_secs(60);
 
-const USAGE: &str = "usage: ramp-server [-i ip] [-p port] [-n max_open] [-m projection_mib] [dir]";
+const USAGE: &str =
+    "usage: ramp-server [-i ip] [-p port] [-n max_open] [-m projection_mib] [-x icij_dir] [dir]";
 
 #[expect(clippy::print_stderr, reason = "CLI diagnostics")]
 fn main() -> ExitCode {
@@ -35,6 +36,8 @@ fn main() -> ExitCode {
     let mut max_open = 64_usize;
     // Projections kept across open graphs (≈300 MiB per million nodes, edges, and properties).
     let mut projection_mib = 1024_usize;
+    // The ICIJ Offshore Leaks CSVs, for `/expand` runs over a real graph.
+    let mut icij = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let ok = match a.as_str() {
@@ -55,6 +58,7 @@ fn main() -> ExitCode {
                 .and_then(|v| v.parse().ok())
                 .map(|v| projection_mib = v)
                 .is_some(),
+            "-x" => args.next().map(|v| icij = Some(v.into())).is_some(),
             "-h" | "--help" => false,
             _ if !a.starts_with('-') => {
                 dir = a;
@@ -68,7 +72,10 @@ fn main() -> ExitCode {
         }
     }
     let store = match Store::open(&dir, max_open, projection_mib << 20) {
-        Ok(s) => Arc::new(s),
+        Ok(mut s) => {
+            s.expansions.icij_dir = icij;
+            Arc::new(s)
+        }
         Err(e) => {
             eprintln!("cannot open {dir}: {e:?}");
             return ExitCode::FAILURE;
