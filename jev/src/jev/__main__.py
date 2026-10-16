@@ -1,15 +1,19 @@
 """`uv run python -m jev DIR [K]`: train the numeric-only model on the training tasks'
 batches (every policy) and compare its ordering with the policy's own on the test
 tasks' batches, per kind and policy. `ahead` is the edges ranked before the first
-positive; its interval is the paired 95% bootstrap of model minus policy."""
+positive; its interval is the paired 95% bootstrap of model minus policy.
+
+With Jev answers cached in `DIR/jev.sqlite` (`python -m jev.ask DIR`), it also fits
+numeric + Jev and reports it the same way: the P2 ablation."""
 
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 
-from . import data, rank
+from . import client, data, questions, rank
 
 
 def main() -> None:
@@ -24,7 +28,20 @@ def main() -> None:
         f"{len(test)} test tasks; loaded in {time.time() - started:.0f}s"
     )
     groups = np.arange(len(d.run))
-    model = rank.fit(d, rank.rows(d, groups[~is_test]))
+    train = rank.rows(d, groups[~is_test])
+    models = {"numeric": (rank.fit(d, train), d.x)}
+    if (dir / "jev.sqlite").exists():
+        texts = data.texts(dir)
+        got = client.answers(
+            {int(i): texts[int(i)] for i in np.unique(d.id)},
+            questions.QUESTIONS,
+            client.Cache(dir / "jev.sqlite"),
+            asking=False,
+        )
+        x = np.hstack([d.x, questions.features(d.id, got)])
+        print(f"Jev answers for {np.mean(~np.isnan(x[:, -1])):.1%} of rows")
+        both = data.NAMES + questions.NAMES
+        models["jev"] = (rank.fit(replace(d, x=x), train, both), x)
     print(f"trained in {time.time() - started:.0f}s")
     for kind in ("connect", "alert"):
         for policy in ("guided", "guided_pushdown"):
@@ -34,27 +51,30 @@ def main() -> None:
             m = rank.rows(d, pick)
             if not m.any():
                 continue
-            y, g, x = d.y[m], d.group[m], d.x[m]
-            left = np.expm1(x[:, rank.LEFT])
-            base = rank.per_group(d.prior[m], y, g, k, left)
-            ours = rank.per_group(rank.priority(model, x), y, g, k, left)
-            n = len(base["top1"])
+            y, g = d.y[m], d.group[m]
+            left = np.expm1(d.x[m, rank.LEFT])
+            out = {policy: rank.per_group(d.prior[m], y, g, k, left)}
+            for name, (model, x) in models.items():
+                out[name] = rank.per_group(rank.priority(model, x[m]), y, g, k, left)
+            n = len(out[policy]["top1"])
             print(f"\n{kind} test, {policy} batches ({n} with mixed labels)")
             if n == 0:
                 continue
-            for name in base:
-                print(
-                    f"  {name:9} {policy:>16} {base[name].mean():8.3f}   model {ours[name].mean():8.3f}"
-                )
-            lo, hi = rank.bootstrap(ours["ahead"] - base["ahead"])
+            print(" " * 11 + "".join(f"{name:>16}" for name in out))
+            for metric in out[policy]:
+                print(f"  {metric:9}" + "".join(f"{r[metric].mean():16.3f}" for r in out.values()))
             print(
-                f"  ahead p90 {np.percentile(base['ahead'], 90):25.1f}   model "
-                f"{np.percentile(ours['ahead'], 90):8.1f}\n"
-                f"  ahead, model - {policy}: 95% CI [{lo:.1f}, {hi:.1f}]"
+                "  ahead p90"
+                + "".join(f"{np.percentile(r['ahead'], 90):16.1f}" for r in out.values())
             )
-    imp = model.get_feature_importance(type="PredictionValuesChange")
-    top = sorted(zip(imp, data.NAMES), reverse=True)[:10]
-    print("\ntop features:", ", ".join(f"{n} {v:.1f}" for v, n in top))
+            pairs = [(name, policy) for name in models] + [("jev", "numeric")] * ("jev" in models)
+            for a, b in pairs:
+                lo, hi = rank.bootstrap(out[a]["ahead"] - out[b]["ahead"])
+                print(f"  ahead, {a} - {b}: 95% CI [{lo:.1f}, {hi:.1f}]")
+    for name, (model, _) in models.items():
+        imp = model.get_feature_importance(type="PredictionValuesChange")
+        top = sorted(zip(imp, model.feature_names_), reverse=True)[:12]
+        print(f"\n{name} top features:", ", ".join(f"{n} {v:.1f}" for v, n in top))
 
 
 main()

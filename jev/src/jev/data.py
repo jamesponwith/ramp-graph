@@ -56,6 +56,7 @@ class Data:
     prior: np.ndarray  # the generating policy's priority (-inf: not expanded)
     run: list[str]  # per group: "<kind>.<task>.<policy>"
     task: list[str]  # per group: "<kind>.<task>"
+    id: np.ndarray  # entity id, one per row
 
 
 def features(c: dict, ctx: dict, task: dict, size: int) -> list[float]:
@@ -103,7 +104,7 @@ def priority(d: dict) -> float:
 def load(dir: Path, kinds: tuple[str, ...] = ("connect", "alert")) -> Data:
     """Every batch file in `dir` of the given kinds, with `tasks.jsonl`."""
     tasks = read_tasks(dir)
-    x, y, group, prior, run, task = [], [], [], [], [], []
+    x, y, group, prior, run, task, ids = [], [], [], [], [], [], []
     for f in sorted(dir.glob("*.jsonl")):
         parts = f.name.split(".")
         if len(parts) < 4 or parts[0] not in kinds:
@@ -124,6 +125,7 @@ def load(dir: Path, kinds: tuple[str, ...] = ("connect", "alert")) -> Data:
             y += [int(c["label"]) for c in cands]
             prior += [priority(d) for d in b["decisions"]]
             group += [g] * len(cands)
+            ids += [c["id"] for c in cands]
             run.append(f"{name}.{'.'.join(parts[2:-1])}")
             task.append(name)
     return Data(
@@ -133,6 +135,7 @@ def load(dir: Path, kinds: tuple[str, ...] = ("connect", "alert")) -> Data:
         np.asarray(prior, np.float64),
         run,
         task,
+        np.asarray(ids, np.int64),
     )
 
 
@@ -162,4 +165,12 @@ def read_tasks(dir: Path) -> dict[str, dict]:
     return {
         (row := json.loads(line))["run"]: row["task"]
         for line in (dir / "tasks.jsonl").read_text().splitlines()
+    }
+
+
+def texts(dir: Path) -> dict[int, str]:
+    """Entity text by id, from `entities.jsonl`."""
+    return {
+        (e := json.loads(line))["id"]: e["text"]
+        for line in (dir / "entities.jsonl").read_text().splitlines()
     }

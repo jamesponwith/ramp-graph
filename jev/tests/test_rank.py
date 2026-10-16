@@ -38,6 +38,7 @@ def test_capped_keeps_positives():
         prior=np.zeros(n),
         run=["a", "b"],
         task=["a", "b"],
+        id=np.arange(n),
     )
     m = rank.capped(d, np.ones(n, bool), 8, 0)
     assert m[:250].sum() == 8 and m[250:].sum() == 8
