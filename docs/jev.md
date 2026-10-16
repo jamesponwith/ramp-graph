@@ -217,6 +217,36 @@ were asked. Every variant trains on the same rows. Losses, lower is better:
   - more test tasks, from the free bench;
   - a less noisy fit, such as more seeds or a larger cap.
 
+## A larger held-out set
+
+`RAMP_SEED=8` on the bench samples another 300 tasks per kind (`~/.cache/ramp-jev/seed8`).
+596 of them share no seed entity with the original 400 tasks. `uv run python -m
+jev.holdout TRAIN_DIR TEST_DIR [BUDGET]` trains on every original task and scores
+those 596: 5,112 `Guided` batches, against 324 in the P1–P3 test split.
+
+- **Per task, not per batch.** A long task has hundreds of correlated batches. Metrics
+  are averaged per task first, and intervals resample tasks. Per batch, the connect
+  comparison flips sign.
+- **v0 needs a spend.** 39.5k entities in the scored rows are not in the cache,
+  estimated at $1.22. A partial v0 column would bias the comparison, so v0 is skipped
+  until they are asked.
+
+Numeric (four-seed average) against `Guided`'s own order, per-task means:
+
+| | tasks | log1p(edges ahead): `Guided` / numeric | numeric − `Guided`, 95% CI | edges ahead: `Guided` / numeric | top-1 |
+|---|---|---|---|---|---|
+| connect | 296 | 2.35 / 1.82 | [−0.60, −0.45] | 143 / 166 | 0.16 / 0.40 |
+| alert | 297 | 0.59 / 0.61 | [−0.06, +0.09] | 15.8 / 13.7 | 0.85 / 0.81 |
+
+- **Connect: the model wins the typical batch and loses the tail.** On the log scale it
+  is clearly better. But in mean edges, which is what the budget pays, it is worse (166
+  against 143), because its misses are expensive.
+- **Alert: a tie.**
+- **So the P1 cost correction is not finished.** `log p − log1p(left)` still lets
+  high-confidence, expensive candidates rank first. A loss that charges edges directly
+  (weighting each row by its cost, or a final `ahead` check when choosing models) is the
+  next fix, and it is free.
+
 ## Costs and risks
 
 - **Cost.** Every one of the 334k entities is a candidate somewhere. At about 600 input
