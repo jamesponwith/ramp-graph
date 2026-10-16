@@ -36,7 +36,6 @@ def main() -> None:
             {int(i): texts[int(i)] for i in np.unique(d.id)},
             questions.QUESTIONS,
             client.Cache(dir / "jev.sqlite"),
-            asking=False,
         )
         x = np.hstack([d.x, questions.features(d.id, got)])
         print(f"Jev answers for {np.mean(~np.isnan(x[:, -1])):.1%} of rows")

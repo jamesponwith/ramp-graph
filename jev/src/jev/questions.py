@@ -62,10 +62,12 @@ QUESTIONS: dict[str, dict] = {
 NAMES = [f"jev_{q}" for q in QUESTIONS]
 
 
-def features(ids: np.ndarray, answers: dict[int, dict[str, dict | None]]) -> np.ndarray:
-    """One row of `NAMES` per id."""
+def features(
+    ids: np.ndarray, answers: dict[int, dict[str, dict | None]], qs: dict = QUESTIONS
+) -> np.ndarray:
+    """One row per id, a column per question in `qs`."""
     uniq, inv = np.unique(ids, return_inverse=True)
-    table = np.array([[value(answers[i][q]) for q in QUESTIONS] for i in uniq], np.float32)
+    table = np.array([[value(answers[i][q]) for q in qs] for i in uniq], np.float32)
     return table[inv]
 
 

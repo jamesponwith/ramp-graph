@@ -139,9 +139,9 @@ def load(dir: Path, kinds: tuple[str, ...] = ("connect", "alert")) -> Data:
     )
 
 
-def split(tasks: dict[str, dict], test: float = 0.2) -> set[str]:
+def split(tasks: dict[str, dict], test: float = 0.2, salt: str = "") -> set[str]:
     """Test tasks: whole components of tasks that share a seed, so no seed entity is
-    in both sides. Deterministic."""
+    in both sides. Deterministic; another `salt` draws another split."""
     parent = {name: name for name in tasks}
 
     def find(a: str) -> str:
@@ -158,7 +158,7 @@ def split(tasks: dict[str, dict], test: float = 0.2) -> set[str]:
             else:
                 by_seed[s] = name
     cut = int(test * 2**32)
-    return {n for n in tasks if zlib.crc32(find(n).encode()) < cut}
+    return {n for n in tasks if zlib.crc32((salt + find(n)).encode()) < cut}
 
 
 def read_tasks(dir: Path) -> dict[str, dict]:
