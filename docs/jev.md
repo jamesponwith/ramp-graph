@@ -58,7 +58,7 @@ It can then judge whether an entity is a specific party or a mass-registration s
 |---|---|---|---|
 | P0 data | Rust | Per-batch logging (`RAMP_BATCHES=dir`: context, every candidate, decisions, oracle label per candidate). Entity text through `Source`/`wire`. `Task.prompt`. ICIJ loader and task sampler moved from the bench into `ramp_expand::icij`, and served by `/expand` (`world: "icij"`). | A dataset from ≥200 ICIJ tasks per kind plus the synthetic scenarios, with batch counts and positive rates reported. |
 | P1 baseline ranker | `jev/` (Python, uv) | Loader into ranking groups (one group per batch); numeric features; a CatBoost model (see P1 results: a classifier, not `YetiRank`). Offline NDCG@k and recall@k against the oracle, with `Guided`'s own ordering scored the same way. Train/test split by task and seed entity. | A numeric-only ranker matches or beats `Guided` offline. Otherwise the data or labels are wrong: fix before adding Jev. |
-| P2 Jev features | `jev/` | TypeSafe client (Python SDK, `TYPESAFE_API_KEY`, backoff on 429/529, 8 concurrent). Question set v0 by hand, ~10 questions: hub-likeness, nominee or agent, mass-registration address, secrecy jurisdiction, relevance to the prompt. One request per entity carrying every question. Disk cache keyed by (model, entity text, question): entity text does not change, so each entity is asked once. | Ablation of numeric vs numeric+Jev on held-out tasks. Determinism checked by re-asking 100 cached items. |
+| P2 Jev features | `jev/` | TypeSafe client (stdlib HTTP: TypeSafe ships no Python SDK; `TYPESAFE_API_KEY`, backoff on 429/529/5xx, 8 concurrent). Question set v0 by hand, 10 questions about the entity alone (see P2 results). One request per entity carrying every question. SQLite cache keyed by (model, question, entity text), so each entity is asked each question once. | Ablation of numeric vs numeric+Jev on held-out tasks. Determinism checked by re-asking 100 cached items. |
 | P3 autoresearch | `jev/` | Claude proposes, revises and drops questions from feedback (worst batches, importances, metric history), over 5 rounds. A refit costs no API calls, so rejected changes are free. Bootstrap CI on the held-out change. | The final question set beats v0 on held-out NDCG with a CI excluding zero. |
 | P4 serving | `jev/` | `jev serve`: an `/expand` client that long-polls and scores each batch (cached Jev answers + numeric features → priority). Breadth starts with `Guided`'s rule (≤1/64 of remaining budget per relation per visit). Newly discovered entities are prefetched while the batch waits; `parallel(k)` and `spread` hide latency. | It runs every held-out task on both worlds without timeouts. |
 | P5 evaluation | both | The ICIJ and scenario tables with Jev added: solved, fetched p50/p90, cheapest-path rate, widest hub, wall time, Jev calls and cost per run. | Ship if it solves at least as many as `Guided`, fetches fewer at p50 and p90 on ICIJ connect, and does not regress on the synthetic scenarios, at a stated cost per run. Otherwise report why. |
@@ -104,15 +104,66 @@ text features (P2) are for.
 On pushdown batches the comparison means little: pushdown prices a filtered fetch as a
 few edges, and the model prices the unfiltered relation.
 
+## P2 results
+
+`uv run python -m jev.ask DIR [N]` asks question set v0 (`jev/src/jev/questions.py`)
+about every entity in `DIR/entities.jsonl`, or a seeded sample of N, into
+`DIR/jev.sqlite`. `python -m jev DIR` then fits numeric and numeric + Jev and reports
+both.
+
+- **Questions.** Ten, each about the entity alone, so they are asked once per entity,
+  not per task:
+  - nominee or agent;
+  - service provider;
+  - mass-registration address;
+  - hub-likeness (a 4-level score);
+  - natural person;
+  - specific party;
+  - secrecy jurisdiction;
+  - shell;
+  - still active;
+  - notable or politically exposed.
+
+  Relevance to the analyst's prompt would need a call per (task, candidate) pair, so it
+  waits for P3.
+- **Asking.** 333,988 entities at about 64 calls/s, 66 minutes in all. Each call is about
+  600 input tokens and 170 output tokens: about 200M input tokens, roughly $8.4 at the
+  quoted rate, plus output tokens (not priced in the docs).
+- **Determinism.** Jev is not deterministic. Re-asking 100 cached entities moved an
+  answer by at most 0.10–0.12, at p99 by 0.06, and 36% of answers came back identical.
+  That is small next to the spread across entities, and the cache keeps experiments
+  reproducible.
+
+Test tasks against the same split as P1. "edges ahead" is the mean edges ranked before
+the first positive:
+
+| batches | top-1: policy / numeric / +Jev | edges ahead: policy / numeric / +Jev | +Jev − numeric, 95% CI |
+|---|---|---|---|
+| connect, `Guided` | 0.14 / 0.31 / 0.37 | 110 / 84 / 77 | [−34, +18] |
+| alert, `Guided` | 0.87 / 0.77 / 0.86 | 7.8 / 8.7 / 5.9 | [−7.7, +1.4] |
+
+- **Jev's answers help on every metric.** On connect, NDCG@5 goes 0.57 → 0.60 and p90
+  edges ahead 148 → 119. On alert, the model with Jev beats `Guided`'s own order on
+  edges ahead.
+- **Not yet significant.** Both intervals include zero. With 239 and 85 test batches the
+  interval is wide, so P3 needs either more test tasks or larger gains.
+- **Importance.** Four Jev answers make the top 12: `secrecy` 6.4, `hub` 6.3,
+  `notable` 4.8 and `person` 2.9. Route `cost` stays first.
+- **Weak questions.** For company entities, `shell` and `secrecy` are almost constant
+  (above 0.5 for all of them), and `mass_address` is above 0.5 for 85–100% of each
+  domain. P3 starts by revising those.
+
 ## Costs and risks
 
-- **Cost.** About 100k distinct frontier entities × ~300 input tokens ≈ 30M tokens per
-  full dataset build, ≈ $1.30. The cache makes reruns free.
+- **Cost.** Every one of the 334k entities is a candidate somewhere. At about 600 input
+  tokens per call (the questions dominate the short entity text), a full pass of the
+  10 v0 questions is about $8.4 in input tokens, plus output (P2). A revised question
+  re-asks only itself, but for every entity. The cache makes reruns free.
 - **Latency.** One call per uncached entity, 70–500 ms. Per-entity caching and
   prefetching leave most batches with no call. Rate limits are undocumented, so the
   client backs off.
-- **Determinism.** Assumed and checked in P2. The cache makes experiments reproducible
-  either way.
+- **Determinism.** Jev is not deterministic: a re-ask moves answers by up to about 0.1
+  (P2). The cache makes experiments reproducible.
 - **Oracle bias.** One cheapest path is one answer, so positives use every path within
   ε of the best cost. The metric stays "least hub-heavy", as in the ICIJ tables.
 - **Leakage.** Splits are by task and by seed entity, never by batch.

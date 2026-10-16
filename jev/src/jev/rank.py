@@ -72,18 +72,24 @@ def capped(d: Data, m: np.ndarray, cap: int, seed: int) -> np.ndarray:
 
 
 def fit(
-    d: Data, train: np.ndarray, iterations: int = 500, cap: int = 64, seed: int = 0
+    d: Data,
+    train: np.ndarray,
+    names: list[str] = NAMES,
+    iterations: int = 500,
+    cap: int = 64,
+    seed: int = 0,
 ) -> CatBoostClassifier:
-    """A classifier on the rows `train` (a mask), each group cut to `cap` rows."""
+    """A classifier on the rows `train` (a mask), each group cut to `cap` rows. `d.x`
+    holds `names`, which start with `data.NAMES`."""
     m = capped(d, train, cap, seed)
     model = CatBoostClassifier(
         iterations=iterations, random_seed=seed, verbose=False, allow_writing_files=False
     )
-    model.fit(Pool(d.x[m], label=d.y[m], feature_names=NAMES))
+    model.fit(Pool(d.x[m], label=d.y[m], feature_names=names))
     return model
 
 
 def priority(model: CatBoostClassifier, x: np.ndarray) -> np.ndarray:
     """Chance on the path per edge: `log p - log(1 + relevant edges left)`."""
-    p = model.predict_proba(Pool(x, feature_names=NAMES))[:, 1]
+    p = model.predict_proba(Pool(x, feature_names=model.feature_names_))[:, 1]
     return np.log(p) - x[:, LEFT]
