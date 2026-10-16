@@ -5,6 +5,7 @@
 //! `cargo bench -p ramp-expand --bench icij -- DIR [TASKS [BUDGET]]`, with DIR holding
 //! the unzipped CSVs from <https://offshoreleaks-data.icij.org> (Open Database License; not in the repo).
 //! TASKS = 10 sampled tasks per kind, BUDGET = 200,000 fetched edges per run.
+//! `RAMP_SEED` (default 7) seeds the task sampler, for a disjoint set of tasks.
 //!
 //! Tasks are sampled by [`ramp_expand::icij`]. Connect runs are scored by the edges
 //! fetched until the seeds are joined, and by how specific the joining path is: its
@@ -270,7 +271,11 @@ fn main() -> Result<()> {
         hubs.join(", ")
     );
     println!("budget: {budget} fetched edges per run, {n} tasks per kind\n");
-    let mut rng = Rng::new(7);
+    let sampler = std::env::var("RAMP_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7);
+    let mut rng = Rng::new(sampler);
     let connects = connect_tasks(&world, n, &mut rng, budget);
     let alerts = alert_tasks(&world, n, &mut rng, budget);
     if let Some(out) = std::env::var_os("RAMP_BATCHES") {
