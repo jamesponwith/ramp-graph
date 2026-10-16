@@ -147,11 +147,75 @@ the first positive:
   edges ahead.
 - **Not yet significant.** Both intervals include zero. With 239 and 85 test batches the
   interval is wide, so P3 needs either more test tasks or larger gains.
+- **Read with care: these are single fits.** P3 found that refitting one feature set
+  under another seed moves the score as much as these gains (see P3 results).
 - **Importance.** Four Jev answers make the top 12: `secrecy` 6.4, `hub` 6.3,
   `notable` 4.8 and `person` 2.9. Route `cost` stays first.
 - **Weak questions.** For company entities, `shell` and `secrecy` are almost constant
   (above 0.5 for all of them), and `mass_address` is above 0.5 for 85–100% of each
   domain. P3 starts by revising those.
+
+## P3 results
+
+P3 had a budget of $5–10, so it skipped the five-round loop the plan describes, which
+would ask every question of every entity each round. Everything is in
+`uv run python -m jev.research DIR <command>`. Question choices were made on a
+validation split carved out of the training tasks, by a second salted `data.split`.
+The test tasks were scored once, at the end.
+
+- **Objective.** The mean of `log(1 + edges ahead)` over `Guided` batches of both
+  kinds. The log keeps one hub batch from outweighing the rest.
+- **Spend.** $2.08 in all. The cache's `spent` table is a ledger of every call:
+  - $1.28 for the validation round;
+  - $0.72 for the test pairs;
+  - about $0.08 of answers lost when a run was stopped before it committed them.
+
+  Output tokens are charged at the input rate, since TypeSafe does not publish an
+  output price.
+- **Spend guard.** `client.answers` estimates its cost first and refuses a budget the
+  estimate exceeds. Its workers stop starting calls once billing passes the budget.
+  Answers come from `jev-1.13.0`, and a different model behind `jev-latest` stops the
+  run.
+
+### Seed noise sets the bar
+
+Refitting one feature set under another seed moves the validation loss by about
+±0.2. A drop-one study over the ten v0 questions measured only that noise: every
+difference fell inside it. Averaging four seeds cuts the noise to about ±0.05, so every
+later comparison uses four-seed averages, and a gain under 0.1 does not count.
+
+### Prompt relevance
+
+All ten v0 questions are about the entity alone. Three questions about the candidate
+in the light of one task (`research.RELEVANCE`: `tie` to the seeds, part of the
+`link` asked for, `fits` what the task names) were asked once per (task, candidate)
+pair. The state was the prompt, the seeds' text and the candidate's text.
+
+To keep the cost down, training covers 8k batches sampled from 250 training tasks (30k
+pairs), with the 64-row cut fixed in advance so that every seed trains on rows that
+were asked. Every variant trains on the same rows. Losses, lower is better:
+
+| | validation | test | test connect | test alert |
+|---|---|---|---|---|
+| `Guided`'s own order | — | 1.87 | 2.35 | 0.50 |
+| numeric | 1.92 | 1.65 | 2.01 | 0.66 |
+| v0 | 1.73 | 1.57 | 1.92 | 0.57 |
+| numeric + relevance | 1.84 | 1.64 | 2.02 | 0.57 |
+| v0 + relevance | **1.63** | 1.58 | 1.97 | **0.48** |
+
+- **Relevance did not hold up on test.** On validation, v0 + relevance beat v0 by
+  0.10, with an interval of [−0.17, −0.02]. On test it ties v0, with an interval of
+  [−0.07, +0.08]. It helps on alert and costs a little on connect. The P3 gate (beat
+  v0 with an interval excluding zero) is **not met**.
+- **Jev against numeric: suggestive.** v0 + relevance minus numeric is [−0.19, +0.04]
+  on test, and v0 beats numeric on both splits.
+- **The learned models beat `Guided`.** v0 + relevance minus `Guided` is
+  [−0.42, −0.15], all of it on connect. On alert, `Guided` ties the best model.
+- **What next.** The entity questions (v0) carry the Jev gain we can measure. More
+  question rounds would chase gains under the noise this evaluation can detect. Two
+  things would help before any more spend:
+  - more test tasks, from the free bench;
+  - a less noisy fit, such as more seeds or a larger cap.
 
 ## Costs and risks
 
@@ -164,6 +228,9 @@ the first positive:
   client backs off.
 - **Determinism.** Jev is not deterministic: a re-ask moves answers by up to about 0.1
   (P2). The cache makes experiments reproducible.
+- **Model drift.** The cache is keyed by `jev-latest`, and its answers are from
+  `jev-1.13.0`. The client stops when the name resolves to another version, so cached
+  and new answers are never mixed.
 - **Oracle bias.** One cheapest path is one answer, so positives use every path within
   ε of the best cost. The metric stays "least hub-heavy", as in the ICIJ tables.
 - **Leakage.** Splits are by task and by seed entity, never by batch.
