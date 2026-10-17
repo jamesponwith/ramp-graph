@@ -97,6 +97,17 @@ def features(c: dict, ctx: dict, task: dict, size: int) -> list[float]:
     ]
 
 
+def batch(cands: list[dict], ctx: dict, task: dict) -> list[list[float]]:
+    """Feature rows for one policy call."""
+    rows = [features(c, ctx, task, len(cands)) for c in cands]
+    # The candidate's place in the batch by route cost: Guided's main signal, relative
+    # to what it competes with.
+    order = np.argsort(np.argsort([r[NAMES.index("cost")] for r in rows]))
+    for r, o in zip(rows, order):
+        r[-1] = o / max(len(rows) - 1, 1)
+    return rows
+
+
 def priority(d: dict) -> float:
     return d["priority"] if d["take"] else -math.inf
 
@@ -115,13 +126,7 @@ def load(dir: Path, kinds: tuple[str, ...] = ("connect", "alert")) -> Data:
             b = json.loads(line)
             cands = b["candidates"]
             g = len(run)
-            rows = [features(c, b["context"], t, len(cands)) for c in cands]
-            # The candidate's place in the batch by route cost: Guided's main signal,
-            # relative to what it competes with.
-            order = np.argsort(np.argsort([r[NAMES.index("cost")] for r in rows]))
-            for r, o in zip(rows, order):
-                r[-1] = o / max(len(rows) - 1, 1)
-            x += rows
+            x += batch(cands, b["context"], t)
             y += [int(c["label"]) for c in cands]
             prior += [priority(d) for d in b["decisions"]]
             group += [g] * len(cands)

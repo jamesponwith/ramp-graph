@@ -294,6 +294,41 @@ a four-seed average:
   mean edges includes zero for both kinds, and the point estimates favour v0.
 - **For P4, serve v0 with reweighting.** Its answers are cached for 372k entities, so
   serving them is free.
+
+## P4 results
+
+`jev.serve` is the client. `train DIR` fits the four-seed v0 model, reweighted, on every
+seed-7 task and saves it beside the cache (5 minutes, no API calls). `run URL TASKS_DIR
+--scenarios` starts each task as a `remote` run on `ramp-server -x icij_dir` and
+long-polls it. Each batch gets the training features (`data.batch`, shared with the
+loader) and the cached v0 answers about its candidates, and is answered with priority
+`log p − log(1 + relevant edges left)` and `Guided`'s breadth rule. An entity the cache
+lacks scores with NaN answers. `--budget` (off by default) pays to ask it first, from
+one cap shared by the whole run. Scoring a batch takes about 2 ms; a round trip with the
+server's step is about 28 ms.
+
+Every seed-8 task and the five synthetic scenarios, `parallel` 1, $0 spent:
+
+| | v0 served: solved | fetched p50 / p90 | `Guided` (bench, same tasks) |
+|---|---|---|---|
+| ICIJ connect | 300/300 | 188 / 2,306 | 300/300, 190 / 2,910 |
+| ICIJ alert | 298/300 | 101 / 450 | 300/300, 100 / 450 |
+| path-5hop | solved | 409 | 202 |
+| path-7hop | not in 100k | | 2,222 |
+| pivot-busy | not in 100k | | 31,407 |
+| alert (synthetic) | solved | 243 | 150 |
+| explore | runs to budget, as `Guided` does | | |
+
+- **The gate is met: no batch went unanswered past the 60 s timeout in 605 runs.**
+- **On ICIJ, v0 matches `Guided`'s median and cuts its connect p90 by a fifth.** It
+  misses two alerts that `Guided` solves, each after spending the full 200k budget.
+- **On the synthetic world it regresses.** The model saw only ICIJ batches, and two of
+  five scenarios go unsolved. P5 measures this properly; the fix to try first is
+  training on the synthetic batches too.
+- **Breadth, prefetch and `parallel` are as planned, but minimal.** Uncached entities are
+  asked before their batch is answered, not in the background, since the cache covers
+  ICIJ; `--parallel k` and `--spread` pass through to the server untested beyond 1.
+
 ## Costs and risks
 
 - **Cost.** Every one of the 334k entities is a candidate somewhere. At about 600 input
