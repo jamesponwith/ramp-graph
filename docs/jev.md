@@ -329,6 +329,49 @@ Every seed-8 task and the five synthetic scenarios, `parallel` 1, $0 spent:
   asked before their batch is answered, not in the background, since the cache covers
   ICIJ; `--parallel k` and `--spread` pass through to the server untested beyond 1.
 
+## P5 results
+
+**Training on both worlds.** The synthetic bench takes `RAMP_SEED` for its world and,
+with `RAMP_BATCHES`, writes `tasks.jsonl` and only the policy tables. Worlds 1–8 at the
+server's defaults (200k entities, 100k budget) give the synthetic batches, with NaN Jev
+answers since the world has no text. `serve train DIR --syn DIR…` fits v0 on them and on
+seed 7's ICIJ batches: 651k batches, 11 minutes.
+
+**The test.** The 596 fresh seed-8 ICIJ tasks, and the four scenarios with a signal on
+unseen worlds 101–110. Both policies ran through the same client and server
+(`serve run --policy guided` for the baseline), `parallel` 1, with no late batch and $0
+spent. An unsolved run counts as infinite.
+
+| | `Guided`: solved | fetched p50 / p90 | v0: solved | fetched p50 / p90 | v0 / `Guided`, paired geo-mean, 95% CI |
+|---|---|---|---|---|---|
+| ICIJ connect | 296/296 | 190 / 3,034 | 296/296 | **167 / 1,984** | **0.84 [0.76, 0.93]** |
+| ICIJ alert | 293/293 | 102 / 450 | 293/293 | 101 / 450 | 0.99 [0.96, 1.03] |
+| syn alert | 10/10 | 147 / 190 | 10/10 | 181 / 310 | 1.36 [0.82, 2.25] |
+| syn path-5hop | 10/10 | 173 / 268 | 10/10 | 74 / 353 | 0.66 [0.40, 1.11] |
+| syn path-7hop | 10/10 | 3,792 / 4,565 | 10/10 | **638 / 1,539** | **0.14 [0.08, 0.23]** |
+| syn pivot-busy | 8/10 | 64,800 / ∞ | **10/10** | **29,743 / 35,206** | **0.41 [0.27, 0.59]** |
+
+On ICIJ connect, `Guided` finds the cheapest path in 270 of 296 runs (mean cost 1.010×
+the cheapest) and v0 in 205 (1.036×), at the same widest hub (812 and 815). Wall p50 is
+1.3 s and 0.7 s.
+
+- **The gate is met.** v0 solves every task `Guided` solves, plus two pivot-busy worlds.
+  It fetches fewer edges at p50 and p90 on ICIJ connect, 16% fewer per task with an
+  interval that excludes zero. It costs $0 per run while the cache covers the tasks.
+- **The synthetic batches fixed the regression.** Trained on ICIJ alone, v0 left
+  path-7hop and pivot-busy unsolved (P4). With worlds 1–8 it beats `Guided` on both by
+  2.5–7× on unseen worlds. The ICIJ numbers did not suffer: connect went from
+  188 / 2,306 in P4 to 167 / 1,984 here, on nearly the same tasks.
+- **The one scenario that looks worse is synthetic alert,** 1.36× the edges on 10 worlds,
+  with an interval that spans 1. It is a 150-edge task either way. More test worlds
+  would settle it.
+- **v0 trades path quality for edges.** It stops at the first join, like `Guided`, but
+  finds the cheapest path a quarter less often. Where analysts want the most specific
+  link, that is a cost.
+- **The cache lacks 23% of v0's connect candidates,** since v0 walks where `Guided`'s
+  traces did not. They score with NaN answers. Asking for them is the obvious next
+  spend (`--budget`), and must be estimated first.
+
 ## Costs and risks
 
 - **Cost.** Every one of the 334k entities is a candidate somewhere. At about 600 input

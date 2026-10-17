@@ -1,17 +1,23 @@
-"""`jev serve` (P4): steer `/expand` runs with the v0 model.
+"""`jev serve` (P4, P5): steer `/expand` runs with the v0 model.
 
-`uv run python -m jev.serve train DIR`: fit the four-seed v0 model, reweighted, on
-every task of DIR (cached answers only, no API calls), and save it beside the cache.
+`uv run python -m jev.serve train DIR [--syn DIR...] [--model NAME]`: fit the four-seed
+v0 model, reweighted, on every task of DIR (cached answers only, no API calls) and of
+each synthetic batches dir (`benches/expand.rs` with `RAMP_BATCHES`, no text, so NaN
+answers), and save it beside the cache.
 
 `uv run python -m jev.serve run URL [TASKS_DIR] [options]`: run each ICIJ task of
-TASKS_DIR's `tasks.jsonl` over the server at URL (started with `-x icij_dir`), and with
-`--scenarios` every synthetic scenario too. Each batch is scored from its numeric
+TASKS_DIR's `tasks.jsonl` that shares no seed with an `--exclude` dir over the server at
+URL (started with `-x icij_dir`), and with `--seeds` every synthetic scenario with a
+signal on each of those worlds. `--policy guided` (or any server policy) runs the
+baseline through the same loop. Each batch is scored from its numeric
 features and the cached Jev answers about its candidates: priority is
 `log p - log(1 + relevant edges left)`, in nats like `Guided`'s, so `--spread 1`
 means the same. Breadth is `Guided`'s rule: every relevant relation, up to 1/64 of the
 remaining budget (at least 16) per visit. An entity the cache lacks gets NaN features,
 unless `--budget` dollars (shared by the whole run, off by default) pays to ask it
 before its batch is answered. One JSON line per run goes to `--out`.
+
+`uv run python -m jev.serve table A.jsonl B.jsonl...`: the P5 table of those runs.
 """
 
 import argparse
@@ -32,21 +38,28 @@ from .holdout import FITS, answers
 from .research import CACHE, loaded
 
 MODELS = CACHE / "serve"
-SCENARIOS = ("path-5hop", "path-7hop", "pivot-busy", "alert", "explore")
+# The scenarios with a planted signal: `explore` has none, so it is never solved.
+SCENARIOS = ("path-5hop", "path-7hop", "pivot-busy", "alert")
 # What a candidate not worth expanding gets: JSON has no -inf.
 SKIP = -1e300
 
 
-def train(dir: Path) -> None:
+def train(dir: Path, syn: list[Path], name: str) -> None:
     d = loaded(dir)
+    parts = [replace(d, x=np.hstack([d.x, answers(dir, d, np.ones(len(d.y), bool), 0.0)]))]
+    for s in syn:
+        e = data.load(s, SCENARIOS)
+        nan = np.full((len(e.y), len(questions.NAMES)), np.nan, np.float32)
+        parts.append(replace(e, x=np.hstack([e.x, nan])))
+    d = data.concat(parts)
+    print(f"  {len(d.run):,} batches, {len(d.y):,} candidates", flush=True)
     every = np.ones(len(d.y), bool)
-    x = np.hstack([d.x, answers(dir, d, every, 0.0)])
     names = data.NAMES + questions.NAMES
     MODELS.mkdir(exist_ok=True)
     for seed in range(FITS):
-        m = rank.fit(replace(d, x=x), every, names, seed=seed, reweight=True)
-        m.save_model(str(MODELS / f"v0.{seed}.cbm"))
-        print(f"  saved v0.{seed}", flush=True)
+        m = rank.fit(d, every, names, seed=seed, reweight=True)
+        m.save_model(str(MODELS / f"{name}.{seed}.cbm"))
+        print(f"  saved {name}.{seed}", flush=True)
 
 
 def call(method: str, url: str, body: dict | None = None) -> dict:
@@ -98,7 +111,7 @@ def run(url: str, req: dict, models: list, budget: float, spent0: float) -> dict
     started = time.time()
     r = call("POST", f"{url}/expand", req)
     run_id, task = r["id"], r["task"]
-    batches, late = 0, False
+    batches, late, seen, known = 0, False, 0, 0
     try:
         while True:
             a = call("GET", f"{url}/expand/{run_id}?wait=25")
@@ -114,6 +127,8 @@ def run(url: str, req: dict, models: list, budget: float, spent0: float) -> dict
                 got = client.answers(texts, questions.QUESTIONS, cache)
             for c in a["candidates"]:
                 got.setdefault(c["id"], dict.fromkeys(questions.QUESTIONS))
+            seen += len(a["candidates"])
+            known += sum(None not in v.values() for v in got.values())
             body = {"seq": a["seq"], "decisions": decide(models, task, a, got)}
             try:
                 call("POST", f"{url}/expand/{run_id}", body)
@@ -126,10 +141,13 @@ def run(url: str, req: dict, models: list, budget: float, spent0: float) -> dict
     finally:
         call("DELETE", f"{url}/expand/{run_id}")
     rep = a["report"]
-    solved = rep["done_at"] is not None
+    path = rep.get("path") or {}
     return {
         **req,
-        "solved": solved,
+        "solved": rep["done_at"] is not None,
+        "cost/best": path["cost"] / path["best"] if path.get("best") else None,
+        "widest": path.get("widest"),
+        "answered": known / seen if seen else None,
         "fetched": rep["fetched"],
         "rounds": rep["rounds"],
         "batches": batches,
@@ -139,26 +157,47 @@ def run(url: str, req: dict, models: list, budget: float, spent0: float) -> dict
     }
 
 
-def summary(rows: list[dict]) -> None:
+def kind(r: dict) -> str:
+    return r.get("goal") or f"syn {r['scenario']}"
+
+
+def summary(rows: list[dict], label: str = "") -> None:
+    """Per kind: solved, fetched p50/p90 (an unsolved run counts as infinite, as in the
+    benches), cheapest-path rate, cost over the cheapest, widest hub p50, wall p50,
+    batches answered late, and the share of candidates with every Jev answer."""
     by: dict[str, list[dict]] = {}
     for r in rows:
-        by.setdefault(r.get("goal") or f"syn {r['scenario']}", []).append(r)
-    for k, rs in by.items():
-        f = [r["fetched"] for r in rs if r["solved"]]
-        p50, p90 = (np.percentile(f, q) if f else math.nan for q in (50, 90))
-        print(
-            f"  {k:10} solved {sum(r['solved'] for r in rs)}/{len(rs)}  fetched p50 {p50:,.0f}"
-            f" p90 {p90:,.0f}  late {sum(r['late'] for r in rs)}"
-            f"  wall {sum(r['wall'] for r in rs):.0f}s"
+        by.setdefault(kind(r), []).append(r)
+    for k, rs in sorted(by.items()):
+        f = [r["fetched"] if r["solved"] else math.inf for r in rs]
+        p50, p90 = (np.percentile(f, q, method="higher") for q in (50, 90))
+        ratio = [r["cost/best"] for r in rs if r["solved"] and r.get("cost/best")]
+        hub = [r["widest"] for r in rs if r["solved"] and r.get("widest") is not None]
+        line = (
+            f"  {label:8} {k:15} solved {sum(r['solved'] for r in rs):3}/{len(rs):<3}"
+            f" fetched p50 {p50:>8,.0f} p90 {p90:>8,.0f}"
         )
+        if ratio:
+            cheapest = sum(x < 1 + 1e-9 for x in ratio)
+            line += f"  cheapest {cheapest}/{len(ratio)} cost/best {np.mean(ratio):.3f}"
+            line += f" widest {np.median(hub):,.0f}"
+        line += f"  wall p50 {np.median([r['wall'] for r in rs]):.1f}s"
+        line += f"  late {sum(r['late'] for r in rs)}"
+        if rs[0].get("answered") is not None:
+            line += f"  answered {np.mean([r['answered'] for r in rs]):.0%}"
+        print(line)
 
 
 def main() -> None:
     a = argparse.ArgumentParser()
-    a.add_argument("cmd", choices=["train", "run"])
-    a.add_argument("target", help="train: batches DIR; run: server URL")
-    a.add_argument("tasks", type=Path, nargs="?")
-    a.add_argument("--scenarios", action="store_true")
+    a.add_argument("cmd", choices=["train", "run", "table"])
+    a.add_argument("target", help="train: batches DIR; run: server URL; table: a run file")
+    a.add_argument("tasks", type=Path, nargs="*", help="run: ICIJ tasks DIR; table: more")
+    a.add_argument("--syn", type=Path, nargs="*", default=[])
+    a.add_argument("--model", default="v0")
+    a.add_argument("--policy", default="remote")
+    a.add_argument("--exclude", type=Path, nargs="*", default=[])
+    a.add_argument("--seeds", type=int, nargs="*", default=[], help="synthetic worlds")
     a.add_argument("--limit", type=int)
     a.add_argument("--budget", type=float, default=0.0)
     a.add_argument("--parallel", type=int, default=1)
@@ -167,17 +206,23 @@ def main() -> None:
     a.add_argument("--out", type=Path, default=CACHE / "serve.jsonl")
     args = a.parse_args()
     if args.cmd == "train":
-        train(Path(args.target))
+        train(Path(args.target), args.syn, args.model)
+        return
+    if args.cmd == "table":
+        for f in [Path(args.target), *args.tasks]:
+            summary([json.loads(line) for line in f.read_text().splitlines()], f.stem)
         return
     models = []
-    for seed in range(FITS):
+    for seed in range(FITS if args.policy == "remote" else 0):
         m = CatBoostClassifier()
-        m.load_model(str(MODELS / f"v0.{seed}.cbm"))
+        m.load_model(str(MODELS / f"{args.model}.{seed}.cbm"))
         models.append(m)
-    common = {"policy": "remote", "parallel": args.parallel, "spread": args.spread}
+    common = {"policy": args.policy, "parallel": args.parallel, "spread": args.spread}
     reqs = []
-    if args.tasks:
-        for t in list(data.read_tasks(args.tasks).values())[: args.limit]:
+    seen = {s for d in args.exclude for t in data.read_tasks(d).values() for s in t["seeds"]}
+    for dir in args.tasks:
+        fresh = [t for t in data.read_tasks(dir).values() if not seen & set(t["seeds"])]
+        for t in fresh[: args.limit]:
             reqs.append(
                 {
                     **common,
@@ -187,8 +232,7 @@ def main() -> None:
                     "budget": t["budget"],
                 }
             )
-    if args.scenarios:
-        reqs += [{**common, "scenario": s} for s in SCENARIOS]
+    reqs += [{**common, "scenario": s, "seed": w} for w in args.seeds for s in SCENARIOS]
     spent0 = client.Cache(CACHE / "jev.sqlite").spent()
     rows = []
     with ThreadPoolExecutor(args.runs) as pool, args.out.open("w") as out:

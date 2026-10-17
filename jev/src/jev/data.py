@@ -144,6 +144,20 @@ def load(dir: Path, kinds: tuple[str, ...] = ("connect", "alert")) -> Data:
     )
 
 
+def concat(parts: list[Data]) -> Data:
+    """One dataset of several, group numbers shifted to stay contiguous."""
+    shift = np.cumsum([0] + [len(d.run) for d in parts[:-1]])
+    return Data(
+        np.vstack([d.x for d in parts]),
+        np.concatenate([d.y for d in parts]),
+        np.concatenate([d.group + k for d, k in zip(parts, shift)]),
+        np.concatenate([d.prior for d in parts]),
+        [r for d in parts for r in d.run],
+        [t for d in parts for t in d.task],
+        np.concatenate([d.id for d in parts]),
+    )
+
+
 def split(tasks: dict[str, dict], test: float = 0.2, salt: str = "") -> set[str]:
     """Test tasks: whole components of tasks that share a seed, so no seed entity is
     in both sides. Deterministic; another `salt` draws another split."""
