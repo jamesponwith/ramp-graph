@@ -130,4 +130,5 @@ def main() -> None:
             print(f"  ahead, v0 - numeric: 95% CI [{lo:+.1f}, {hi:+.1f}]")
 
 
-main()
+if __name__ == "__main__":
+    main()
