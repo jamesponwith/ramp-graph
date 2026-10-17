@@ -1,11 +1,12 @@
 //! Expansion scenarios: every policy on every planted scenario, then the read path.
 //!
 //! `cargo bench -p ramp-expand --bench expand [-- N [BUDGET]]` (N = 2,000,000 world
-//! entities, BUDGET = 400,000 fetched edges per run). With `RAMP_TRACE=dir`, each run's
-//! decision trace is written to `dir/<scenario>.<policy>.jsonl`, labelled with the
-//! scenario's planted signal: training data for a learned policy. With
-//! `RAMP_BATCHES=dir`, every policy call goes to the same name, each candidate labelled
-//! by whether it is an endpoint of a planted signal edge.
+//! entities, BUDGET = 400,000 fetched edges per run; `RAMP_SEED` draws the world, 42 by
+//! default). With `RAMP_TRACE=dir`, each run's decision trace is written to
+//! `dir/<scenario>.s<seed>.<policy>.jsonl`, labelled with the scenario's planted signal:
+//! training data for a learned policy. With `RAMP_BATCHES=dir`, every policy call goes
+//! to the same name, each candidate labelled by whether it is an endpoint of a planted
+//! signal edge, the tasks go to `dir/tasks.jsonl`, and only the policy tables run.
 
 use std::time::{Duration, Instant};
 
@@ -45,6 +46,7 @@ fn run_k(
     reads: Reads,
     k: usize,
 ) -> Result<(Report, usize)> {
+    let seed = world_seed();
     let dir = tempfile::tempdir().map_err(|e| GraphError::Io(e.to_string()))?;
     let g = Graph::open(dir.path().join("g.db"))?;
     let mut task = s.task.clone();
@@ -64,7 +66,7 @@ fn run_k(
             .count();
         !s.signal.is_empty() && recovered == s.signal.len()
     })?;
-    let file: String = format!("{}.{name}.jsonl", s.name)
+    let file: String = format!("{}.s{seed}.{name}.jsonl", s.name)
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || "-.".contains(c) {
@@ -98,6 +100,14 @@ fn run_k(
     Ok((report, recovered))
 }
 
+/// `RAMP_SEED`, or 42.
+fn world_seed() -> u64 {
+    std::env::var("RAMP_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(42)
+}
+
 fn cost(at: Option<u64>) -> String {
     at.map_or_else(|| "—".to_owned(), |f| f.to_string())
 }
@@ -110,7 +120,7 @@ fn main() -> Result<()> {
     let n = u32::try_from(args.next().unwrap_or(2_000_000)).unwrap_or(u32::MAX);
     let budget = args.next().unwrap_or(400_000);
     let started = Instant::now();
-    let mut builder = Builder::random(n, 42);
+    let mut builder = Builder::random(n, world_seed());
     let scenarios = scenario::plant(&mut builder);
     let mut world = builder.build();
     println!(
@@ -124,6 +134,21 @@ fn main() -> Result<()> {
     println!("budget: {budget} fetched edges per run\n");
     for s in scenarios.iter().filter(|s| !s.signal.is_empty()) {
         table(&world, s, budget)?;
+    }
+    if let Some(dir) = std::env::var_os("RAMP_BATCHES") {
+        let mut rows = Vec::new();
+        for s in scenarios.iter().filter(|s| !s.signal.is_empty()) {
+            let mut task = s.task.clone();
+            task.budget = budget;
+            let run = format!("{}.s{}", s.name, world_seed());
+            let row = serde_json::json!({"run": run, "task": wire::task(&task, &world)});
+            rows.extend(row.to_string().into_bytes());
+            rows.push(b'\n');
+        }
+        std::fs::write(std::path::Path::new(&dir).join("tasks.jsonl"), rows)
+            .map_err(|e| GraphError::Io(e.to_string()))?;
+        // The sections below rerun `Guided` under the same file names.
+        return Ok(());
     }
     if let Some(s) = scenarios.iter().find(|s| s.name == "explore") {
         read_path(&world, s, budget)?;

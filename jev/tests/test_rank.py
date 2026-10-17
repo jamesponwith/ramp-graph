@@ -65,3 +65,20 @@ def test_weights_undo_the_cut():
     assert np.allclose(w[(y == 0) & (g == 0)], 245 / 59)
     assert (w[(y == 0) & (g == 1)] == 1).all()
     assert np.isclose(w[g == 0].sum(), 250)
+
+
+def test_concat_shifts_groups():
+    def two(n):
+        return data.Data(
+            x=np.zeros((n, 1), np.float32),
+            y=np.zeros(n, np.int8),
+            group=np.repeat([0, 1], [1, n - 1]),
+            prior=np.zeros(n),
+            run=["a", "b"],
+            task=["a", "b"],
+            id=np.arange(n),
+        )
+
+    d = data.concat([two(3), two(4)])
+    assert d.group.tolist() == [0, 1, 1, 2, 3, 3, 3]
+    assert d.run == ["a", "b", "a", "b"] and len(d.id) == 7
