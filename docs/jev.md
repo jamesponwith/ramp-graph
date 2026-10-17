@@ -273,9 +273,27 @@ On the seed-8 test tasks, the change helps less:
   200 edges, so on mean edges the model and `Guided` are tied on test, and the
   reweighting gain over P1 is within noise.
 - **The log scale.** Reweighting is still best there: 1.81 against 2.35 for `Guided`.
-- **v0 on seed 8 was not run.** The TypeSafe account ran out (402) on the first call,
-  and nothing was billed. Run it with `--reweight --budget 1.25` once the account has
-  funds.
+
+### v0 on the larger test set
+
+38,124 entities in the scored seed-8 rows were not cached. Asking them cost $1.31 on
+the ledger, in two capped runs: $1.25 and then $0.06. Per-task means, with each model
+a four-seed average:
+
+| test (seed 8) | `Guided` | numeric | v0 | v0 P1 setting | v0 − numeric, 95% CI |
+|---|---|---|---|---|---|
+| connect, edges ahead | 143 | 159 | 151 | 163 | [−21, +6] |
+| connect, log1p(ahead) | 2.35 | 1.81 | **1.70** | 1.74 | |
+| alert, edges ahead | 15.8 | 13.1 | **12.7** | 14.7 | [−3.5, +2.7] |
+| alert, log1p(ahead) | 0.59 | 0.58 | 0.59 | 0.61 | |
+
+- **v0 with reweighting is the best model on every measure but one.** Jev's entity
+  answers and the cost fix each help, and they add up. The exception is connect mean
+  edges, where `Guided` still leads, 143 against 151, inside a wide tail interval.
+- **The Jev gain is not significant, even with 296 tasks per kind.** v0 − numeric on
+  mean edges includes zero for both kinds, and the point estimates favour v0.
+- **For P4, serve v0 with reweighting.** Its answers are cached for 372k entities, so
+  serving them is free.
 ## Costs and risks
 
 - **Cost.** Every one of the 334k entities is a candidate somewhere. At about 600 input
