@@ -243,10 +243,39 @@ Numeric (four-seed average) against `Guided`'s own order, per-task means:
   against 143), because its misses are expensive.
 - **Alert: a tie.**
 - **So the P1 cost correction is not finished.** `log p − log1p(left)` still lets
-  high-confidence, expensive candidates rank first. A loss that charges edges directly
-  (weighting each row by its cost, or a final `ahead` check when choosing models) is the
-  next fix, and it is free.
+  high-confidence, expensive candidates rank first.
 
+### The cost fix
+
+The 64-row cut keeps every positive and samples the negatives, which inflates `p` most
+in big hub batches, where candidates are expensive. `rank.fit(reweight=True)` weighs
+each kept negative by its batch's negatives over those kept. The fix was tuned on a
+third set: `RAMP_SEED=9`, 592 tasks that share no seed with seed 7 or seed 8
+(`holdout --sweep`, numeric only, free). Per-task means of edges ahead:
+
+| validation (seed 9) | `Guided` | P1 setting | `alpha` 1.5 | `alpha` 2 | reweight | reweight, `alpha` 2 |
+|---|---|---|---|---|---|---|
+| connect | 166 | 213 | 222 | 229 | **138** | 151 |
+| alert | 35.1 | 45.6 | 42.7 | 42.2 | 43.8 | 36.8 |
+
+A stronger cost term (`alpha` > 1) makes connect worse. Reweighting fixes it: on
+validation, connect beats `Guided` with an interval of [−45, −13]. Reweighting with
+`alpha` 1 is kept, so no knob is added.
+
+On the seed-8 test tasks, the change helps less:
+
+| test (seed 8) | `Guided` | P1 setting | reweight | reweight − `Guided`, 95% CI |
+|---|---|---|---|---|
+| connect | 143 | 166 | 159 | [−53, +140] |
+| alert | 15.8 | 13.7 | 13.1 | [−7.0, +0.8] |
+
+- **Mean edges is dominated by a few long tasks.** The connect interval spans almost
+  200 edges, so on mean edges the model and `Guided` are tied on test, and the
+  reweighting gain over P1 is within noise.
+- **The log scale.** Reweighting is still best there: 1.81 against 2.35 for `Guided`.
+- **v0 on seed 8 was not run.** The TypeSafe account ran out (402) on the first call,
+  and nothing was billed. Run it with `--reweight --budget 1.25` once the account has
+  funds.
 ## Costs and risks
 
 - **Cost.** Every one of the 334k entities is a candidate somewhere. At about 600 input
