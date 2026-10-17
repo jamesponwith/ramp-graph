@@ -1,14 +1,19 @@
-"""`uv run python -m jev.holdout TRAIN_DIR TEST_DIR [BUDGET]`: train on every task of
+"""`uv run python -m jev.holdout TRAIN_DIR TEST_DIR [options]`: train on every task of
 TRAIN_DIR and score on the tasks of TEST_DIR (another bench seed, `RAMP_SEED`) that
-share no seed entity with them: a larger held-out set than the 85 test tasks of one
-dataset's split.
+share no seed entity with TRAIN_DIR or any `--exclude` dir.
 
-v0 answers come from the cache. Entities it lacks are asked only within BUDGET
-dollars (default 0, and then they stay NaN). Numeric and v0 are each a four-seed
-average, against `Guided`'s own order on the same batches.
+- `--sweep`: numeric only, for each cost setting (`reweight` off and on, `alpha` 1 to 4):
+  the free tuning run, on a validation seed.
+- Otherwise, numeric and v0 at `--alpha`/`--reweight` against the P1 setting and
+  `Guided`'s own order. v0 answers come from the cache. Entities it lacks are asked
+  only within `--budget` dollars, and v0 is skipped while any are missing.
+
+Each model is a four-seed average. Batches of one task are correlated, and long tasks
+have hundreds, so every metric is averaged per task first, and intervals resample
+tasks. `ahead` (edges before the first positive) is what the budget pays.
 """
 
-import sys
+import argparse
 from dataclasses import replace
 from pathlib import Path
 
@@ -36,11 +41,23 @@ def answers(dir: Path, d: data.Data, rows: np.ndarray, budget: float) -> np.ndar
 
 
 def main() -> None:
-    train_dir, test_dir = Path(sys.argv[1]), Path(sys.argv[2])
-    budget = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
-    tr, te = loaded(train_dir), data.load(test_dir)
-    seen = {s for t in data.read_tasks(train_dir).values() for s in t["seeds"]}
-    fresh = {name for name, t in data.read_tasks(test_dir).items() if not seen & set(t["seeds"])}
+    a = argparse.ArgumentParser()
+    a.add_argument("train", type=Path)
+    a.add_argument("test", type=Path)
+    a.add_argument("--exclude", type=Path, nargs="*", default=[])
+    a.add_argument("--budget", type=float, default=0.0)
+    a.add_argument("--alpha", type=float, default=1.0)
+    a.add_argument("--reweight", action="store_true")
+    a.add_argument("--sweep", action="store_true")
+    args = a.parse_args()
+    tr, te = loaded(args.train), data.load(args.test)
+    seen = {
+        s
+        for dir in [args.train, *args.exclude]
+        for t in data.read_tasks(dir).values()
+        for s in t["seeds"]
+    }
+    fresh = {n for n, t in data.read_tasks(args.test).items() if not seen & set(t["seeds"])}
     pos = np.bincount(te.group, te.y, len(te.run))
     size = np.bincount(te.group, minlength=len(te.run))
     scored = np.flatnonzero(
@@ -50,58 +67,67 @@ def main() -> None:
         & (pos < size)
     )
     m = rank.rows(te, scored)
-    print(f"{len(fresh)} fresh test tasks, {len(scored)} scored batches")
-    jte = answers(test_dir, te, m, budget)
-    covered = np.mean(~np.isnan(jte[m, 0]))
-    print(f"v0 answers for {covered:.2%} of scored test rows")
-    every = np.ones(len(tr.y), bool)
-    variants = [("numeric", tr.x, te.x, data.NAMES)]
-    if covered == 1:
-        jtr = answers(train_dir, tr, every, 0.0)
-        both = data.NAMES + questions.NAMES
-        variants.append(("v0", np.hstack([tr.x, jtr]), np.hstack([te.x, jte]), both))
-    else:
-        print("  v0 skipped: a partial column would bias it (pass a BUDGET to ask the rest)")
-
+    print(f"{len(fresh)} fresh tasks, {len(scored)} scored batches", flush=True)
     kind = np.array([r.split(".")[0] for r in te.run])[scored]
-    # Batches of one task are correlated, and long tasks have hundreds: every metric is
-    # averaged per task first, and intervals resample tasks.
     task_of = np.unique(np.array(te.task)[scored], return_inverse=True)[1]
+    left = np.expm1(te.x[m, rank.LEFT])
+    every = np.ones(len(tr.y), bool)
 
     def by_task(v: np.ndarray, sel: np.ndarray) -> np.ndarray:
         t = task_of[sel]
-        return np.bincount(t, v[sel])[np.unique(t)] / np.bincount(t)[np.unique(t)]
+        u = np.unique(t)
+        return np.bincount(t, v[sel])[u] / np.bincount(t)[u]
 
-    left = np.expm1(te.x[m, rank.LEFT])
-
-    def per(score: np.ndarray) -> dict[str, np.ndarray]:
-        return rank.per_group(score, te.y[m], te.group[m], 5, left)
-
-    out = {"guided": per(te.prior[m])}
-    for name, xtr, xte, names in variants:
+    def p_of(xtr: np.ndarray, xte: np.ndarray, names: list[str], reweight: bool) -> np.ndarray:
         p = np.zeros(m.sum())
         for seed in range(FITS):
-            model = rank.fit(replace(tr, x=xtr), every, names, seed=seed)
+            model = rank.fit(replace(tr, x=xtr), every, names, seed=seed, reweight=reweight)
             p += model.predict_proba(xte[m])[:, 1] / FITS
-        out[name] = per(np.log(p) - te.x[m, rank.LEFT])
-        print(f"  fitted {name}", flush=True)
+        return p
 
-    print(" " * 18 + "".join(f"{n:>12}" for n in out))
+    def ahead(score: np.ndarray) -> np.ndarray:
+        return rank.per_group(score, te.y[m], te.group[m], 5, left)["ahead"]
+
+    out = {"guided": ahead(te.prior[m])}
+    cost = te.x[m, rank.LEFT]
+    if args.sweep:
+        for reweight in (False, True):
+            p = p_of(tr.x, te.x, data.NAMES, reweight)
+            for alpha in (1.0, 1.5, 2.0, 3.0, 4.0):
+                out[f"{'rw' if reweight else 'p'} a{alpha:g}"] = ahead(np.log(p) - alpha * cost)
+            print(f"  fitted reweight={reweight}", flush=True)
+    else:
+        jte = answers(args.test, te, m, args.budget)
+        covered = np.mean(~np.isnan(jte[m, 0]))
+        print(f"v0 answers for {covered:.2%} of scored rows")
+        variants = [("numeric", tr.x, te.x, data.NAMES)]
+        if covered == 1:
+            jtr = answers(args.train, tr, every, 0.0)
+            both = data.NAMES + questions.NAMES
+            variants.append(("v0", np.hstack([tr.x, jtr]), np.hstack([te.x, jte]), both))
+        else:
+            print("  v0 skipped: a partial column would bias it (--budget asks the rest)")
+        for name, xtr, xte, names in variants:
+            if args.alpha != 1 or args.reweight:
+                out[f"{name} P1"] = ahead(np.log(p_of(xtr, xte, names, False)) - cost)
+            p = p_of(xtr, xte, names, args.reweight)
+            out[name] = ahead(np.log(p) - args.alpha * cost)
+            print(f"  fitted {name}", flush=True)
+
+    width = max(len(n) for n in out) + 2
+    print(" " * 16 + "".join(f"{n:>{width}}" for n in out))
     for k in ("connect", "alert"):
         sel = kind == k
         print(f"{k} ({sel.sum()} batches, {len(np.unique(task_of[sel]))} tasks; per-task means)")
-        for metric, f in (
-            ("log1p(ahead)", lambda r: np.log1p(r["ahead"])),
-            ("ahead", lambda r: r["ahead"]),
-            ("top1", lambda r: r["top1"]),
-        ):
+        for metric, f in (("log1p(ahead)", np.log1p), ("ahead", lambda v: v)):
             means = (by_task(f(r), sel).mean() for r in out.values())
-            print(f"  {metric:16}" + "".join(f"{v:12.3f}" for v in means))
-        pairs = [("numeric", "guided"), ("v0", "guided"), ("v0", "numeric")]
-        for a, b in (p for p in pairs if p[0] in out):
-            diff = np.log1p(out[a]["ahead"]) - np.log1p(out[b]["ahead"])
-            lo, hi = rank.bootstrap(by_task(diff, sel))
-            print(f"  log1p(ahead), {a} - {b}: 95% CI [{lo:+.3f}, {hi:+.3f}]")
+            print(f"  {metric:14}" + "".join(f"{v:{width}.3f}" for v in means))
+        for name in list(out)[1:]:
+            lo, hi = rank.bootstrap(by_task(out[name] - out["guided"], sel))
+            print(f"  ahead, {name} - guided: 95% CI [{lo:+.1f}, {hi:+.1f}]")
+        if "v0" in out:
+            lo, hi = rank.bootstrap(by_task(out["v0"] - out["numeric"], sel))
+            print(f"  ahead, v0 - numeric: 95% CI [{lo:+.1f}, {hi:+.1f}]")
 
 
 main()

@@ -71,6 +71,17 @@ def capped(d: Data, m: np.ndarray, cap: int, seed: int) -> np.ndarray:
     return out
 
 
+def weights(d: Data, train: np.ndarray, m: np.ndarray) -> np.ndarray:
+    """Per row of `m` (cut from `train`): 1 for a positive, and for a negative its
+    group's negatives in `train` over those kept in `m`."""
+    n = len(d.run)
+    neg = d.y == 0
+    total = np.bincount(d.group[train & neg], minlength=n)
+    kept = np.bincount(d.group[m & neg], minlength=n)
+    g = d.group[m]
+    return np.where(d.y[m] == 0, total[g] / np.maximum(kept[g], 1), 1.0)
+
+
 def fit(
     d: Data,
     train: np.ndarray,
@@ -78,18 +89,22 @@ def fit(
     iterations: int = 500,
     cap: int = 64,
     seed: int = 0,
+    reweight: bool = False,
 ) -> CatBoostClassifier:
     """A classifier on the rows `train` (a mask), each group cut to `cap` rows. `d.x`
-    holds `names`, which start with `data.NAMES`."""
+    holds `names`, which start with `data.NAMES`. `reweight` weighs each kept negative
+    by its group's negatives over those kept, undoing the cut's inflation of `p` in
+    big groups."""
     m = capped(d, train, cap, seed)
+    weight = weights(d, train, m) if reweight else None
     model = CatBoostClassifier(
         iterations=iterations, random_seed=seed, verbose=False, allow_writing_files=False
     )
-    model.fit(Pool(d.x[m], label=d.y[m], feature_names=names))
+    model.fit(Pool(d.x[m], label=d.y[m], feature_names=names, weight=weight))
     return model
 
 
-def priority(model: CatBoostClassifier, x: np.ndarray) -> np.ndarray:
-    """Chance on the path per edge: `log p - log(1 + relevant edges left)`."""
+def priority(model: CatBoostClassifier, x: np.ndarray, alpha: float = 1.0) -> np.ndarray:
+    """Chance on the path per edge: `log p - alpha * log(1 + relevant edges left)`."""
     p = model.predict_proba(Pool(x, feature_names=model.feature_names_))[:, 1]
-    return np.log(p) - x[:, LEFT]
+    return np.log(p) - alpha * x[:, LEFT]

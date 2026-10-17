@@ -43,3 +43,25 @@ def test_capped_keeps_positives():
     m = rank.capped(d, np.ones(n, bool), 8, 0)
     assert m[:250].sum() == 8 and m[250:].sum() == 8
     assert (d.y[m] == 1).sum() == 6  # every positive: 5 in group 0, 1 in group 1
+
+
+def test_weights_undo_the_cut():
+    n = 300
+    d = data.Data(
+        x=np.zeros((n, 1), np.float32),
+        y=(np.arange(n) % 50 == 0).astype(np.int8),
+        group=np.repeat([0, 1], [250, 50]),
+        prior=np.zeros(n),
+        run=["a", "b"],
+        task=["a", "b"],
+        id=np.arange(n),
+    )
+    every = np.ones(n, bool)
+    m = rank.capped(d, every, 64, 0)
+    w = rank.weights(d, every, m)
+    y, g = d.y[m], d.group[m]
+    assert (w[y == 1] == 1).all()
+    # Group 0: 245 negatives, 59 kept; group 1 is under the cap and keeps all 49.
+    assert np.allclose(w[(y == 0) & (g == 0)], 245 / 59)
+    assert (w[(y == 0) & (g == 1)] == 1).all()
+    assert np.isclose(w[g == 0].sum(), 250)
