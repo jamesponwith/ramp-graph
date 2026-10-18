@@ -374,6 +374,21 @@ the cheapest) and v0 in 205 (1.036×), at the same widest hub (812 and 815). Wal
   entities with text, median 228 characters: about $1.07 at the input rate, or about
   $1.25 at the rate the ledger has billed for v0 so far. One pass is not the end of it:
   with answers, v0 walks elsewhere and meets new uncached entities.
+- **Jev's share of the win is small, so that spend waits.** The same model without Jev
+  answers (`train --numeric`), served on the same 589 tasks:
+
+  | ICIJ, paired geo-mean of edges fetched, 95% CI | connect | alert |
+  |---|---|---|
+  | numeric / `Guided` | 0.88 [0.80, 0.95] | 0.99 [0.96, 1.02] |
+  | v0 / `Guided` | 0.84 [0.76, 0.93] | 0.99 [0.96, 1.03] |
+  | v0 / numeric | 0.96 [0.87, 1.06] | 1.00 [0.97, 1.04] |
+
+  Numeric's connect p50 / p90 is 191 / 2,151 (v0: 167 / 1,984). It finds the cheapest
+  path in 199 of 296 runs (v0: 205), with a widest hub of 738 (v0: 815). Most of the
+  gain over `Guided` is the learned cost model; Jev adds a few percent that 296 tasks
+  cannot resolve. Filling the missing 23% for about $1.25 could not show a gain this
+  test would detect, so it was not bought. A larger test set or a more decisive
+  question set comes first.
 
 ## Costs and risks
 
