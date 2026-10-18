@@ -362,9 +362,11 @@ the cheapest) and v0 in 205 (1.036×), at the same widest hub (812 and 815). Wal
   path-7hop and pivot-busy unsolved (P4). With worlds 1–8 it beats `Guided` on both by
   2.5–7× on unseen worlds. The ICIJ numbers did not suffer: connect went from
   188 / 2,306 in P4 to 167 / 1,984 here, on nearly the same tasks.
-- **The one scenario that looks worse is synthetic alert,** 1.36× the edges on 10 worlds,
-  with an interval that spans 1. It is a 150-edge task either way. More test worlds
-  would settle it.
+- **Synthetic alert is a tie, not a regression.** On the 10 worlds above it looked worse:
+  1.36× the edges, with an interval spanning 1. On 100 more unseen worlds (111–210,
+  `serve run --only alert`), v0 fetches 150 / 244 at p50 / p90 against `Guided`'s
+  165 / 256: paired 0.94× [0.80, 1.14], fewer edges in 57 worlds, more in 43. With
+  pushdown both take 2 / 3 edges in every world (see Pushdown).
 - **v0 trades path quality for edges.** It stops at the first join, like `Guided`, but
   finds the cheapest path a quarter less often. Where analysts want the most specific
   link, that is a cost.
