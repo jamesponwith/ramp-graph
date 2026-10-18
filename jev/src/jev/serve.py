@@ -246,6 +246,7 @@ def main() -> None:
     a.add_argument("--pushdown", action="store_true", help="run: push targets down")
     a.add_argument("--exclude", type=Path, nargs="*", default=[])
     a.add_argument("--seeds", type=int, nargs="*", default=[], help="synthetic worlds")
+    a.add_argument("--only", nargs="*", default=SCENARIOS, help="run: these scenarios")
     a.add_argument("--limit", type=int)
     a.add_argument("--budget", type=float, default=0.0)
     a.add_argument("--parallel", type=int, default=1)
@@ -281,7 +282,7 @@ def main() -> None:
                     "budget": t["budget"],
                 }
             )
-    reqs += [{**common, "scenario": s, "seed": w} for w in args.seeds for s in SCENARIOS]
+    reqs += [{**common, "scenario": s, "seed": w} for w in args.seeds for s in args.only]
     spent0 = client.Cache(CACHE / "jev.sqlite").spent()
     rows, lacking = [], {}
     with ThreadPoolExecutor(args.runs) as pool, args.out.open("w") as out:
