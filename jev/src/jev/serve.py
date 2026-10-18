@@ -9,7 +9,7 @@ answers), and save it beside the cache.
 TASKS_DIR's `tasks.jsonl` that shares no seed with an `--exclude` dir over the server at
 URL (started with `-x icij_dir`), and with `--seeds` every synthetic scenario with a
 signal on each of those worlds. `--policy guided` (or any server policy) runs the
-baseline through the same loop. Each batch is scored from its numeric
+baseline through the same loop. `--pushdown` gives v0 `Guided`'s pushdown (see `pushdown`). Each batch is scored from its numeric
 features and the cached Jev answers about its candidates: priority is
 `log p - log(1 + relevant edges left)`, in nats like `Guided`'s, so `--spread 1`
 means the same. Breadth is `Guided`'s rule: every relevant relation, up to 1/64 of the
@@ -75,8 +75,43 @@ def call(method: str, url: str, body: dict | None = None) -> dict:
     return json.loads(raw) if raw else {}
 
 
-def decide(models: list, task: dict, ask: dict, got: dict) -> list[dict]:
-    """One decision per candidate of `ask`."""
+def joining(task: dict, a: int, b: int) -> int | None:
+    """The relation joining domains `a` and `b`, either way round."""
+    for i, r in enumerate(task["relations"]):
+        if (r["from"], r["to"]) in ((a, b), (b, a)):
+            return i
+    return None
+
+
+def pushdown(task: dict, c: dict) -> tuple[int, dict] | None:
+    """`Guided`'s filtered fetch from `c` towards the task's target: for a candidate on
+    the task's shape with more of it beyond, the relation to its next step and the
+    target wrapped in one semi-join per step after that. `None` if the task names no
+    target or the source cannot filter, the candidate is off-shape, or that relation
+    was already fetched filtered."""
+    if not task["filters"] or task["target"] is None:
+        return None
+    at = min(h for h in c["hops"] if h is not None)
+    for shape in task["shape"]:
+        if at + 1 >= len(shape) or shape[at] != c["domain"]:
+            continue
+        f, ok = task["target"], True
+        for i in reversed(range(at + 1, len(shape) - 1)):
+            via = joining(task, shape[i], shape[i + 1])
+            if via is None:
+                ok = False
+                break
+            f = {"via": via, "then": f}
+        rel = joining(task, c["domain"], shape[at + 1])
+        if ok and rel is not None and not c["pushed"][rel]:
+            return rel, f
+    return None
+
+
+def decide(models: list, task: dict, ask: dict, got: dict, push: bool = False) -> list[dict]:
+    """One decision per candidate of `ask`. With `push`, a candidate `pushdown` applies
+    to fetches only that filtered relation, priced as one edge left, as `Guided`
+    prices it: what comes back is what can complete a hit."""
     cands, ctx = ask["candidates"], ask["context"]
     if not cands:
         return []
@@ -89,11 +124,12 @@ def decide(models: list, task: dict, ask: dict, got: dict) -> list[dict]:
     )
     # A numeric-only model reads only the leading columns.
     p = sum(m.predict_proba(x[:, : len(m.feature_names_)])[:, 1] for m in models) / len(models)
-    score = np.log(p) - x[:, rank.LEFT]
+    logp = np.log(p)
+    score = logp - x[:, rank.LEFT]
     interest = task["relation_interest"]
     breadth = max((ctx["budget"] - ctx["fetched"]) // 64, 16)
     out = []
-    for c, s in zip(cands, score):
+    for c, s, lp in zip(cands, score, logp):
         rem = [max(a - b, 0) for a, b in zip(c["peek"], c["fetched"])]
         take = [
             {"rel": r, "limit": min(n, breadth)}
@@ -102,12 +138,18 @@ def decide(models: list, task: dict, ask: dict, got: dict) -> list[dict]:
         ]
         if not take or task["domain_interest"][c["domain"]] <= 0:
             out.append({"priority": SKIP})
+        elif push and (pd := pushdown(task, c)):
+            rel, f = pd
+            filtered = {"rel": rel, "limit": breadth, "filter": f}
+            out.append({"priority": float(lp - math.log(2)), "take": [filtered]})
         else:
             out.append({"priority": float(s), "take": take})
     return out
 
 
-def run(url: str, req: dict, models: list, budget: float, spent0: float) -> dict:
+def run(
+    url: str, req: dict, models: list, budget: float, spent0: float, push: bool = False
+) -> dict:
     """One run to its end: the report, the batches decided, and whether one was late."""
     cache = client.Cache(CACHE / "jev.sqlite")
     started = time.time()
@@ -132,7 +174,7 @@ def run(url: str, req: dict, models: list, budget: float, spent0: float) -> dict
             uncached.update((i, t) for i, t in texts.items() if None in got[i].values())
             seen += len(a["candidates"])
             known += sum(None not in v.values() for v in got.values())
-            body = {"seq": a["seq"], "decisions": decide(models, task, a, got)}
+            body = {"seq": a["seq"], "decisions": decide(models, task, a, got, push)}
             try:
                 call("POST", f"{url}/expand/{run_id}", body)
             except urllib.error.HTTPError as e:
@@ -201,6 +243,7 @@ def main() -> None:
     a.add_argument("--model", default="v0")
     a.add_argument("--numeric", action="store_true", help="train: without Jev answers")
     a.add_argument("--policy", default="remote")
+    a.add_argument("--pushdown", action="store_true", help="run: push targets down")
     a.add_argument("--exclude", type=Path, nargs="*", default=[])
     a.add_argument("--seeds", type=int, nargs="*", default=[], help="synthetic worlds")
     a.add_argument("--limit", type=int)
@@ -243,7 +286,10 @@ def main() -> None:
     rows, lacking = [], {}
     with ThreadPoolExecutor(args.runs) as pool, args.out.open("w") as out:
         for n, row in enumerate(
-            pool.map(lambda r: run(args.target, r, models, args.budget, spent0), reqs), 1
+            pool.map(
+                lambda r: run(args.target, r, models, args.budget, spent0, args.pushdown), reqs
+            ),
+            1,
         ):
             lacking.update(row.pop("uncached"))
             rows.append(row)

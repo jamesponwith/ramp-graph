@@ -390,6 +390,25 @@ the cheapest) and v0 in 205 (1.036×), at the same widest hub (812 and 815). Wal
   test would detect, so it was not bought. A larger test set or a more decisive
   question set comes first.
 
+### Pushdown
+
+`serve run --pushdown` gives v0 `Guided`'s pushdown. A candidate on the task's shape,
+with more of it beyond, fetches only the relation to the next step, filtered by
+semi-joins to the target. That fetch is priced as one edge left, so its priority is
+`log p − ln 2`. Only tasks that name a target change: ICIJ alert, and synthetic alert
+and pivot-busy. Same tasks as above, against `Guided` with pushdown, $0 spent:
+
+| | `Guided`+pushdown: solved, fetched p50 / p90 | v0+pushdown | paired geo-mean, 95% CI |
+|---|---|---|---|
+| ICIJ alert | 293/293, 4 / 4 | 293/293, **2 / 3** | **0.71 [0.68, 0.74]**, fewer in 159, more in 1 |
+| syn alert | 10/10, 2 / 2 | 10/10, 2 / 2 | 1.00 |
+| syn pivot-busy | 10/10, 60 / 128 | 10/10, **7 / 18** | **0.13 [0.10, 0.19]** |
+
+Connect and the path scenarios are unchanged: they name no target. Pushdown also
+removes the one synthetic case where v0 was behind: synthetic alert drops from 181 to
+2 edges, level with `Guided`. The learned order gets more from pushdown than `Guided`'s
+does. Both take the same filtered fetches, but v0 takes the ones that pay first.
+
 ## Costs and risks
 
 - **Cost.** Every one of the 334k entities is a candidate somewhere. At about 600 input
