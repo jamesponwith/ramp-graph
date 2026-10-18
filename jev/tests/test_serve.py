@@ -1,9 +1,11 @@
 import numpy as np
 
-from jev import questions, serve
+from jev import data, questions, serve
 
 
 class Half:
+    feature_names_ = data.NAMES + questions.NAMES
+
     def predict_proba(self, x):
         return np.full((len(x), 2), 0.5)
 

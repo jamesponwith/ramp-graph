@@ -1,6 +1,6 @@
 """`jev serve` (P4, P5): steer `/expand` runs with the v0 model.
 
-`uv run python -m jev.serve train DIR [--syn DIR...] [--model NAME]`: fit the four-seed
+`uv run python -m jev.serve train DIR [--syn DIR...] [--model NAME] [--numeric]`: fit the four-seed
 v0 model, reweighted, on every task of DIR (cached answers only, no API calls) and of
 each synthetic batches dir (`benches/expand.rs` with `RAMP_BATCHES`, no text, so NaN
 answers), and save it beside the cache.
@@ -44,7 +44,7 @@ SCENARIOS = ("path-5hop", "path-7hop", "pivot-busy", "alert")
 SKIP = -1e300
 
 
-def train(dir: Path, syn: list[Path], name: str) -> None:
+def train(dir: Path, syn: list[Path], name: str, numeric: bool = False) -> None:
     d = loaded(dir)
     parts = [replace(d, x=np.hstack([d.x, answers(dir, d, np.ones(len(d.y), bool), 0.0)]))]
     for s in syn:
@@ -54,7 +54,8 @@ def train(dir: Path, syn: list[Path], name: str) -> None:
     d = data.concat(parts)
     print(f"  {len(d.run):,} batches, {len(d.y):,} candidates", flush=True)
     every = np.ones(len(d.y), bool)
-    names = data.NAMES + questions.NAMES
+    names = data.NAMES + ([] if numeric else questions.NAMES)
+    d = replace(d, x=d.x[:, : len(names)])
     MODELS.mkdir(exist_ok=True)
     for seed in range(FITS):
         m = rank.fit(d, every, names, seed=seed, reweight=True)
@@ -86,7 +87,8 @@ def decide(models: list, task: dict, ask: dict, got: dict) -> list[dict]:
             questions.features(ids, got),
         ]
     )
-    p = sum(m.predict_proba(x)[:, 1] for m in models) / len(models)
+    # A numeric-only model reads only the leading columns.
+    p = sum(m.predict_proba(x[:, : len(m.feature_names_)])[:, 1] for m in models) / len(models)
     score = np.log(p) - x[:, rank.LEFT]
     interest = task["relation_interest"]
     breadth = max((ctx["budget"] - ctx["fetched"]) // 64, 16)
@@ -197,6 +199,7 @@ def main() -> None:
     a.add_argument("tasks", type=Path, nargs="*", help="run: ICIJ tasks DIR; table: more")
     a.add_argument("--syn", type=Path, nargs="*", default=[])
     a.add_argument("--model", default="v0")
+    a.add_argument("--numeric", action="store_true", help="train: without Jev answers")
     a.add_argument("--policy", default="remote")
     a.add_argument("--exclude", type=Path, nargs="*", default=[])
     a.add_argument("--seeds", type=int, nargs="*", default=[], help="synthetic worlds")
@@ -209,7 +212,7 @@ def main() -> None:
     a.add_argument("--uncached", type=Path, help="run: where to list what the cache lacks")
     args = a.parse_args()
     if args.cmd == "train":
-        train(Path(args.target), args.syn, args.model)
+        train(Path(args.target), args.syn, args.model, args.numeric)
         return
     if args.cmd == "table":
         for f in [Path(args.target), *args.tasks]:
