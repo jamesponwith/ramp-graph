@@ -111,7 +111,7 @@ def run(url: str, req: dict, models: list, budget: float, spent0: float) -> dict
     started = time.time()
     r = call("POST", f"{url}/expand", req)
     run_id, task = r["id"], r["task"]
-    batches, late, seen, known = 0, False, 0, 0
+    batches, late, seen, known, uncached = 0, False, 0, 0, {}
     try:
         while True:
             a = call("GET", f"{url}/expand/{run_id}?wait=25")
@@ -127,6 +127,7 @@ def run(url: str, req: dict, models: list, budget: float, spent0: float) -> dict
                 got = client.answers(texts, questions.QUESTIONS, cache)
             for c in a["candidates"]:
                 got.setdefault(c["id"], dict.fromkeys(questions.QUESTIONS))
+            uncached.update((i, t) for i, t in texts.items() if None in got[i].values())
             seen += len(a["candidates"])
             known += sum(None not in v.values() for v in got.values())
             body = {"seq": a["seq"], "decisions": decide(models, task, a, got)}
@@ -148,6 +149,7 @@ def run(url: str, req: dict, models: list, budget: float, spent0: float) -> dict
         "cost/best": path["cost"] / path["best"] if path.get("best") else None,
         "widest": path.get("widest"),
         "answered": known / seen if seen else None,
+        "uncached": uncached,
         "fetched": rep["fetched"],
         "rounds": rep["rounds"],
         "batches": batches,
@@ -204,6 +206,7 @@ def main() -> None:
     a.add_argument("--spread", type=float, default=1.0)
     a.add_argument("--runs", type=int, default=4, help="concurrent runs")
     a.add_argument("--out", type=Path, default=CACHE / "serve.jsonl")
+    a.add_argument("--uncached", type=Path, help="run: where to list what the cache lacks")
     args = a.parse_args()
     if args.cmd == "train":
         train(Path(args.target), args.syn, args.model)
@@ -234,16 +237,26 @@ def main() -> None:
             )
     reqs += [{**common, "scenario": s, "seed": w} for w in args.seeds for s in SCENARIOS]
     spent0 = client.Cache(CACHE / "jev.sqlite").spent()
-    rows = []
+    rows, lacking = [], {}
     with ThreadPoolExecutor(args.runs) as pool, args.out.open("w") as out:
         for n, row in enumerate(
             pool.map(lambda r: run(args.target, r, models, args.budget, spent0), reqs), 1
         ):
+            lacking.update(row.pop("uncached"))
             rows.append(row)
             out.write(json.dumps(row) + "\n")
             if n % 50 == 0 or n == len(reqs):
                 print(f"{n}/{len(reqs)} runs", flush=True)
                 summary(rows)
+    if args.uncached:
+        todo = {i: list(questions.QUESTIONS) for i in lacking}
+        args.uncached.write_text(
+            "".join(json.dumps({"id": i, "text": t}) + "\n" for i, t in lacking.items())
+        )
+        print(
+            f"{len(lacking):,} entities with text lack answers: about "
+            f"${client.estimate(todo, lacking):.2f} to ask (input rate)"
+        )
     print(f"Jev spend this run: ${client.Cache(CACHE / 'jev.sqlite').spent() - spent0:.2f}")
 
 

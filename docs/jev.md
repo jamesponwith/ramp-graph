@@ -337,7 +337,7 @@ server's defaults (200k entities, 100k budget) give the synthetic batches, with 
 answers since the world has no text. `serve train DIR --syn DIR…` fits v0 on them and on
 seed 7's ICIJ batches: 651k batches, 11 minutes.
 
-**The test.** The 596 fresh seed-8 ICIJ tasks, and the four scenarios with a signal on
+**The test.** The 589 seed-8 ICIJ tasks that share no seed with seed 7 or seed 9, and the four scenarios with a signal on
 unseen worlds 101–110. Both policies ran through the same client and server
 (`serve run --policy guided` for the baseline), `parallel` 1, with no late batch and $0
 spent. An unsolved run counts as infinite.
@@ -369,8 +369,11 @@ the cheapest) and v0 in 205 (1.036×), at the same widest hub (812 and 815). Wal
   finds the cheapest path a quarter less often. Where analysts want the most specific
   link, that is a cost.
 - **The cache lacks 23% of v0's connect candidates,** since v0 walks where `Guided`'s
-  traces did not. They score with NaN answers. Asking for them is the obvious next
-  spend (`--budget`), and must be estimated first.
+  traces did not. They score with NaN answers. `serve run --uncached FILE` lists them
+  with no spend. The rerun reproduced the table above exactly. It found 35,902
+  entities with text, median 228 characters: about $1.07 at the input rate, or about
+  $1.25 at the rate the ledger has billed for v0 so far. One pass is not the end of it:
+  with answers, v0 walks elsewhere and meets new uncached entities.
 
 ## Costs and risks
 
