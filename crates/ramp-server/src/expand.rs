@@ -8,6 +8,7 @@
 //! - `GET /expand/<id>?wait=s` long-polls for the next batch of candidates to decide;
 //! - `POST /expand/<id>` answers it, one decision per candidate;
 //! - `GET /expand/<id>/trace` is the run's labelled decision trace, as JSON lines;
+//! - `GET /expand/<id>/batches` is every batch it asked, oracle-labelled, if asked for;
 //! - `DELETE /expand/<id>` stops and forgets the run.
 //!
 //! The wire format is `ramp_expand::wire`.
@@ -62,6 +63,8 @@ enum Check {
 #[derive(Debug)]
 struct Session {
     graph: String,
+    /// What labels the batches, if they were asked for.
+    oracle: Option<HashSet<Id>>,
     shared: Mutex<Shared>,
     changed: Condvar,
 }
@@ -74,8 +77,8 @@ struct Shared {
     ask: Option<(Value, usize)>,
     answer: Option<Vec<Decision>>,
     cancelled: bool,
-    /// Set when the run ends: the report, and the trace as JSON lines.
-    done: Option<(Value, Vec<u8>)>,
+    /// Set when the run ends: the report, the trace and the batches as JSON lines.
+    done: Option<(Value, Vec<u8>, Vec<u8>)>,
 }
 
 impl Session {
@@ -307,8 +310,14 @@ impl Sessions {
                 .ok_or_else(|| ApiError::new(400, "spread must be a non-negative number"))?,
         };
         let (world, task, check, depth) = self.world(&req, budget)?;
+        let oracle = req
+            .get("batches")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            .then(|| oracle(&world, &task, &check));
         let session = Arc::new(Session {
             graph: graph.to_owned(),
+            oracle,
             shared: Mutex::default(),
             changed: Condvar::new(),
         });
@@ -358,7 +367,7 @@ impl Sessions {
         let deadline = Instant::now() + wait.min(MAX_WAIT);
         let mut shared = session.lock();
         loop {
-            if let Some((report, _)) = &shared.done {
+            if let Some((report, ..)) = &shared.done {
                 let report = report.clone();
                 drop(shared);
                 // The run wrote without going through the API: list it as it is now.
@@ -435,7 +444,22 @@ impl Sessions {
         shared
             .done
             .as_ref()
-            .map(|(_, trace)| trace.clone())
+            .map(|(_, trace, _)| trace.clone())
+            .ok_or_else(|| ApiError::new(409, "the run is not done"))
+    }
+
+    /// `GET /expand/<id>/batches`, once the run is done: empty unless it was started
+    /// with `"batches": true`.
+    ///
+    /// # Errors
+    /// The HTTP error to send instead.
+    pub(crate) fn batches(&self, id: &str) -> Res<Vec<u8>> {
+        let session = self.get(id)?;
+        let shared = session.lock();
+        shared
+            .done
+            .as_ref()
+            .map(|(.., batches)| batches.clone())
             .ok_or_else(|| ApiError::new(409, "the run is not done"))
     }
 
@@ -456,8 +480,24 @@ impl Sessions {
     }
 }
 
-/// Runs `task` to the end; returns the report (with how much of a planted signal was
-/// recovered, or the joining path) and the trace labelled with the hits.
+/// The entities a batch's candidate is labelled positive for, as the benches label them.
+///
+/// An endpoint of a planted signal edge; for ICIJ connect, on a path between
+/// the seeds within ε of the cheapest; for an alert, sharing a company with an
+/// officer from the target country.
+fn oracle(world: &World, task: &Task, check: &Check) -> HashSet<Id> {
+    match check {
+        Check::Signal(signal) => signal.iter().flat_map(|&(a, b, _)| [a, b]).collect(),
+        Check::Join(a, b, best) => icij::near_cheapest(world, *a, *b, *best),
+        Check::Goal => icij::shared_with_target(world, task),
+    }
+}
+
+/// Runs `task` to the end: the report, the trace and the batches.
+///
+/// The report says how much of a planted signal was recovered, or the joining path; the
+/// trace is labelled with the hits; with the session's oracle, every batch is kept and
+/// labelled by it.
 fn expand(
     world: &World,
     g: &Graph,
@@ -466,14 +506,20 @@ fn expand(
     parallel: usize,
     check: &Check,
     session: &Session,
-) -> (Value, Vec<u8>) {
+) -> (Value, Vec<u8>, Vec<u8>) {
     let mut extra = match check {
         Check::Signal(signal) => json!({"signal": [0, signal.len()]}),
         Check::Join(..) | Check::Goal => json!({}),
     };
     let mut truth = HashSet::new();
     let run = Expander::new(world, g, policy, task, Reads::Projection).and_then(|ex| {
-        ex.parallel(parallel).run(|ex| {
+        let ex = ex.parallel(parallel);
+        let ex = if session.oracle.is_some() {
+            ex.log_batches()
+        } else {
+            ex
+        };
+        ex.run(|ex| {
             let done = match check {
                 Check::Signal(signal) => {
                     let recovered = signal
@@ -500,7 +546,7 @@ fn expand(
         })
     });
     match run {
-        Err(e) => (json!({"error": e.to_string()}), Vec::new()),
+        Err(e) => (json!({"error": e.to_string()}), Vec::new(), Vec::new()),
         Ok(report) => {
             if let Check::Signal(signal) = check {
                 truth = signal
@@ -513,7 +559,11 @@ fn expand(
                 o.extend(extra.clone());
                 o.insert("cancelled".to_owned(), session.lock().cancelled.into());
             }
-            (out, wire::trace(&report, &truth))
+            let batches = session
+                .oracle
+                .as_ref()
+                .map_or_else(Vec::new, |o| wire::batches(&report, |c| o.contains(&c.id)));
+            (out, wire::trace(&report, &truth), batches)
         }
     }
 }

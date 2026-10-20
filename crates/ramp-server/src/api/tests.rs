@@ -624,7 +624,8 @@ fn a_client_steers_an_expansion() {
     let t = server();
     let r = t.post(
         "/expand",
-        json!({"scenario": "alert", "entities": 20_000, "seed": 1, "budget": 50_000, "parallel": 4}),
+        json!({"scenario": "alert", "entities": 20_000, "seed": 1, "budget": 50_000, "parallel": 4,
+               "batches": true}),
     );
     assert_eq!(r.status, 201, "{}", r.body);
     let (id, graph, task) = (
@@ -686,6 +687,33 @@ fn a_client_steers_an_expansion() {
         usize::try_from(report["steps"].as_u64().unwrap()).unwrap()
     );
     assert!(rows.iter().any(|row| row["hits"].as_u64().unwrap() > 0));
+
+    // Every batch it asked, each candidate labelled by the planted signal.
+    let raw = run(
+        &t.store,
+        &Req {
+            method: "GET".to_owned(),
+            path: format!("/expand/{id}/batches"),
+            query: String::new(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        },
+    );
+    assert_eq!(raw.status, 200);
+    let batches: Vec<Value> = raw
+        .body()
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_slice(l).unwrap())
+        .collect();
+    assert_eq!(batches.len(), asked);
+    assert!(batches.iter().any(|b| {
+        b["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["label"] == true)
+    }));
 
     // The graph is an ordinary one: the standing query runs over it.
     let q = t.get(&format!(

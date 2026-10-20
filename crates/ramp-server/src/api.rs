@@ -591,6 +591,10 @@ impl<'r> Ctx<'r> {
                 self.store.expansions.trace(id)?,
                 "application/x-ndjson",
             ))),
+            ([id, "batches"], "GET") if is_uuid(id) => Ok(Reply::new(Out::Raw(
+                self.store.expansions.batches(id)?,
+                "application/x-ndjson",
+            ))),
             _ => Err(ApiError::new(
                 404,
                 format!("no handler for {}", self.req.path),

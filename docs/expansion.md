@@ -291,10 +291,11 @@ client pulls work and needs no server of its own. The JSON is `ramp_expand::wire
 
 | request | does |
 |---|---|
-| `POST /expand` | starts a run: `{"world"?, "policy"?, "budget"?, "cap"?, "timeout"?, "parallel"?, "spread"?}` plus, for the synthetic world (the default), `{"scenario", "entities"?, "seed"?}`, or for `"world": "icij"`, `{"goal": "connect", "seeds": [a, b]}` or `{"goal": "alert", "seeds": [s]}`. Returns `{"id", "graph", "task"}`: the task with its prompt and domain and relation names, and a new graph of the collection the run writes into |
+| `POST /expand` | starts a run: `{"world"?, "policy"?, "budget"?, "cap"?, "timeout"?, "parallel"?, "spread"?, "batches"?}` plus, for the synthetic world (the default), `{"scenario", "entities"?, "seed"?}`, or for `"world": "icij"`, `{"goal": "connect", "seeds": [a, b]}` or `{"goal": "alert", "seeds": [s]}`. Returns `{"id", "graph", "task"}`: the task with its prompt and domain and relation names, and a new graph of the collection the run writes into |
 | `GET /expand/<id>?wait=s` | long-polls (default 25 s): `{"state": "ask", "seq", "context", "candidates"}` (each with its `text`, if any), `{"state": "done", "report"}`, or `{"state": "running"}` |
 | `POST /expand/<id>` | `{"seq", "decisions": [{"priority", "take": [{"rel", "limit", "filter"?}]}]}`, one per candidate; 409 for a batch that is not open, 400 for the wrong count |
 | `GET /expand/<id>/trace` | the labelled decision trace, JSON lines, once done |
+| `GET /expand/<id>/batches` | with `"batches": true`, every policy call, each candidate labelled by the benches' oracle (see Decision batches), JSON lines, once done |
 | `DELETE /expand/<id>` | stops and forgets the run; its graph stays |
 
 - **`policy`** is `remote` by default: the client decides every batch, including the

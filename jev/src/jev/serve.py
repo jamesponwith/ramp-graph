@@ -44,13 +44,22 @@ SCENARIOS = ("path-5hop", "path-7hop", "pivot-busy", "alert")
 SKIP = -1e300
 
 
-def train(dir: Path, syn: list[Path], name: str, numeric: bool = False) -> None:
-    d = loaded(dir)
-    parts = [replace(d, x=np.hstack([d.x, answers(dir, d, np.ones(len(d.y), bool), 0.0)]))]
-    for s in syn:
-        e = data.load(s, SCENARIOS)
-        nan = np.full((len(e.y), len(questions.NAMES)), np.nan, np.float32)
-        parts.append(replace(e, x=np.hstack([e.x, nan])))
+def with_answers(dir: Path, d: data.Data) -> data.Data:
+    """`d` with its cached v0 answers as columns: NaN where the cache lacks them, and
+    everywhere if `dir` has no entity text (the synthetic world)."""
+    if (dir / "entities.jsonl").exists():
+        cols = answers(dir, d, np.ones(len(d.y), bool), 0.0)
+    else:
+        cols = np.full((len(d.y), len(questions.NAMES)), np.nan, np.float32)
+    return replace(d, x=np.hstack([d.x, cols]))
+
+
+def train(dir: Path, more: list[Path], name: str, numeric: bool = False) -> None:
+    """`dir` is the original ICIJ batches (pickled); `more` are synthetic batch dirs and
+    on-policy dirs (`run --collect`), of either world."""
+    parts = [with_answers(dir, loaded(dir))]
+    for m in more:
+        parts.append(with_answers(m, data.load(m, ("connect", *SCENARIOS))))
     d = data.concat(parts)
     print(f"  {len(d.run):,} batches, {len(d.y):,} candidates", flush=True)
     every = np.ones(len(d.y), bool)
@@ -64,6 +73,11 @@ def train(dir: Path, syn: list[Path], name: str, numeric: bool = False) -> None:
 
 
 def call(method: str, url: str, body: dict | None = None) -> dict:
+    raw = fetch(method, url, body)
+    return json.loads(raw) if raw else {}
+
+
+def fetch(method: str, url: str, body: dict | None = None) -> bytes:
     req = urllib.request.Request(
         url,
         None if body is None else json.dumps(body).encode(),
@@ -71,8 +85,7 @@ def call(method: str, url: str, body: dict | None = None) -> dict:
         method=method,
     )
     with urllib.request.urlopen(req, timeout=120) as r:
-        raw = r.read()
-    return json.loads(raw) if raw else {}
+        return r.read()
 
 
 def joining(task: dict, a: int, b: int) -> int | None:
@@ -148,14 +161,22 @@ def decide(models: list, task: dict, ask: dict, got: dict, push: bool = False) -
 
 
 def run(
-    url: str, req: dict, models: list, budget: float, spent0: float, push: bool = False
+    url: str,
+    req: dict,
+    models: list,
+    budget: float,
+    spent0: float,
+    push: bool = False,
+    collect: Path | None = None,
 ) -> dict:
-    """One run to its end: the report, the batches decided, and whether one was late."""
+    """One run to its end: the report, the batches decided, and whether one was late.
+    With `collect`, its oracle-labelled batches go to `collect/<name>.v0.jsonl`, and
+    the row carries its task and the entity text it saw."""
     cache = client.Cache(CACHE / "jev.sqlite")
     started = time.time()
-    r = call("POST", f"{url}/expand", req)
+    r = call("POST", f"{url}/expand", {**req, "batches": collect is not None})
     run_id, task = r["id"], r["task"]
-    batches, late, seen, known, uncached = 0, False, 0, 0, {}
+    batches, late, seen, known, uncached, saw = 0, False, 0, 0, {}, {}
     try:
         while True:
             a = call("GET", f"{url}/expand/{run_id}?wait=25")
@@ -164,6 +185,8 @@ def run(
             if a["state"] == "done":
                 break
             texts = {c["id"]: c["text"] for c in a["candidates"] if c.get("text")}
+            if collect:
+                saw.update((c["id"], c.get("text", "")) for c in a["candidates"])
             left = budget - (cache.spent() - spent0)
             try:
                 got = client.answers(texts, questions.QUESTIONS, cache, max(left, 0.0))
@@ -183,6 +206,9 @@ def run(
                     raise
                 late = True
             batches += 1
+        if collect:
+            raw = fetch("GET", f"{url}/expand/{run_id}/batches")
+            (collect / f"{req['name']}.v0.jsonl").write_bytes(raw)
     finally:
         call("DELETE", f"{url}/expand/{run_id}")
     rep = a["report"]
@@ -194,6 +220,7 @@ def run(
         "widest": path.get("widest"),
         "answered": known / seen if seen else None,
         "uncached": uncached,
+        "collected": {"run": req["name"], "task": task, "texts": saw} if collect else None,
         "fetched": rep["fetched"],
         "rounds": rep["rounds"],
         "batches": batches,
@@ -239,7 +266,8 @@ def main() -> None:
     a.add_argument("cmd", choices=["train", "run", "table"])
     a.add_argument("target", help="train: batches DIR; run: server URL; table: a run file")
     a.add_argument("tasks", type=Path, nargs="*", help="run: ICIJ tasks DIR; table: more")
-    a.add_argument("--syn", type=Path, nargs="*", default=[])
+    a.add_argument("--syn", type=Path, nargs="*", default=[], help="train: more batch dirs")
+    a.add_argument("--collect", type=Path, help="run: save on-policy batches here")
     a.add_argument("--model", default="v0")
     a.add_argument("--numeric", action="store_true", help="train: without Jev answers")
     a.add_argument("--policy", default="remote")
@@ -271,33 +299,54 @@ def main() -> None:
     reqs = []
     seen = {s for d in args.exclude for t in data.read_tasks(d).values() for s in t["seeds"]}
     for dir in args.tasks:
-        fresh = [t for t in data.read_tasks(dir).values() if not seen & set(t["seeds"])]
-        for t in fresh[: args.limit]:
+        tasks = data.read_tasks(dir).items()
+        fresh = [(n, t) for n, t in tasks if not seen & set(t["seeds"])]
+        for n, t in fresh[: args.limit]:
             reqs.append(
                 {
                     **common,
+                    "name": n,
                     "world": "icij",
                     "goal": t["goal"],
                     "seeds": t["seeds"],
                     "budget": t["budget"],
                 }
             )
-    reqs += [{**common, "scenario": s, "seed": w} for w in args.seeds for s in args.only]
+    reqs += [
+        {**common, "name": f"{s}.s{w}", "scenario": s, "seed": w}
+        for w in args.seeds
+        for s in args.only
+    ]
     spent0 = client.Cache(CACHE / "jev.sqlite").spent()
-    rows, lacking = [], {}
+    rows, lacking, collected = [], {}, []
+    if args.collect:
+        args.collect.mkdir(parents=True, exist_ok=True)
     with ThreadPoolExecutor(args.runs) as pool, args.out.open("w") as out:
         for n, row in enumerate(
             pool.map(
-                lambda r: run(args.target, r, models, args.budget, spent0, args.pushdown), reqs
+                lambda r: run(
+                    args.target, r, models, args.budget, spent0, args.pushdown, args.collect
+                ),
+                reqs,
             ),
             1,
         ):
             lacking.update(row.pop("uncached"))
+            if (c := row.pop("collected")) is not None:
+                collected.append(c)
             rows.append(row)
             out.write(json.dumps(row) + "\n")
             if n % 50 == 0 or n == len(reqs):
                 print(f"{n}/{len(reqs)} runs", flush=True)
                 summary(rows)
+    if args.collect:
+        tasks = "".join(json.dumps({"run": c["run"], "task": c["task"]}) + "\n" for c in collected)
+        (args.collect / "tasks.jsonl").write_text(tasks)
+        texts = {i: t for c in collected for i, t in c["texts"].items()}
+        if any(texts.values()):
+            ents = "".join(json.dumps({"id": i, "text": t}) + "\n" for i, t in texts.items())
+            (args.collect / "entities.jsonl").write_text(ents)
+        print(f"collected {len(collected)} runs, {len(texts):,} entities")
     if args.uncached:
         todo = {i: list(questions.QUESTIONS) for i in lacking}
         args.uncached.write_text(
