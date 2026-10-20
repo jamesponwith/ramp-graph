@@ -411,6 +411,38 @@ removes the one synthetic case where v0 was behind: synthetic alert drops from 1
 2 edges, level with `Guided`. The learned order gets more from pushdown than `Guided`'s
 does. Both take the same filtered fetches, but v0 takes the ones that pay first.
 
+## P6: on-policy data (DAgger)
+
+`Guided`'s traces show v0 only the states `Guided` reaches. Served, v0 goes elsewhere:
+23% of its connect candidates are entities the traces never offered. DAgger trains on
+the states the learned policy reaches, labelled by the oracle:
+- **`/expand` serves labelled batches.** A run started with `"batches": true` keeps every
+  policy call and labels each candidate with the benches' oracle: near-cheapest path
+  for ICIJ connect, shared with the target for alert, a signal endpoint for a scenario
+  (`GET /expand/<id>/batches`).
+- **`serve run --collect DIR`** saves them per run, with `tasks.jsonl` and the entity
+  text, in the loader's format. **`serve train … --syn DIR…`** takes those dirs too,
+  with cached answers where there is text.
+
+**Round 1.** v0 with pushdown ran on the training tasks only: the 400 seed-7 ICIJ tasks
+and the four scenarios on worlds 1–8. That gave 432 runs and 39 MB. `dagger` is v0
+retrained on the `Guided` batches plus these. On the P5 test sets with pushdown, paired
+against v0, $0 spent:
+
+| | v0: fetched p50 / p90 | `dagger` | `dagger` / v0, geo-mean, 95% CI |
+|---|---|---|---|
+| ICIJ connect | 167 / 1,984 | 139 / 2,123 | 0.93 [0.85, 1.01] |
+| ICIJ alert | 2 / 3 | 2 / 3 | 0.98 [0.97, 1.00] |
+| syn path-5hop | 74 / 353 | 66 / 517 | 0.72 [0.51, 1.01] |
+| syn path-7hop | 638 / 1,539 | 575 / 1,368 | 0.73 [0.45, 1.24] |
+| syn pivot-busy | 7 / 18 | 7 / 19 | 0.87 [0.70, 1.01] |
+| syn alert | 2 / 2 | 2 / 2 | 1.00 |
+
+Every kind leans towards `dagger`, and none is significant. Both solve every task. On
+connect, `dagger` lowers the median (139 against 167) and raises p90 (2,123 against
+1,984); mean edges are level (0.99). Round 2 collects with `dagger` and trains on both
+rounds.
+
 ## Costs and risks
 
 - **Cost.** Every one of the 334k entities is a candidate somewhere. At about 600 input
