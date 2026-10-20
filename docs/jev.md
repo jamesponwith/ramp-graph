@@ -440,8 +440,30 @@ against v0, $0 spent:
 
 Every kind leans towards `dagger`, and none is significant. Both solve every task. On
 connect, `dagger` lowers the median (139 against 167) and raises p90 (2,123 against
-1,984); mean edges are level (0.99). Round 2 collects with `dagger` and trains on both
-rounds.
+1,984); mean edges are level (0.99).
+
+**Round 2.** `dagger` with pushdown ran on the same training tasks: 432 more runs.
+`dagger2` trains on the `Guided` batches and both rounds. Same test, $0 spent:
+
+| | v0: fetched p50 / p90 | `dagger2` | `dagger2` / v0, geo-mean, 95% CI | mean edges |
+|---|---|---|---|---|
+| ICIJ connect | 167 / 1,984 | 159 / 2,045 | **0.89 [0.82, 0.98]** | 0.90 |
+| ICIJ alert | 2 / 3 | 2 / 3 | 0.98 [0.97, 0.99] | 0.99 |
+| syn path-5hop | 74 / 353 | 57 / 409 | **0.67 [0.47, 0.91]** | 0.65 |
+| syn path-7hop | 638 / 1,539 | 196 / 1,212 | **0.51 [0.34, 0.76]** | 0.53 |
+| syn pivot-busy | 7 / 18 | 7 / 9 | 0.84 [0.70, 1.00] | 0.76 |
+| syn alert | 2 / 2 | 2 / 2 | 1.00 | 1.00 |
+
+- **Two rounds make the gain significant.** `dagger2` fetches 11% fewer edges than v0
+  per ICIJ connect task, and about half as many on path-7hop. It solves every test task.
+- **Each round adds less.** `dagger2` against `dagger` leans better everywhere (connect
+  0.96 [0.89, 1.03]), and none of it is significant. A third round would likely add a
+  few percent.
+- **Path quality keeps slipping.** Cheapest-path joins fall from `Guided`'s 270 of 296,
+  to v0's 205, to `dagger2`'s 195 (mean cost 1.050× the cheapest). The oracle labels
+  every path within ε of the cheapest as positive, and the metric is edges fetched, so
+  nothing here rewards the cheapest join over a near one.
+- **`dagger2` with pushdown is the policy to serve.**
 
 ## Costs and risks
 
