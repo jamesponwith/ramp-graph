@@ -149,10 +149,18 @@ def pushdown(task: dict, c: dict) -> tuple[int, dict] | None:
     return None
 
 
-def decide(models: list, task: dict, ask: dict, got: dict, push: bool = False) -> list[dict]:
+def decide(
+    models: list,
+    task: dict,
+    ask: dict,
+    got: dict,
+    push: bool = False,
+    scale: float = 1.0,
+) -> list[dict]:
     """One decision per candidate of `ask`. With `push`, a candidate `pushdown` applies
     to fetches only that filtered relation, priced as one edge left, as `Guided`
-    prices it: what comes back is what can complete a hit."""
+    prices it: what comes back is what can complete a hit. `scale` multiplies
+    `Guided`'s breadth cap."""
     cands, ctx = ask["candidates"], ask["context"]
     if not cands:
         return []
@@ -168,7 +176,7 @@ def decide(models: list, task: dict, ask: dict, got: dict, push: bool = False) -
     logp = np.log(p)
     score = logp - x[:, rank.LEFT]
     interest = task["relation_interest"]
-    breadth = max((ctx["budget"] - ctx["fetched"]) // 64, 16)
+    breadth = max(int(scale * (ctx["budget"] - ctx["fetched"]) / 64), 16)
     out = []
     for c, s, lp in zip(cands, score, logp):
         rem = [max(a - b, 0) for a, b in zip(c["peek"], c["fetched"])]
@@ -196,6 +204,7 @@ def run(
     spent0: float,
     push: bool = False,
     collect: Path | None = None,
+    scale: float = 1.0,
 ) -> dict:
     """One run to its end: the report, the batches decided, and whether one was late.
     With `collect`, its oracle-labelled batches go to `collect/<name>.v0.jsonl`, and
@@ -225,7 +234,7 @@ def run(
             uncached.update((i, t) for i, t in texts.items() if None in got[i].values())
             seen += len(a["candidates"])
             known += sum(None not in v.values() for v in got.values())
-            body = {"seq": a["seq"], "decisions": decide(models, task, a, got, push)}
+            body = {"seq": a["seq"], "decisions": decide(models, task, a, got, push, scale)}
             try:
                 call("POST", f"{url}/expand/{run_id}", body)
             except urllib.error.HTTPError as e:
@@ -302,6 +311,7 @@ def main() -> None:
     a.add_argument("--numeric", action="store_true", help="train: without Jev answers")
     a.add_argument("--policy", default="remote")
     a.add_argument("--pushdown", action="store_true", help="run: push targets down")
+    a.add_argument("--breadth", type=float, default=1.0, help="run: scale the take cap")
     a.add_argument("--exclude", type=Path, nargs="*", default=[])
     a.add_argument("--seeds", type=int, nargs="*", default=[], help="synthetic worlds")
     a.add_argument("--only", nargs="*", default=SCENARIOS, help="run: these scenarios")
@@ -355,7 +365,14 @@ def main() -> None:
         for n, row in enumerate(
             pool.map(
                 lambda r: run(
-                    args.target, r, models, args.budget, spent0, args.pushdown, args.collect
+                    args.target,
+                    r,
+                    models,
+                    args.budget,
+                    spent0,
+                    args.pushdown,
+                    args.collect,
+                    args.breadth,
                 ),
                 reqs,
             ),

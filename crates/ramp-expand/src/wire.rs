@@ -205,12 +205,16 @@ pub fn trace<H: BuildHasher>(r: &Report, truth: &HashSet<(Id, Id, Rel), H>) -> V
     out
 }
 
-/// Every logged policy call ([`Report::batches`]) as JSON lines: `{"context",
-/// "candidates", "decisions"}`, each candidate with an oracle `label` (whether a
-/// policy that knew the answer would expand it).
+/// Every logged policy call ([`Report::batches`]) as JSON lines.
+///
+/// Each is `{"context", "candidates", "decisions"}`, each candidate with an oracle
+/// `label` (whether a policy that knew the answer would expand it) and, per relation,
+/// the `depth` of the first labelled neighbour among the edges still behind it (`null`
+/// if none): how far an unfiltered take must reach.
 #[must_use]
-pub fn batches(r: &Report, label: impl Fn(&Candidate) -> bool) -> Vec<u8> {
+pub fn batches(r: &Report, src: &impl Source, label: impl Fn(Id) -> bool) -> Vec<u8> {
     let mut out = Vec::new();
+    let mut buf = Vec::new();
     for b in &r.batches {
         let candidates: Vec<Value> = b
             .candidates
@@ -218,7 +222,8 @@ pub fn batches(r: &Report, label: impl Fn(&Candidate) -> bool) -> Vec<u8> {
             .map(|c| {
                 let mut v = candidate(c);
                 if let Some(o) = v.as_object_mut() {
-                    o.insert("label".to_owned(), label(c).into());
+                    o.insert("label".to_owned(), label(c.id).into());
+                    o.insert("depth".to_owned(), depth(src, c, &label, &mut buf).into());
                 }
                 v
             })
@@ -233,6 +238,24 @@ pub fn batches(r: &Report, label: impl Fn(&Candidate) -> bool) -> Vec<u8> {
         out.push(b'\n');
     }
     out
+}
+
+/// Per relation, the position of the first neighbour `label` accepts among `c`'s edges
+/// from `fetched` on, in the order a take fetches them.
+fn depth(
+    src: &impl Source,
+    c: &Candidate,
+    label: &impl Fn(Id) -> bool,
+    buf: &mut Vec<Id>,
+) -> Vec<Option<usize>> {
+    (0..)
+        .zip(c.fetched.iter().zip(&c.peek))
+        .map(|(r, (&f, &p))| {
+            buf.clear();
+            src.fetch(c.id, r, f, p.saturating_sub(f), buf);
+            buf.iter().position(|&n| label(n))
+        })
+        .collect()
 }
 
 /// `{"id", "domain", "text"}` per entity of `ids`, as JSON lines: what a reading policy

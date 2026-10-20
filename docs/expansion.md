@@ -340,7 +340,9 @@ hits, 3 of pushdown's 13 alert steps beyond the 10.
 A step records only the candidate that was expanded; a ranker learns from what it was
 chosen over. With `Expander::log_batches`, `Report::batches` keeps every policy call:
 the context, every candidate offered, and the decisions. `wire::batches` writes one
-JSON line per call, each candidate with an oracle `label` from the caller. Both benches
+JSON line per call, each candidate with an oracle `label` from the caller and, per
+relation, the `depth` of the first labelled neighbour among its remaining edges (in
+fetch order; `null` if none). Both benches
 write them with `RAMP_BATCHES=dir`, labelled by an oracle that sees the whole graph:
 - **synthetic:** an endpoint of a planted signal edge;
 - **ICIJ connect:** a seed, or on a path between the seeds costing at most 1.1× the
