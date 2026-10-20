@@ -345,18 +345,28 @@ fn within(w: &World, from: Id, bound: f64) -> HashMap<Id, f64> {
 /// The connect oracle: the seeds, and every entity on a path between them costing at
 /// most `1 + EPS` times the cheapest, `best`.
 pub fn near_cheapest(w: &World, a: Id, b: Id, best: f64) -> HashSet<Id> {
+    path_slack(w, a, b, best).into_keys().collect()
+}
+
+/// [`near_cheapest`], each entity with its slack: how much dearer than `best` the
+/// cheapest path through it is, as a fraction (0 to `EPS`; 0 for the seeds).
+pub fn path_slack(w: &World, a: Id, b: Id, best: f64) -> HashMap<Id, f64> {
     let bound = best.mul_add(1.0 + EPS, 1e-9);
     let (from_a, from_b) = (within(w, a, bound), within(w, b, bound));
-    let mut out: HashSet<Id> = from_a
+    let mut out: HashMap<Id, f64> = from_a
         .iter()
-        .filter(|&(&x, &ca)| {
-            from_b
-                .get(&x)
-                .is_some_and(|&cb| ca + cb + f64::from(w.degree(x)).ln_1p() <= bound)
+        .filter_map(|(&x, &ca)| {
+            let through = ca + from_b.get(&x)? + f64::from(w.degree(x)).ln_1p();
+            let slack = if best > 0.0 {
+                (through / best - 1.0).max(0.0)
+            } else {
+                0.0
+            };
+            (through <= bound).then_some((x, slack))
         })
-        .map(|(&x, _)| x)
         .collect();
-    out.extend([a, b]);
+    out.insert(a, 0.0);
+    out.insert(b, 0.0);
     out
 }
 

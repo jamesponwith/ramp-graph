@@ -90,13 +90,18 @@ def fit(
     cap: int = 64,
     seed: int = 0,
     reweight: bool = False,
+    credit: np.ndarray | None = None,
 ) -> CatBoostClassifier:
     """A classifier on the rows `train` (a mask), each group cut to `cap` rows. `d.x`
     holds `names`, which start with `data.NAMES`. `reweight` weighs each kept negative
     by its group's negatives over those kept, undoing the cut's inflation of `p` in
-    big groups."""
+    big groups. `credit` (one per row of `d`) multiplies each kept positive's weight.
+    """
     m = capped(d, train, cap, seed)
     weight = weights(d, train, m) if reweight else None
+    if credit is not None:
+        weight = np.ones(m.sum()) if weight is None else weight
+        weight = np.where(d.y[m] == 1, weight * credit[m], weight)
     model = CatBoostClassifier(
         iterations=iterations, random_seed=seed, verbose=False, allow_writing_files=False
     )

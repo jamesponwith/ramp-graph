@@ -465,6 +465,31 @@ connect, `dagger` lowers the median (139 against 167) and raises p90 (2,123 agai
   nothing here rewards the cheapest join over a near one.
 - **`dagger2` with pushdown is the policy to serve.**
 
+### Route credit: tried, not kept
+
+To win back cheapest paths, positives were weighted by how near the cheapest path
+they lie. `icij::path_slack` gives each entity of the connect oracle its slack: how
+much dearer than the cheapest the best path through it is, 0 to 10%. Half of seed 7's
+positives are at 0. The ICIJ bench writes it with `RAMP_SLACK=dir`, and no policy
+runs (26 s for 200 tasks). `serve train --slack FILE --credit λ` weighs each positive
+`exp(−λ · slack)`. λ was tuned on the seed-9 validation tasks against `dagger2` (λ = 0),
+with pushdown, $0 spent:
+
+| seed-9 connect (298 tasks) | fetched p50 / p90 | cheapest | cost / best | edges vs λ = 0, 95% CI |
+|---|---|---|---|---|
+| λ = 0 (`dagger2`) | 205 / 2,498 | 206 | 1.051 | |
+| λ = 10 | 235 / 2,814 | 213 | 1.053 | 1.05 [0.97, 1.14] |
+| λ = 30 | 270 / 3,337 | 213 | 1.056 | **1.16 [1.06, 1.27]** |
+
+Path quality does not move: the change in mean cost/best is +0.002 [−0.012, +0.016]
+at λ = 10. Edges go up, so the test set was not spent on it. The reason is the stopping
+rule. A connect run ends at the first join, so path quality is set by which join comes
+first. `Guided` expands in route-cost order, close to Dijkstra, so its first join is
+usually the cheapest. Reweighting labels changes how sure the model is, not that order.
+Better paths would need the search order or the stopping rule to change: keep
+expanding after the first join while a cheaper one is still possible. That is a
+different task from fewest edges, and a choice for whoever reads the paths.
+
 ## Costs and risks
 
 - **Cost.** Every one of the 334k entities is a candidate somewhere. At about 600 input

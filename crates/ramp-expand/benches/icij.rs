@@ -19,6 +19,10 @@
 //! [`near_cheapest`] for connect, [`shared_with_target`] for alert. Every candidate's
 //! text goes to `entities.jsonl` there, and every task (prompt and seeds, under its
 //! `<kind>.<task>` run name) to `tasks.jsonl`.
+//!
+//! With `RAMP_SLACK=dir`, it writes only `dir/slack.jsonl`: each connect task's oracle,
+//! every entity with its [`path_slack`], to weight positives by how near the cheapest
+//! path they lie. No policy runs.
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
@@ -26,7 +30,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use ramp_expand::icij::{
-    DOMAINS, alert_tasks, connect_tasks, joining, load, near_cheapest, shared_with_target,
+    DOMAINS, alert_tasks, connect_tasks, joining, load, near_cheapest, path_slack,
+    shared_with_target,
 };
 use ramp_expand::policy::{Bfs, Guided, Rules};
 use ramp_expand::world::{Rng, World};
@@ -290,6 +295,20 @@ fn main() -> Result<()> {
             rows.push(b'\n');
         }
         std::fs::write(Path::new(&out).join("tasks.jsonl"), rows).map_err(io)?;
+    }
+    if let Some(out) = std::env::var_os("RAMP_SLACK") {
+        // Only each connect task's oracle with its slack, for weighting positives.
+        let mut rows = Vec::new();
+        for (i, (task, (best, _))) in connects.iter().enumerate() {
+            if let [a, b] = task.seeds[..] {
+                let slack = path_slack(&world, a, b, *best);
+                let row = serde_json::json!({"run": format!("connect.{i}"), "seeds": task.seeds, "slack": slack});
+                rows.extend(row.to_string().into_bytes());
+                rows.push(b'\n');
+            }
+        }
+        std::fs::write(Path::new(&out).join("slack.jsonl"), rows).map_err(io)?;
+        return Ok(());
     }
     let mut seen = HashSet::new();
     connect(&world, &connects, &mut seen)?;
