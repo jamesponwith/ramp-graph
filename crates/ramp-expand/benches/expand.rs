@@ -89,11 +89,10 @@ fn run_k(
         .map_err(|e| GraphError::Io(e.to_string()))?;
     }
     if let Some(dir) = batches {
-        let on =
-            |c: &ramp_expand::Candidate| s.signal.iter().any(|&(a, b, _)| c.id == a || c.id == b);
+        let on = |id| s.signal.iter().any(|&(a, b, _)| id == a || id == b);
         std::fs::write(
             std::path::Path::new(&dir).join(&file),
-            wire::batches(&report, on),
+            wire::batches(&report, world, on),
         )
         .map_err(|e| GraphError::Io(e.to_string()))?;
     }

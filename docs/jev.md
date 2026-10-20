@@ -62,7 +62,7 @@ It can then judge whether an entity is a specific party or a mass-registration s
 | P3 autoresearch | `jev/` | Claude proposes, revises and drops questions from feedback (worst batches, importances, metric history), over 5 rounds. A refit costs no API calls, so rejected changes are free. Bootstrap CI on the held-out change. | The final question set beats v0 on held-out NDCG with a CI excluding zero. |
 | P4 serving | `jev/` | `jev serve`: an `/expand` client that long-polls and scores each batch (cached Jev answers + numeric features → priority). Breadth starts with `Guided`'s rule (≤1/64 of remaining budget per relation per visit). Newly discovered entities are prefetched while the batch waits; `parallel(k)` and `spread` hide latency. | It runs every held-out task on both worlds without timeouts. |
 | P5 evaluation | both | The ICIJ and scenario tables with Jev added: solved, fetched p50/p90, cheapest-path rate, widest hub, wall time, Jev calls and cost per run. | Ship if it solves at least as many as `Guided`, fetches fewer at p50 and p90 on ICIJ connect, and does not regress on the synthetic scenarios, at a stated cost per run. Otherwise report why. |
-| P6 later | | Learned breadth (take limits). On-policy data: run the learned policy, relabel with the oracle, retrain (DAgger). Route credit as a reward weight. | |
+| P6 later | | Learned breadth (take limits): measured, not trained (see below). On-policy data: run the learned policy, relabel with the oracle, retrain (DAgger). Route credit as a reward weight. | |
 
 ## P1 results
 
@@ -489,6 +489,51 @@ usually the cheapest. Reweighting labels changes how sure the model is, not that
 Better paths would need the search order or the stopping rule to change: keep
 expanding after the first join while a cheaper one is still possible. That is a
 different task from fewest edges, and a choice for whoever reads the paths.
+
+### Learned breadth: nothing to learn but the source's edge order
+
+Breadth is the take limit: how many of a relation's edges one visit fetches. Served
+v0 uses `Guided`'s cap, 1/64 of the budget left (about 3,000 on ICIJ, 1,500 on the
+synthetic worlds), and the cap rarely binds. On round 2's on-policy batches it limits
+1.2% of ICIJ connect decisions and 5–15% on the synthetic path and pivot scenarios.
+`serve run --breadth s` scales it (the floor stays 16). The sweep below ran `dagger2`
+with pushdown on the seed-9 validation tasks and synthetic worlds 11–20 (11–40 for
+the flat cap), $0:
+
+| cap × | ICIJ connect edges vs ×1 | cheapest / 298 | path-7hop edges vs ×1 |
+|---|---|---|---|
+| 4 | 1.00 [0.99, 1.00] | 206 | 1.00 |
+| ¼ | 0.98 [0.96, 1.00] | 207 | 1.00 |
+| 1/16 | 0.91 [0.87, 0.94] | 207 | 0.93 [0.82, 1.01] |
+| 1/64 | 0.88 [0.83, 0.94] | 207 | 1.40 [0.96, 2.09] |
+| 0 (flat 16) | **0.79 [0.73, 0.85]** | 200 | **1.44 [1.13, 1.84]** (30 worlds) |
+
+Path-5hop moves at most to 0.93× (flat cap), pivot-busy not at all, and wall time does not change. Smaller takes
+help ICIJ and hurt the synthetic worlds. Scaling the cap by the candidate's
+probability (`max(16, p · cap)`) changed nothing, 1.00× on every kind: even p · cap
+stays above most remainders.
+
+The reason is the order a take fetches edges in, not the candidates. The batches now
+carry a per-relation `depth`: where the first oracle neighbour sits among a
+candidate's remaining edges. Where more than 64 edges are left, it falls at these
+shares of the remainder (first to last fifth):
+
+| | candidates | 1st | 2nd | 3rd | 4th | 5th |
+|---|---|---|---|---|---|---|
+| ICIJ connect | 561 | 0.36 | 0.21 | 0.18 | 0.14 | 0.12 |
+| path-5hop | 39 | 0 | 0 | 0 | 0.23 | 0.77 |
+| path-7hop | 67 | 0.01 | 0 | 0.07 | 0.31 | 0.60 |
+
+Both orders come from ids. Edges are stored sorted by neighbour id. A synthetic
+domain's ids run heaviest first, and scenarios plant light entities (`quiet`,
+`around` at low degree), so planted neighbours come last. ICIJ ids follow the CSVs,
+and there the path neighbour tends to come early. A breadth model would learn each
+source's id order, which says nothing about a third source, so none was trained.
+Breadth stays at `Guided`'s cap.
+
+What would make small takes pay on any source is fetching in a chosen order: light
+neighbours first, say, since path cost is the sum of `ln(1 + degree)`. That is a
+change to `Source::fetch` (an index ordered by degree), not to the policy.
 
 ## Costs and risks
 

@@ -559,10 +559,9 @@ fn expand(
                 o.extend(extra.clone());
                 o.insert("cancelled".to_owned(), session.lock().cancelled.into());
             }
-            let batches = session
-                .oracle
-                .as_ref()
-                .map_or_else(Vec::new, |o| wire::batches(&report, |c| o.contains(&c.id)));
+            let batches = session.oracle.as_ref().map_or_else(Vec::new, |o| {
+                wire::batches(&report, world, |id| o.contains(&id))
+            });
             (out, wire::trace(&report, &truth), batches)
         }
     }

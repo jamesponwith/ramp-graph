@@ -121,7 +121,7 @@ fn run(
         std::fs::write(Path::new(&out).join(&file), wire::trace(&report, &truth)).map_err(io)?;
     }
     if let Some(out) = batches {
-        let rows = wire::batches(&report, |c| oracle.contains(&c.id));
+        let rows = wire::batches(&report, world, |id| oracle.contains(&id));
         seen.extend(
             report
                 .batches

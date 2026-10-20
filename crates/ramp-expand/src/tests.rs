@@ -452,7 +452,7 @@ fn logged_batches_hold_every_decision_and_label_candidates() {
     assert!(r.trace.iter().all(|t| ids.contains(&t.candidate.id)));
 
     let seed = s.task.seeds[0];
-    let lines = wire::batches(&r, |c| c.id == seed);
+    let lines = wire::batches(&r, &w, |id| id == seed);
     let rows: Vec<serde_json::Value> = lines
         .split(|&b| b == b'\n')
         .filter(|l| !l.is_empty())
@@ -463,6 +463,21 @@ fn logged_batches_hold_every_decision_and_label_candidates() {
     let first = rows[0]["candidates"].as_array().unwrap();
     assert!(first.iter().any(labels));
     assert_eq!(rows[0]["decisions"].as_array().unwrap().len(), first.len());
+    // The seed's neighbours still have their edge back to it: a depth within what is left.
+    let mut deep = 0;
+    for c in rows
+        .iter()
+        .flat_map(|r| r["candidates"].as_array().unwrap())
+    {
+        for (r, d) in c["depth"].as_array().unwrap().iter().enumerate() {
+            if let Some(d) = d.as_u64() {
+                let left = c["peek"][r].as_u64().unwrap() - c["fetched"][r].as_u64().unwrap();
+                assert!(d < left);
+                deep += 1;
+            }
+        }
+    }
+    assert!(deep > 0);
 
     // Off by default.
     let (r, _) = run(&w, s, Guided::default(), 10_000, Reads::Projection);
