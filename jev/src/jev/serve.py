@@ -54,9 +54,34 @@ def with_answers(dir: Path, d: data.Data) -> data.Data:
     return replace(d, x=np.hstack([d.x, cols]))
 
 
-def train(dir: Path, more: list[Path], name: str, numeric: bool = False) -> None:
+def credit(d: data.Data, slack: Path, strength: float) -> np.ndarray:
+    """Route credit, one per row: `exp(-strength * slack)` for a positive whose task has
+    a row in `slack` (`benches/icij.rs` with `RAMP_SLACK`), so a candidate on the
+    cheapest path counts more than one on a path 10% dearer; 1 for every other row."""
+    by_task = {
+        (r := json.loads(line))["run"]: {int(i): s for i, s in r["slack"].items()}
+        for line in slack.read_text().splitlines()
+    }
+    task = np.array(d.task)[d.group]
+    out = np.ones(len(d.y))
+    for r in np.flatnonzero(d.y == 1):
+        s = by_task.get(task[r], {}).get(int(d.id[r]))
+        if s is not None:
+            out[r] = math.exp(-strength * s)
+    return out
+
+
+def train(
+    dir: Path,
+    more: list[Path],
+    name: str,
+    numeric: bool = False,
+    slack: Path | None = None,
+    strength: float = 0.0,
+) -> None:
     """`dir` is the original ICIJ batches (pickled); `more` are synthetic batch dirs and
-    on-policy dirs (`run --collect`), of either world."""
+    on-policy dirs (`run --collect`), of either world. With `slack`, positives get
+    route credit (see `credit`)."""
     parts = [with_answers(dir, loaded(dir))]
     for m in more:
         parts.append(with_answers(m, data.load(m, ("connect", *SCENARIOS))))
@@ -65,9 +90,12 @@ def train(dir: Path, more: list[Path], name: str, numeric: bool = False) -> None
     every = np.ones(len(d.y), bool)
     names = data.NAMES + ([] if numeric else questions.NAMES)
     d = replace(d, x=d.x[:, : len(names)])
+    weight = credit(d, slack, strength) if slack else None
+    if weight is not None:
+        print(f"  route credit: {np.mean(weight[d.y == 1] < 1):.0%} of positives below 1")
     MODELS.mkdir(exist_ok=True)
     for seed in range(FITS):
-        m = rank.fit(d, every, names, seed=seed, reweight=True)
+        m = rank.fit(d, every, names, seed=seed, reweight=True, credit=weight)
         m.save_model(str(MODELS / f"{name}.{seed}.cbm"))
         print(f"  saved {name}.{seed}", flush=True)
 
@@ -268,6 +296,8 @@ def main() -> None:
     a.add_argument("tasks", type=Path, nargs="*", help="run: ICIJ tasks DIR; table: more")
     a.add_argument("--syn", type=Path, nargs="*", default=[], help="train: more batch dirs")
     a.add_argument("--collect", type=Path, help="run: save on-policy batches here")
+    a.add_argument("--slack", type=Path, help="train: slack.jsonl, for route credit")
+    a.add_argument("--credit", type=float, default=0.0, help="train: credit strength")
     a.add_argument("--model", default="v0")
     a.add_argument("--numeric", action="store_true", help="train: without Jev answers")
     a.add_argument("--policy", default="remote")
@@ -284,7 +314,7 @@ def main() -> None:
     a.add_argument("--uncached", type=Path, help="run: where to list what the cache lacks")
     args = a.parse_args()
     if args.cmd == "train":
-        train(Path(args.target), args.syn, args.model, args.numeric)
+        train(Path(args.target), args.syn, args.model, args.numeric, args.slack, args.credit)
         return
     if args.cmd == "table":
         for f in [Path(args.target), *args.tasks]:

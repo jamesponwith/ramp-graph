@@ -82,3 +82,21 @@ def test_concat_shifts_groups():
     d = data.concat([two(3), two(4)])
     assert d.group.tolist() == [0, 1, 1, 2, 3, 3, 3]
     assert d.run == ["a", "b", "a", "b"] and len(d.id) == 7
+
+
+def test_credit_weighs_positives_only():
+    n = 64
+    d = data.Data(
+        x=np.arange(n, dtype=np.float32)[:, None],
+        y=(np.arange(n) % 2).astype(np.int8),
+        group=np.zeros(n, np.int64),
+        prior=np.zeros(n),
+        run=["a"],
+        task=["a"],
+        id=np.arange(n),
+    )
+    every = np.ones(n, bool)
+    low = rank.fit(d, every, ["x"], iterations=20, credit=np.full(n, 0.1))
+    base = rank.fit(d, every, ["x"], iterations=20)
+    # Down-weighted positives pull the predicted rate down.
+    assert low.predict_proba(d.x)[:, 1].mean() < base.predict_proba(d.x)[:, 1].mean()

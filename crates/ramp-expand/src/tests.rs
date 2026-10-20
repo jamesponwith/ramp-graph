@@ -509,3 +509,53 @@ fn icij_entities_carry_their_text() {
     let row: serde_json::Value = serde_json::from_slice(rows.trim_ascii()).unwrap();
     assert_eq!(row["domain"], 1);
 }
+
+#[test]
+fn path_slack_grades_the_connect_oracle() {
+    use std::fmt::Write as _;
+
+    // Officers 3 and 4 share three companies, of degree 10, 11 and 20.
+    let dir = tempfile::tempdir().unwrap();
+    let mut officers = "node_id,name,countries,country_codes\n".to_owned();
+    let mut rels = "node_id_start,node_id_end,rel_type,link\n".to_owned();
+    let mut next = 100;
+    for (company, degree) in [(1, 10), (2, 11), (3, 20)] {
+        for officer in [10, 20] {
+            writeln!(rels, "{officer},{company},officer_of,director").unwrap();
+        }
+        for _ in 2..degree {
+            next += 1;
+            writeln!(officers, "{next},filler,,").unwrap();
+            writeln!(rels, "{next},{company},officer_of,director").unwrap();
+        }
+    }
+    officers = officers.replacen('\n', "\n10,A,,\n20,B,,\n", 1);
+    let files = [
+        (
+            "nodes-entities.csv",
+            "node_id,name\n1,e1\n2,e2\n3,e3\n".to_owned(),
+        ),
+        ("nodes-officers.csv", officers),
+        ("nodes-intermediaries.csv", "node_id,name\n".to_owned()),
+        ("nodes-addresses.csv", "node_id,address\n".to_owned()),
+        ("nodes-others.csv", "node_id,name\n".to_owned()),
+        ("relationships.csv", rels),
+    ];
+    for (name, body) in files {
+        std::fs::write(dir.path().join(name), body).unwrap();
+    }
+    let w = icij::load(dir.path()).unwrap();
+    let (a, b) = (3, 4);
+    assert_eq!((w.degree(0), w.degree(1), w.degree(2)), (10, 11, 20));
+    let best = 11.0_f64.ln();
+    let slack = icij::path_slack(&w, a, b, best);
+    assert!(slack[&0].abs() < 1e-9, "{slack:?}");
+    assert!((slack[&1] - (12.0_f64.ln() / best - 1.0)).abs() < 1e-9);
+    assert!(
+        !slack.contains_key(&2),
+        "27% dearer than the cheapest: not near it"
+    );
+    assert_eq!((slack[&a], slack[&b]), (0.0, 0.0));
+    let near = icij::near_cheapest(&w, a, b, best);
+    assert_eq!(near, slack.keys().copied().collect());
+}
