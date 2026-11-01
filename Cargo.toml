@@ -12,7 +12,7 @@ repository = "https://github.com/jamesponwith/ramp-graph"
 
 [workspace.dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
-heed = { version = "0.22.1", default-features = false }
+heed = { version = "0.23.1", default-features = false }
 regex = "1.13.1"
 rmp-serde = "1.3.1"
 serde_json = "1.0.151"
